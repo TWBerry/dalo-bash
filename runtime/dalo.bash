@@ -4131,7 +4131,7 @@ compile_project() {
     local project="$1" outdir="$2" abi="${1}_PROJECT_ABI"
     [[ "${!abi:-}" == 2 ]] || return 3
     mkdir -p -- "$outdir" || return
-    local source="$outdir/project.phi" machine="$outdir/async_script.bash" hash
+    local source="$outdir/project.dalo" machine="$outdir/async_script.bash" hash
     save_project "$project" "$source" || return
     hash="$(__asyncscript_sha256 "$source")" || return
     __asyncmachine_link "$project" "$source" "$machine" "$hash" || return
@@ -4235,7 +4235,7 @@ async_perf_report() {
 # ============================================================================
 #
 # Object type definitions are compiler-side JSON descriptors.
-# PROJECT remains DALO's own source representation.
+# PROJECT remains PhiWeave's own source representation.
 #
 # IMPORTANT:
 #   - JSON descriptors are NOT runtime object state.
@@ -4350,4 +4350,129 @@ async_project_validate_definitions() {
         [[ "$splane" == "$dplane" ]] || return 29
         [[ "$stype" == any || "$dtype" == any || "$stype" == "$dtype" ]] || return 30
     done
+}
+
+# ============================================================================
+# 24. DALO WORKER DEFINITION ABI v1
+# ============================================================================
+# Compiler-side worker descriptors. Descriptors are metadata; worker artifacts
+# remain ordinary implementation files and are not runtime JSON dependencies.
+
+DALO_WORKER_DEFINITION_ABI=1
+declare -g -A DALO_WORKER_DEF_FILE=()
+declare -g -A DALO_WORKER_DEF_JSON=()
+declare -g -A DALO_WORKER_DEF_ARTIFACT=()
+
+__dalo_sha256_file() {
+    [ $# -eq 1 ] || return 2
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$1" | awk '{print $1}'
+    else
+        return 127
+    fi
+}
+
+__dalo_worker_resolve_artifact() {
+    [ $# -eq 2 ] || return 2
+    local descriptor="$1" artifact="$2"
+    if [[ "$artifact" == /* ]]; then
+        printf '%s\n' "$artifact"
+    else
+        printf '%s/%s\n' "$(cd "$(dirname -- "$descriptor")" && pwd)" "$artifact"
+    fi
+}
+
+async_worker_definition_register() {
+    [ $# -eq 1 ] || return 2
+    local file="$1" name artifact declared_hash actual_hash
+    [[ -r "$file" ]] || return 3
+    command -v jq >/dev/null 2>&1 || return 4
+
+    jq -e '
+      .abi == 1 and
+      (.name | type == "string" and length > 0) and
+      (.language | type == "string" and length > 0) and
+      (.entry | type == "string" and length > 0) and
+      (.artifact | type == "string" and length > 0) and
+      (.object_types | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
+      ((.inputs // {}) | type == "object" and all(.[]; type == "string" and length > 0)) and
+      ((.outputs // {}) | type == "object" and all(.[]; type == "string" and length > 0)) and
+      ((.features // []) | type == "array" and all(.[]; type == "string" and length > 0)) and
+      ((.sha256 // "") | type == "string")
+    ' "$file" >/dev/null || return 5
+
+    name="$(jq -r '.name' "$file")" || return
+    [[ -z "${DALO_WORKER_DEF_FILE[$name]:-}" ]] || return 6
+    artifact="$(__dalo_worker_resolve_artifact "$file" "$(jq -r '.artifact' "$file")")" || return
+    [[ -r "$artifact" ]] || { printf 'WORKER %s: artifact not readable: %s\n' "$name" "$artifact" >&2; return 7; }
+
+    if [[ "$(jq -r '.language' "$file")" == bash ]]; then
+        bash -n "$artifact" || { printf 'WORKER %s: Bash artifact failed bash -n\n' "$name" >&2; return 8; }
+        local entry="$(jq -r '.entry' "$file")"
+        bash -c 'source "$1"; declare -F "$2" >/dev/null' _ "$artifact" "$entry" || {
+            printf 'WORKER %s: entry %s not found in artifact\n' "$name" "$entry" >&2; return 9;
+        }
+    fi
+
+    declared_hash="$(jq -r '.sha256 // ""' "$file")"
+    if [[ -n "$declared_hash" ]]; then
+        [[ "$declared_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 10
+        actual_hash="$(__dalo_sha256_file "$artifact")" || return 11
+        [[ "${actual_hash,,}" == "${declared_hash,,}" ]] || {
+            printf 'WORKER %s: SHA-256 mismatch\n' "$name" >&2; return 12;
+        }
+    fi
+
+    DALO_WORKER_DEF_FILE["$name"]="$file"
+    DALO_WORKER_DEF_JSON["$name"]="$(cat -- "$file")"
+    DALO_WORKER_DEF_ARTIFACT["$name"]="$artifact"
+}
+
+async_worker_definition_has() { [ $# -eq 1 ] || return 2; [[ -n "${DALO_WORKER_DEF_FILE[$1]:-}" ]]; }
+
+async_worker_definition_field() {
+    [ $# -eq 2 ] || return 2
+    local file="${DALO_WORKER_DEF_FILE[$1]:-}"
+    [[ -n "$file" ]] || return 3
+    jq -er --arg f "$2" '.[$f] // error("unknown worker field")' "$file"
+}
+
+async_worker_definition_object_allowed() {
+    [ $# -eq 2 ] || return 2
+    local file="${DALO_WORKER_DEF_FILE[$1]:-}"
+    [[ -n "$file" ]] || return 3
+    jq -e --arg t "$2" '.object_types | index($t) != null' "$file" >/dev/null
+}
+
+async_worker_definition_port_type() {
+    [ $# -eq 3 ] || return 2
+    local file="${DALO_WORKER_DEF_FILE[$1]:-}" direction="$2" port="$3"
+    [[ -n "$file" ]] || return 3
+    case "$direction" in inputs|outputs) ;; *) return 4 ;; esac
+    jq -er --arg d "$direction" --arg p "$port" '.[$d][$p] // error("unknown worker port")' "$file"
+}
+
+async_worker_definition_validate_for_object() {
+    [ $# -eq 2 ] || return 2
+    local worker="$1" object_type="$2" file port wtype otype
+    async_worker_definition_has "$worker" || return 20
+    async_object_definition_has "$object_type" || return 21
+    async_worker_definition_object_allowed "$worker" "$object_type" || return 22
+    file="${DALO_WORKER_DEF_FILE[$worker]}"
+
+    while IFS= read -r port; do
+        wtype="$(async_worker_definition_port_type "$worker" inputs "$port")" || return 23
+        otype="$(async_object_definition_port "$object_type" "$port" type 2>/dev/null)" || return 24
+        [[ "$(async_object_definition_port "$object_type" "$port" direction 2>/dev/null)" == input ]] || return 25
+        [[ "$wtype" == any || "$otype" == any || "$wtype" == "$otype" ]] || return 26
+    done < <(jq -r '(.inputs // {}) | keys[]' "$file")
+
+    while IFS= read -r port; do
+        wtype="$(async_worker_definition_port_type "$worker" outputs "$port")" || return 27
+        otype="$(async_object_definition_port "$object_type" "$port" type 2>/dev/null)" || return 28
+        [[ "$(async_object_definition_port "$object_type" "$port" direction 2>/dev/null)" == output ]] || return 29
+        [[ "$wtype" == any || "$otype" == any || "$wtype" == "$otype" ]] || return 30
+    done < <(jq -r '(.outputs // {}) | keys[]' "$file")
 }

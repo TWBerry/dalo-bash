@@ -1,0 +1,12 @@
+{
+  "abi": 1,
+  "name": "passthrough",
+  "language": "bash",
+  "entry": "worker",
+  "artifact": "artifacts/passthrough.bash",
+  "object_types": ["ORIGIN", "PIPE", "ENDPOINT"],
+  "inputs": {},
+  "outputs": {},
+  "features": [],
+  "sha256": "8145961801c6c80332a8719f8dec6d9008bfe91cc2fed17a42aa1787ac8c4332"
+}
