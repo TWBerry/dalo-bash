@@ -1,0 +1,29 @@
+{
+  "abi": 1,
+  "type": "ORIGIN",
+  "name": "Origin",
+  "ports": {
+    "out": {
+      "direction": "output",
+      "plane": "data",
+      "type": "any"
+    }
+  },
+  "methods": [
+    "summon_worker",
+    "on_job_completed"
+  ],
+  "features": [
+    "core",
+    "data",
+    "worker"
+  ],
+  "worker": {
+    "required": true
+  },
+  "execution": [
+    "INLINE",
+    "ASYNC",
+    "PERSISTENT"
+  ]
+}

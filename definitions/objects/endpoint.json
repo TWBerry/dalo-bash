@@ -1,0 +1,28 @@
+{
+  "abi": 1,
+  "type": "ENDPOINT",
+  "name": "Endpoint",
+  "ports": {
+    "in": {
+      "direction": "input",
+      "plane": "data",
+      "type": "any"
+    }
+  },
+  "methods": [
+    "summon_worker"
+  ],
+  "features": [
+    "core",
+    "data",
+    "worker"
+  ],
+  "worker": {
+    "required": true
+  },
+  "execution": [
+    "INLINE",
+    "ASYNC",
+    "PERSISTENT"
+  ]
+}

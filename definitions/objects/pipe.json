@@ -1,0 +1,34 @@
+{
+  "abi": 1,
+  "type": "PIPE",
+  "name": "Pipe",
+  "ports": {
+    "in": {
+      "direction": "input",
+      "plane": "data",
+      "type": "any"
+    },
+    "out": {
+      "direction": "output",
+      "plane": "data",
+      "type": "any"
+    }
+  },
+  "methods": [
+    "summon_worker",
+    "on_job_completed"
+  ],
+  "features": [
+    "core",
+    "data",
+    "worker"
+  ],
+  "worker": {
+    "required": true
+  },
+  "execution": [
+    "INLINE",
+    "ASYNC",
+    "PERSISTENT"
+  ]
+}

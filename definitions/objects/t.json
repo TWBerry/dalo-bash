@@ -1,0 +1,37 @@
+{
+  "abi": 1,
+  "type": "T",
+  "name": "T",
+  "ports": {
+    "in": {
+      "direction": "input",
+      "plane": "data",
+      "type": "any"
+    },
+    "out1": {
+      "direction": "output",
+      "plane": "data",
+      "type": "any"
+    },
+    "out2": {
+      "direction": "output",
+      "plane": "data",
+      "type": "any"
+    }
+  },
+  "methods": [
+    "receive",
+    "forward"
+  ],
+  "features": [
+    "core",
+    "data",
+    "structural"
+  ],
+  "worker": {
+    "required": false
+  },
+  "execution": [
+    "INLINE"
+  ]
+}

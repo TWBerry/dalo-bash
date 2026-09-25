@@ -1,0 +1,38 @@
+{
+  "abi": 1,
+  "type": "Y",
+  "name": "Y",
+  "ports": {
+    "in1": {
+      "direction": "input",
+      "plane": "data",
+      "type": "any"
+    },
+    "in2": {
+      "direction": "input",
+      "plane": "data",
+      "type": "any"
+    },
+    "out": {
+      "direction": "output",
+      "plane": "data",
+      "type": "any"
+    }
+  },
+  "methods": [
+    "receive_in1",
+    "receive_in2",
+    "forward"
+  ],
+  "features": [
+    "core",
+    "data",
+    "structural"
+  ],
+  "worker": {
+    "required": false
+  },
+  "execution": [
+    "INLINE"
+  ]
+}

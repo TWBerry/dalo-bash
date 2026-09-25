@@ -1,0 +1,4 @@
+*.log
+*.tmp
+async_script.bash
+.DS_Store

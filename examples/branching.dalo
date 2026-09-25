@@ -1,0 +1,20 @@
+PROJECT BranchingExample
+FIELD 100 100
+MAX_WORKERS 64
+
+OBJECT source ORIGIN 10 20
+OBJECT split T 20 20
+OBJECT left PIPE 30 10
+OBJECT right PIPE 30 30
+OBJECT sink_left ENDPOINT 40 10
+OBJECT sink_right ENDPOINT 40 30
+
+EXEC source INLINE
+EXEC left ASYNC
+EXEC right ASYNC
+
+CONNECT source out split in
+CONNECT split out1 left in
+CONNECT split out2 right in
+CONNECT left out sink_left in
+CONNECT right out sink_right in
