@@ -1,0 +1,7 @@
+{
+  "abi": 1,
+  "name": "worker",
+  "requires": [
+    "data"
+  ]
+}

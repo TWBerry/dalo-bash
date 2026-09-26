@@ -3987,7 +3987,88 @@ async_project_validate_definitions() {
 }
 
 # ============================================================================
-# 24. DALO WORKER DEFINITION ABI v1
+# 24. DALO FEATURE DEFINITION ABI v1
+# ============================================================================
+DALO_FEATURE_DEFINITION_ABI=1
+declare -g -A DALO_FEATURE_DEF_FILE=()
+declare -g -A DALO_FEATURE_DEF_JSON=()
+
+async_feature_definition_register() {
+    [ $# -eq 1 ] || return 2
+    local file="$1" name
+    [[ -r "$file" ]] || return 3
+    command -v jq >/dev/null 2>&1 || return 4
+    jq -e '.abi == 1 and (.name|type=="string" and length>0) and
+      ((.requires//[])|type=="array" and all(.[];type=="string" and length>0)) and
+      (((.requires//[])|unique|length)==((.requires//[])|length))' "$file" >/dev/null || return 5
+    name="$(jq -r '.name' "$file")" || return
+    [[ -z "${DALO_FEATURE_DEF_FILE[$name]:-}" ]] || return 6
+    DALO_FEATURE_DEF_FILE["$name"]="$file"
+    DALO_FEATURE_DEF_JSON["$name"]="$(cat -- "$file")"
+}
+async_feature_definition_has() { [ $# -eq 1 ] || return 2; [[ -n "${DALO_FEATURE_DEF_FILE[$1]:-}" ]]; }
+async_feature_definition_requires() {
+    [ $# -eq 1 ] || return 2
+    local file="${DALO_FEATURE_DEF_FILE[$1]:-}"; [[ -n "$file" ]] || return 3
+    jq -r '(.requires//[])[]' "$file"
+}
+__dalo_feature_resolve_visit() {
+    [ $# -eq 4 ] || return 2
+    local feature="$1" state_name="$2" result_name="$3" stack_name="$4" dep s
+    local -n _state="$state_name" _result="$result_name" _stack="$stack_name"
+    async_feature_definition_has "$feature" || { printf 'FEATURE: missing definition: %s\n' "$feature" >&2; return 20; }
+    s="${_state[$feature]:-0}"
+    [[ "$s" == 2 ]] && return 0
+    if [[ "$s" == 1 ]]; then
+        printf 'FEATURE: dependency cycle at %s\n' "$feature" >&2; return 21
+    fi
+    _state["$feature"]=1; _stack+=("$feature")
+    while IFS= read -r dep; do
+        [[ -n "$dep" ]] || continue
+        __dalo_feature_resolve_visit "$dep" "$state_name" "$result_name" "$stack_name" || return
+    done < <(async_feature_definition_requires "$feature" | LC_ALL=C sort)
+    unset '_stack[${#_stack[@]}-1]'
+    _state["$feature"]=2; _result+=("$feature")
+}
+async_feature_definition_resolve() {
+    [ $# -ge 1 ] || return 2
+    local -A state=(); local -a result=() stack=() roots=(); local feature
+    mapfile -t roots < <(printf '%s\n' "$@" | LC_ALL=C sort -u)
+    for feature in "${roots[@]}"; do __dalo_feature_resolve_visit "$feature" state result stack || return; done
+    printf '%s\n' "${result[@]}"
+}
+async_feature_definition_validate_registry() {
+    local feature dep
+    for feature in "${!DALO_FEATURE_DEF_FILE[@]}"; do
+        while IFS= read -r dep; do
+            async_feature_definition_has "$dep" || { printf 'FEATURE %s: missing dependency %s\n' "$feature" "$dep" >&2; return 20; }
+        done < <(async_feature_definition_requires "$feature")
+    done
+    while IFS= read -r feature; do async_feature_definition_resolve "$feature" >/dev/null || return; done       < <(printf '%s\n' "${!DALO_FEATURE_DEF_FILE[@]}" | LC_ALL=C sort)
+}
+async_object_definition_features_resolve() {
+    [ $# -eq 1 ] || return 2
+    local file="${ASYNC_OBJECT_DEF_FILE[$1]:-}"; [[ -n "$file" ]] || return 3
+    local -a roots=(); mapfile -t roots < <(jq -r '(.features//[])[]' "$file")
+    ((${#roots[@]})) || return 0
+    async_feature_definition_resolve "${roots[@]}"
+}
+async_definition_features_resolve() {
+    [ $# -eq 1 ] || [ $# -eq 2 ] || return 2
+    local object_type="$1" worker="${2:-}" file feature; local -a roots=()
+    file="${ASYNC_OBJECT_DEF_FILE[$object_type]:-}"; [[ -n "$file" ]] || return 3
+    mapfile -t roots < <(jq -r '(.features//[])[]' "$file")
+    if [[ -n "$worker" ]]; then
+        file="${DALO_WORKER_DEF_FILE[$worker]:-}"; [[ -n "$file" ]] || return 4
+        while IFS= read -r feature; do roots+=("$feature"); done < <(jq -r '(.features//[])[]' "$file")
+    fi
+    ((${#roots[@]})) || return 0
+    async_feature_definition_resolve "${roots[@]}"
+}
+async_definition_features_validate() { [ $# -eq 1 ] || [ $# -eq 2 ] || return 2; async_definition_features_resolve "$@" >/dev/null; }
+
+# ============================================================================
+# 25. DALO WORKER DEFINITION ABI v1
 # ============================================================================
 # Compiler-side worker descriptors. Descriptors are metadata; worker artifacts
 # remain ordinary implementation files and are not runtime JSON dependencies.
