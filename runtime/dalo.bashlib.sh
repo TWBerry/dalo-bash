@@ -1215,20 +1215,41 @@ define_audit_job_pool() {
 ${ns}_audit_job_pool() {
     local validate_func="\$1"
     echo "--- Parallel Job State Audit [Instance: ${ns}] ---"
-    local slot
+    local slot key port worker_dir pid ec have_input have_output
+    local -a input_members output_members
     for (( slot=1; slot<=\${${ns}_MAX_JOBS}; slot++ )); do
-        local in_vec="\${${ns}_INPUT_DATA_VECTOR[\$slot]:-}"
-        local worker_dir="\${${ns}_WORKER_TMP_DIR[\$slot]:-}"
-        local pid="\${${ns}_WORKER_PIDS[\$slot]:-none}"
-        [ -z "\$in_vec" ] && continue
+        input_members=()
+        output_members=()
+        have_input=0
+        have_output=0
+
+        for key in "\${!${ns}_INPUT_DATA_VECTOR[@]}"; do
+            [[ "\$key" == "\$slot|"* ]] || continue
+            port="\${key#"\$slot|"}"
+            input_members+=("\$port=\${${ns}_INPUT_DATA_VECTOR[\$key]}")
+            have_input=1
+        done
+        (( have_input )) || continue
+
+        for key in "\${!${ns}_OUTPUT_DATA_VECTOR[@]}"; do
+            [[ "\$key" == "\$slot|"* ]] || continue
+            port="\${key#"\$slot|"}"
+            output_members+=("\$port=\${${ns}_OUTPUT_DATA_VECTOR[\$key]}")
+            have_output=1
+        done
+
+        worker_dir="\${${ns}_WORKER_TMP_DIR[\$slot]:-}"
+        pid="\${${ns}_WORKER_PIDS[\$slot]:-none}"
         echo "Worker Slot [\$slot] (PID \$pid):"
-        if [[ ! -v ${ns}_OUTPUT_DATA_VECTOR["\$slot"] ]]; then
+
+        if (( ! have_output )); then
             echo "  └─ [FAIL] Output vector undefined."
-            "\$validate_func" "\$slot" "UNFINISHED" "\$in_vec" "" "\$worker_dir"
+            "\$validate_func" "\$slot" "UNFINISHED" \
+                "\${input_members[*]}" "" "\$worker_dir"
         else
-            local out_vec="\${${ns}_OUTPUT_DATA_VECTOR[\$slot]}"
-            local ec="\${${ns}_EXIT_CODE_VECTOR[\$slot]:-?}"
-            if "\$validate_func" "\$slot" "COMPLETED" "\$in_vec" "\$out_vec" "\$worker_dir"; then
+            ec="\${${ns}_EXIT_CODE_VECTOR[\$slot]:-?}"
+            if "\$validate_func" "\$slot" "COMPLETED" \
+                "\${input_members[*]}" "\${output_members[*]}" "\$worker_dir"; then
                 echo "  └─ [OK] Verification successful (exit=\$ec)."
             else
                 echo "  └─ [FAIL] Integrity validation failed (exit=\$ec)."
@@ -3800,7 +3821,10 @@ async_perf_instrument_object() {
     # different subsets of the runtime ABI.
     async_perf_wrap_function "$ns" summon_worker SUMMON_NS 2>/dev/null || true
     async_perf_wrap_function "$ns" on_job_completed COMPLETE_HOOK_NS 2>/dev/null || true
-    async_perf_wrap_function "$ns" fifo_output FIFO_OUTPUT_NS 2>/dev/null || true
+    # Canonical DATA ABI is port-aware. fifo_output remains a compatibility
+    # alias for legacy single-output workers, but instrumentation follows the
+    # canonical fifo_output_port boundary.
+    async_perf_wrap_function "$ns" fifo_output_port FIFO_OUTPUT_NS 2>/dev/null || true
 }
 
 async_perf_instrument_machine() {
