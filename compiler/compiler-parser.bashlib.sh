@@ -56,8 +56,8 @@ dalo_parse_project() {
                 local obj="${current#OBJECT:}"
                 case "$key" in
                     TYPE) dalo_ir_set_object_type "$ir" "$obj" "$value" ;;
-                    MAX_JOBS) dalo_ir_set_object_field "$ir" "$obj" MAX_JOBS "$value" ;;
-                    *) printf 'daloc:%d: unknown OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
+                    [A-Z][A-Z0-9_]*) dalo_ir_set_object_field "$ir" "$obj" "$key" "$value" ;;
+                    *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
                 esac ;;
             *) printf 'daloc:%d: indented field without PROJECT/OBJECT\n' "$lineno" >&2; return 17 ;;
         esac

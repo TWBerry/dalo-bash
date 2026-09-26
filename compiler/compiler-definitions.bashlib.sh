@@ -12,7 +12,7 @@ DALO_WORKER_DEFINITION_ABI=1
 declare -gA DALO_OBJECT_DEF_FILE=() DALO_FEATURE_DEF_FILE=() DALO_WORKER_DEF_FILE=()
 
 dalo_object_definition_register(){
- local f="$1" t; jq -e '.abi==1 and (.type|type=="string") and (.ports|type=="object") and ((.features//[])|type=="array")' "$f" >/dev/null || return 5
+ local f="$1" t; jq -e '.abi==1 and (.type|type=="string") and (.ports|type=="object") and ((.port_patterns//[])|type=="array") and ((.instance_fields//{})|type=="object") and ((.features//[])|type=="array")' "$f" >/dev/null || return 5
  t="$(jq -r .type "$f")"; DALO_OBJECT_DEF_FILE["$t"]="$f"
 }
 dalo_feature_definition_register(){
@@ -31,12 +31,33 @@ dalo_definitions_load_tree(){
  for f in "$root"/definitions/workers/*.json; do [[ -e "$f" ]] && dalo_worker_definition_register "$f" || return; done
 }
 dalo_definition_validate_ir(){
- local p="$1" o type
- local nv="${p}_NAME"
- local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE"
+ local p="$1" o type file field field_type required min value
+ local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD"
  for o in "${objs[@]}"; do
    type="${types[$o]}"
    [[ -n "$type" ]] || { printf 'daloc: OBJECT %s missing TYPE\n' "$o" >&2; return 30; }
-   [[ -n "${DALO_OBJECT_DEF_FILE[$type]:-}" ]] || { printf 'daloc: undefined object type %s\n' "$type" >&2; return 31; }
+   file="${DALO_OBJECT_DEF_FILE[$type]:-}"
+   [[ -n "$file" ]] || { printf 'daloc: undefined object type %s\n' "$type" >&2; return 31; }
+
+   while IFS=$'\t' read -r field field_type required min; do
+     [[ -n "$field" ]] || continue
+     value="${fields["$o.$field"]:-}"
+     [[ "$required" != true || -n "$value" ]] || {
+       printf 'daloc: OBJECT %s (%s) requires field %s\n' "$o" "$type" "$field" >&2; return 32;
+     }
+     [[ -n "$value" ]] || continue
+     case "$field_type" in
+       uint)
+         [[ "$value" =~ ^[0-9]+$ ]] || {
+           printf 'daloc: OBJECT %s field %s must be uint\n' "$o" "$field" >&2; return 33;
+         }
+         if [[ "$min" != null ]] && (( value < min )); then
+           printf 'daloc: OBJECT %s field %s must be >= %s\n' "$o" "$field" "$min" >&2; return 34
+         fi
+         ;;
+       *) printf 'daloc: unsupported instance field type %s\n' "$field_type" >&2; return 35 ;;
+     esac
+   done < <(jq -r '(.instance_fields//{}) | to_entries[] |
+       [.key,.value.type,(.value.required//false),(.value.min//null)] | @tsv' "$file")
  done
 }

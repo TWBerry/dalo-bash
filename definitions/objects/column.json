@@ -1,0 +1,19 @@
+{
+  "abi": 1,
+  "type": "COLUMN",
+  "name": "Column",
+  "instance_fields": {
+    "INPUTS": {"type": "uint", "min": 1, "required": true},
+    "OUTPUTS": {"type": "uint", "min": 1, "required": true},
+    "MAX_JOBS": {"type": "uint", "min": 1, "required": false}
+  },
+  "ports": {},
+  "port_patterns": [
+    {"pattern":"^in([1-9][0-9]*)$","direction":"input","plane":"data","type":"any","index_group":1,"max_from_field":"INPUTS"},
+    {"pattern":"^out([1-9][0-9]*)$","direction":"output","plane":"data","type":"any","index_group":1,"max_from_field":"OUTPUTS"}
+  ],
+  "methods": ["receive","forward"],
+  "features": ["core","data","worker","structural"],
+  "worker": {"required": true},
+  "execution": ["INLINE","ASYNC","PERSISTENT"]
+}

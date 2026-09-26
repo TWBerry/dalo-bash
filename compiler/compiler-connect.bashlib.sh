@@ -29,27 +29,51 @@ dalo_connect_endpoint() {
 dalo_connect_port_field() {
     [ $# -eq 4 ] || return 2
     local ir="$1" object="$2" port="$3" field="$4"
-    local type file
+    local type file value pattern index_group max_field index max_value
     local -n types="${ir}_OBJECT_TYPE"
+    local -n fields="${ir}_OBJECT_FIELD"
 
-    [[ -v types["$object"] ]] || {
-        printf 'daloc: CONNECT references unknown OBJECT %s\n' "$object" >&2
-        return 42
-    }
-
+    [[ -v types["$object"] ]] || { printf 'daloc: CONNECT references unknown OBJECT %s\n' "$object" >&2; return 42; }
     type="${types[$object]}"
     file="${DALO_OBJECT_DEF_FILE[$type]:-}"
     [[ -n "$file" ]] || return 43
 
-    jq -er --arg p "$port" --arg f "$field" '
-        .ports[$p] as $port |
-        if $port == null then error("unknown port")
-        elif $port[$f] == null then error("unknown field")
-        else $port[$f] end
-    ' "$file" 2>/dev/null || {
-        printf 'daloc: invalid port %s.%s\n' "$object" "$port" >&2
-        return 44
-    }
+    if jq -e --arg p "$port" '.ports[$p] != null' "$file" >/dev/null 2>&1; then
+        value="$(jq -er --arg p "$port" --arg f "$field" '.ports[$p][$f] // error("unknown field")' "$file" 2>/dev/null)" || {
+            printf 'daloc: invalid port %s.%s\n' "$object" "$port" >&2; return 44;
+        }
+        printf '%s\n' "$value"
+        return
+    fi
+
+    while IFS=$'\t' read -r pattern index_group max_field value; do
+        [[ -n "$pattern" ]] || continue
+        [[ "$port" =~ $pattern ]] || continue
+
+        if [[ "$index_group" != null && "$max_field" != null ]]; then
+            index="${BASH_REMATCH[$index_group]}"
+            max_value="${fields["$object.$max_field"]:-}"
+            [[ "$max_value" =~ ^[0-9]+$ && "$index" -le "$max_value" ]] || {
+                printf 'daloc: port %s.%s exceeds %s=%s\n' \
+                    "$object" "$port" "$max_field" "${max_value:-unset}" >&2
+                return 44
+            }
+        fi
+
+        [[ -n "$value" ]] || {
+            printf 'daloc: port %s.%s has no field %s\n' "$object" "$port" "$field" >&2
+            return 44
+        }
+        printf '%s\n' "$value"
+        return
+    done < <(jq -r --arg f "$field" '
+        (.port_patterns // [])[] |
+        [.pattern, (.index_group // null), (.max_from_field // null), (.[$f] // "")] |
+        @tsv
+    ' "$file")
+
+    printf 'daloc: invalid port %s.%s\n' "$object" "$port" >&2
+    return 44
 }
 
 dalo_connect_infer_port() {
