@@ -60,7 +60,7 @@ dalo_definition_validate_ir(){
    done < <(jq -r '(.instance_fields//{}) | to_entries[] |
        [.key,.value.type,(.value.required//false),(.value.min//null)] | @tsv' "$file")
 
-   local -n worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE"
+   local -n worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION"
    local worker_required mode
    worker_required="$(jq -r '(.worker.required // false)' "$file")"
    if [[ "$worker_required" == true && -z "${worker_code[$o]:-}" ]]; then
@@ -71,11 +71,14 @@ dalo_definition_validate_ir(){
        bash -n "${worker_code[$o]}" || return 38
        mode="${worker_type[$o]:-inline}"
        case "$mode" in
-         inline) jq -e '.execution | index("INLINE") != null' "$file" >/dev/null || {
-             printf 'daloc: OBJECT %s does not allow INLINE execution\n' "$o" >&2; return 39; } ;;
-         include) jq -e '.execution | index("INCLUDE") != null' "$file" >/dev/null || {
-             printf 'daloc: OBJECT %s does not allow INCLUDE execution\n' "$o" >&2; return 39; } ;;
+         inline|include) ;;
+         *) printf 'daloc: OBJECT %s has invalid WORKER TYPE %s\n' "$o" "$mode" >&2; return 39 ;;
        esac
+       local execution="${worker_execution[$o]:-INLINE}"
+       jq -e --arg execution "$execution" '.execution | index($execution) != null' "$file" >/dev/null || {
+           printf 'daloc: OBJECT %s (%s) does not allow execution mode %s\n' "$o" "$type" "$execution" >&2
+           return 40
+       }
    fi
  done
 }

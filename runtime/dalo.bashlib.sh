@@ -3650,48 +3650,65 @@ __asyncmachine_link() {
         elif [[ "$emode" == PERSISTENT ]]; then
             {
                 printf '\n# Port-aware PERSISTENT worker pool for %s.\n' "$ns"
-                # Persistent children never mutate canonical parent vectors.
-                # DATA output returns as O frames; completion returns as a C frame.
-                printf '%s_PERSIST_FIFO="${TMPDIR:-/tmp}/%s.persist.$$.fifo"\n' "$ns" "$ns"
+                # DATA parent->child uses private anonymous pipes. The per-OBJECT
+                # FIFO remains exclusively child->parent/control transport.
                 printf '%s_PERSIST_PIDS=()\n' "$ns"
+                printf '%s_PERSIST_DATA_FDS=()\n' "$ns"
                 printf '%s_PERSIST_SEQ=0\n' "$ns"
+                printf '%s_PERSIST_NEXT=0\n' "$ns"
+                printf '%s_PERSIST_PENDING=0\n' "$ns"
                 printf '%s_persistent_start() {\n' "$ns"
-                printf '  [[ -p "$%s_PERSIST_FIFO" ]] || mkfifo "$%s_PERSIST_FIFO" || return\n' "$ns" "$ns"
-                printf '  local i line seq input_port payload rc\n'
+                printf '  local i fd pid\n'
                 printf '  for ((i=0;i<%s_MAX_JOBS;i++)); do\n' "$ns"
-                printf '    ( while IFS= read -r line; do\n'
-                printf '        [[ "$line" == STOP ]] && break\n'
-                printf '        IFS=$'"'"'\\t'"'"' read -r seq input_port payload <<<"$line"\n'
-                printf '        input_port="$(printf "%%b" "$input_port")"\n'
-                printf '        payload="$(printf "%%b" "$payload")"\n'
-                printf '        rc=0\n'
-                printf '        %s_worker "${TMPDIR:-/tmp}" "$seq" "$payload" || rc=$?\n' "$ns"
-                printf '        %s_fifo_call_parent %s_on_job_completed "$seq" "$rc"\n' "$ns" "$ns"
-                printf '      done <"$%s_PERSIST_FIFO" ) &\n' "$ns"
-                printf '    %s_PERSIST_PIDS+=("$!")\n' "$ns"
+                printf '    exec {fd}> >(%s_persistent_child_loop) || return\n' "$ns"
+                printf '    pid=$!\n'
+                printf '    %s_PERSIST_DATA_FDS[i]="$fd"\n' "$ns"
+                printf '    %s_PERSIST_PIDS[i]="$pid"\n' "$ns"
                 printf '  done\n'
-                printf '  exec {%s_PERSIST_FD}<>"$%s_PERSIST_FIFO"\n' "$ns" "$ns"
+                printf '}\n'
+                printf '%s_persistent_child_loop() {\n' "$ns"
+                printf '  local seq input_port payload rc\n'
+                printf '  while IFS=$'"'"'\t'"'"' read -r seq input_port payload; do\n'
+                printf '    [[ "$seq" == STOP ]] && break\n'
+                printf '    [[ "$seq" =~ ^[0-9]+$ && -n "$input_port" ]] || continue\n'
+                printf '    input_port="$(printf "%%b" "$input_port")"\n'
+                printf '    payload="$(printf "%%b" "$payload")"\n'
+                printf '    rc=0\n'
+                printf '    %s_worker "${TMPDIR:-/tmp}" "$seq" "$payload" || rc=$?\n' "$ns"
+                printf '    %s_fifo_call_parent %s_persistent_completed "$seq" "$rc"\n' "$ns" "$ns"
+                printf '  done\n'
                 printf '}\n'
                 printf '%s_summon_worker() {\n' "$ns"
                 printf '  [[ $# -ge 1 ]] || return 2\n'
                 printf '  local input_port="$1"; shift\n'
                 printf '  [[ "$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2\n'
                 printf '  %s_PERSIST_SEQ=$((%s_PERSIST_SEQ+1))\n' "$ns" "$ns"
-                printf '  local seq="$%s_PERSIST_SEQ" payload="$*" key\n' "$ns"
+                printf '  local seq="$%s_PERSIST_SEQ" payload="$*" key idx fd\n' "$ns"
                 printf '  %s_INPUT_DATA_VECTOR["$seq|$input_port"]="$payload"\n' "$ns"
                 printf '  for key in "${!%s_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$seq|"* ]] && unset '\''%s_OUTPUT_DATA_VECTOR['\''"$key"'\'']'\''; done\n' "$ns" "$ns"
-                printf '  input_port="${input_port//\\\\/\\\\\\\\}"; input_port="${input_port//$'"'"'\\t'"'"'/\\\\t}"; input_port="${input_port//$'"'"'\\n'"'"'/\\\\n}"\n'
-                printf '  payload="${payload//\\\\/\\\\\\\\}"; payload="${payload//$'"'"'\\t'"'"'/\\\\t}"; payload="${payload//$'"'"'\\n'"'"'/\\\\n}"\n'
-                printf '  printf "%%s\\t%%s\\t%%s\\n" "$seq" "$input_port" "$payload" >&"$%s_PERSIST_FD"\n' "$ns"
+                printf '  input_port="${input_port//\\/\\\\}"; input_port="${input_port//$'"'"'\t'"'"'/\\t}"; input_port="${input_port//$'"'"'\n'"'"'/\\n}"\n'
+                printf '  payload="${payload//\\/\\\\}"; payload="${payload//$'"'"'\t'"'"'/\\t}"; payload="${payload//$'"'"'\n'"'"'/\\n}"\n'
+                printf '  idx="$%s_PERSIST_NEXT"\n' "$ns"
+                printf '  %s_PERSIST_NEXT=$(((idx + 1) %% %s_MAX_JOBS))\n' "$ns" "$ns"
+                printf '  fd="${%s_PERSIST_DATA_FDS[idx]}"\n' "$ns"
+                printf '  %s_PERSIST_PENDING=$((%s_PERSIST_PENDING+1))\n' "$ns" "$ns"
+                printf '  printf "%%s\\t%%s\\t%%s\\n" "$seq" "$input_port" "$payload" >&"$fd"\n'
                 printf '}\n'
                 printf '%s_persistent_stop() {\n' "$ns"
-                printf '  local _; for _ in "${%s_PERSIST_PIDS[@]}"; do printf "STOP\\n" >&"$%s_PERSIST_FD"; done\n' "$ns" "$ns"
-                printf '  exec {%s_PERSIST_FD}>&-\n' "$ns"
-                printf '  for _ in "${%s_PERSIST_PIDS[@]}"; do wait "$_" 2>/dev/null || true; done\n' "$ns"
-                printf '  rm -f "$%s_PERSIST_FIFO"; %s_PERSIST_PIDS=()\n' "$ns" "$ns"
+                printf '  local i fd pid\n'
+                printf '  for ((i=0;i<${#%s_PERSIST_DATA_FDS[@]};i++)); do fd="${%s_PERSIST_DATA_FDS[i]}"; printf "STOP\\t_\\t_\\n" >&"$fd" 2>/dev/null || true; done\n' "$ns" "$ns"
+                printf '  for ((i=0;i<${#%s_PERSIST_DATA_FDS[@]};i++)); do fd="${%s_PERSIST_DATA_FDS[i]}"; eval "exec ${fd}>&-"; done\n' "$ns" "$ns"
+                printf '  for pid in "${%s_PERSIST_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done\n' "$ns"
+                printf '  %s_PERSIST_PIDS=(); %s_PERSIST_DATA_FDS=()\n' "$ns" "$ns"
                 printf '}\n'
-                # Drain until queued output/completion frames are visible to owner.
-                printf '%s_job_pool_wait() { sleep 0.02; %s_drain_fifo || true; }\n' "$ns" "$ns"
+                printf '%s_persistent_completed() {\n' "$ns"
+                printf '  local seq="$1" rc="$2"\n'
+                printf '  %s_on_job_completed "$seq" "$rc"\n' "$ns"
+                printf '  ((%s_PERSIST_PENDING > 0)) && %s_PERSIST_PENDING=$((%s_PERSIST_PENDING-1))\n' "$ns" "$ns" "$ns"
+                printf '}\n'
+                printf '%s_job_pool_wait() {\n' "$ns"
+                printf '  while ((%s_PERSIST_PENDING > 0)); do %s_drain_fifo || true; ((%s_PERSIST_PENDING > 0)) && sleep 0.001; done\n' "$ns" "$ns" "$ns"
+                printf '}\n'
                 printf '%s_persistent_start || exit $?\n' "$ns"
             } >>"$out"
         fi
@@ -3714,12 +3731,35 @@ __asyncmachine_link() {
     {
         printf '\nASYNC_MACHINE_READY=1\n'
         printf 'async_machine_wait_all() {\n'
+        printf '  local __dalo_pending\n'
+        printf '  while :; do\n'
+        printf '    __dalo_pending=0\n'
     } >>"$out"
+    # PROJECT quiescence barrier. Never wait objects sequentially: draining one
+    # object may directly enqueue work in another object, including one already
+    # visited in this pass. Drain every object, inspect all execution-mode
+    # counters, and iterate to a fixpoint.
     for obj in "${objs[@]}"; do
         ns="${machine_ns[$obj]}"
-        printf '  %s_job_pool_wait || return\n' "$ns" >>"$out"
+        printf '    %s_drain_fifo || return\n' "$ns" >>"$out"
+    done
+    for obj in "${objs[@]}"; do
+        ns="${machine_ns[$obj]}"
+        emode="${execm[$obj]:-INLINE}"
+        [[ "$emode" == DIRECT ]] && emode=INLINE
+        case "$emode" in
+            ASYNC)
+                printf '    if ((%s_PENDING_JOBS > 0)); then %s_reap_one || return; __dalo_pending=1; fi\n' "$ns" "$ns" >>"$out"
+                ;;
+            PERSISTENT)
+                printf '    ((%s_PERSIST_PENDING > 0)) && __dalo_pending=1\n' "$ns" >>"$out"
+                ;;
+        esac
     done
     {
+        printf '    ((__dalo_pending == 0)) && return 0\n'
+        printf '    sleep 0.001\n'
+        printf '  done\n'
         printf '}\n'
         printf 'async_machine_main() {\n'
         printf '  async_machine_parse_args "$@" || return\n'

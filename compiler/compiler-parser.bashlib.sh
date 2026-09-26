@@ -87,6 +87,10 @@ dalo_parse_project() {
                     case "$value" in inline|include) dalo_ir_set_worker_type "$ir" "$current_object" "$value" ;;
                         *) printf 'daloc:%d: WORKER TYPE must be inline or include\n' "$lineno" >&2; return 19 ;;
                     esac ;;
+                EXECUTION)
+                    case "$value" in INLINE|ASYNC|PERSISTENT) dalo_ir_set_worker_execution "$ir" "$current_object" "$value" ;;
+                        *) printf 'daloc:%d: WORKER EXECUTION must be INLINE, ASYNC, or PERSISTENT\n' "$lineno" >&2; return 19 ;;
+                    esac ;;
                 *) printf 'daloc:%d: unknown WORKER field %s\n' "$lineno" "$key" >&2; return 19 ;;
             esac
             continue

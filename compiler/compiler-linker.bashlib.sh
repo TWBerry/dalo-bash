@@ -12,7 +12,7 @@ dalo_link_machine(){
     local nv="${p}_NAME" vv="${p}_VERSION"
     local name="${!nv}" version="${!vv}" obj edge mode workers
     local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD"
-    local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE"
+    local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION"
 
     # Backend ABI expected by the established executable-machine linker.
     local backend="DALO_MACHINE_BUILD"
@@ -37,7 +37,7 @@ dalo_link_machine(){
                 return 70
             }
             b_wf["$obj"]="${worker_code[$obj]}"
-            b_exec["$obj"]="INLINE"
+            b_exec["$obj"]="${worker_execution[$obj]:-INLINE}"
         fi
     done
     printf -v "${backend}_MAX_WORKERS_PER_OBJECT" '%s' 1
