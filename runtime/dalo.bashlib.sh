@@ -1,4 +1,8 @@
 #!/bin/bash
+DALO_LIBRARY_ABI=1
+DALO_LIBRARY_NAME="dalo"
+DALO_LIBRARY_VERSION="1.0.0"
+DALO_LIBRARY_REQUIRES="helpers"
 # ==============================================================================
 # Async object / project compiler runtime for Bash.
 #
@@ -31,59 +35,22 @@
 # Requirements: Bash >= 4.3. sha256sum or shasum is required for project hashes.
 # ==============================================================================
 
+# Loaded DALO modules may use this to select namespaced/code-recorded installation.
+if [ "${DALO_INCLUDE:-0}" -eq 0 ]; then
+    DALO_INCLUDE=1
+else
+    return 0
+fi
+
+__dalo_library_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return
+source "${__dalo_library_dir}/helpers.bashlib.sh" || return
+unset __dalo_library_dir
 # ============================================================================
 # 0. OBJECT VARIABLE / CODE STORAGE BOOTSTRAP
 # ============================================================================
 
-__asyncobj_ensure_variable_storage() {
-    local ns="$1"
-    declare -p "${ns}_VARIABLE_TYPE" >/dev/null 2>&1 || eval "declare -gA ${ns}_VARIABLE_TYPE=()"
-    declare -p "${ns}_VARIABLE_VALUE" >/dev/null 2>&1 || eval "declare -gA ${ns}_VARIABLE_VALUE=()"
-    declare -p "${ns}_CODE_ORDER" >/dev/null 2>&1 || eval "declare -ga ${ns}_CODE_ORDER=()"
-    local code_var="${ns}_variables_code"
-    if ! declare -p "$code_var" >/dev/null 2>&1; then
-        printf -v "$code_var" '%s' ""
-    fi
-}
 
-__asyncobj_record_code() {
-    local ns="$1" component="$2" code="$3"
-    __asyncobj_ensure_variable_storage "$ns"
 
-    local type_name="${ns}_VARIABLE_TYPE"
-    local value_name="${ns}_VARIABLE_VALUE"
-    local order_name="${ns}_CODE_ORDER"
-    local -n _types="$type_name" _values="$value_name" _order="$order_name"
-    local key="code.${component}"
-
-    if [[ ! -v _types["$key"] ]]; then
-        _order+=("$key")
-    fi
-    _types["$key"]="bash"
-    _values["$key"]="$code"
-
-    local aggregate="" k
-    for k in "${_order[@]}"; do
-        aggregate+="${_values[$k]}"$'\n'
-    done
-    printf -v "${ns}_variables_code" '%s' "$aggregate"
-}
-
-__asyncobj_eval_body() {
-    local ns="$1" component="$2" body="$3"
-    local tmp
-    tmp="$(mktemp "${TMPDIR:-/tmp}/asyncobj-body.XXXXXX")" || return 1
-    printf '%s\n' "$body" > "$tmp"
-    if ! bash -n "$tmp"; then
-        rm -f -- "$tmp"
-        printf 'Chyba [%s]: generated component %s neprošel bash -n\n' "$ns" "$component" >&2
-        return 2
-    fi
-    rm -f -- "$tmp"
-
-    eval "$body" || return
-    __asyncobj_record_code "$ns" "$component" "$body"
-}
 
 define_variable_api() {
     local ns="$1"
@@ -232,321 +199,10 @@ fifo_close() {
 }
 
 # ============================================================================
-# 2. SYNC ITERÁTORY
+# 2. ITERÁTORY A REKURZORY
 # ============================================================================
-
-Make_iterator() {
-    local array_name="$1" var_start="$2" var_end="$3" var_elem="$4" var_ret="$5"
-    local body
-    body=$(cat <<EOF
-iterator_over_${array_name}() {
-    local ${var_start}="\$1" ${var_end}="\$2"
-    local func="\$3"; shift 3
-    local idx
-    for (( idx=${var_start}; idx<=${var_end}; idx++ )); do
-        local ${var_elem}
-        printf -v ${var_elem} '%s' "\${${array_name}[\$idx]}"
-        local ${var_ret}=0
-        "\$func" "\$idx" "\$${var_elem}" "\$@" || ${var_ret}=\$?
-        [ "\$${var_ret}" -eq 0 ] || return "\$${var_ret}"
-    done
-}
-EOF
-)
-    eval "$body"
-}
-
-Make_file_iterator() {
-    local gen_name="$1" var_line="$2" var_ret="$3"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local _file="\$1" _func="\$2"; shift 2
-    [ -r "\$_file" ] || return 1
-    local ${var_line} ${var_ret}=0 _ln=0
-    while IFS= read -r ${var_line} || [ -n "\$${var_line}" ]; do
-        _ln=\$(( _ln + 1 ))
-        [ -n "\$${var_line}" ] || continue
-        ${var_ret}=0
-        "\$_func" "\$_ln" "\$${var_line}" "\$@" || ${var_ret}=\$?
-        [ "\$${var_ret}" -eq 0 ] || return "\$${var_ret}"
-    done < "\$_file"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_range_iterator() {
-    local gen_name="$1" var_i="$2" var_ret="$3"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local _start="\$1" _end="\$2" _step="\$3" _func="\$4"; shift 4
-    local ${var_i} ${var_ret}=0
-    for (( ${var_i}=_start; ${var_i}<=_end; ${var_i}+=_step )); do
-        ${var_ret}=0
-        "\$_func" "\$${var_i}" "\$@" || ${var_ret}=\$?
-        [ "\$${var_ret}" -eq 0 ] || return "\$${var_ret}"
-    done
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_xy_iterator() {
-    local gen_name="$1" var_x="$2" var_y="$3" var_ret="$4"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local _xs="\$1" _xe="\$2" _yoff="\$3" _ye="\$4" _ystep="\$5" _func="\$6"; shift 6
-    local ${var_x} ${var_y} ${var_ret}=0
-    for (( ${var_x}=_xs; ${var_x}<=_xe; ${var_x}++ )); do
-        for (( ${var_y}=${var_x}+_yoff; ${var_y}<=_ye; ${var_y}+=_ystep )); do
-            ${var_ret}=0
-            "\$_func" "\$${var_x}" "\$${var_y}" "\$@" || ${var_ret}=\$?
-            [ "\$${var_ret}" -eq 0 ] || return "\$${var_ret}"
-        done
-    done
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_glob_iterator() {
-    local gen_name="$1" var_path="$2" var_ret="$3"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local _pattern="\$1" _func="\$2"; shift 2
-    local _on="\$(shopt -p nullglob)" _od="\$(shopt -p dotglob)"
-    shopt -s nullglob dotglob
-    local ${var_path} ${var_ret}=0
-    for ${var_path} in \$_pattern; do
-        ${var_ret}=0
-        "\$_func" "\$${var_path}" "\$@" || ${var_ret}=\$?
-        if [ "\$${var_ret}" -ne 0 ]; then
-            eval "\$_on"; eval "\$_od"; return "\$${var_ret}"
-        fi
-    done
-    eval "\$_on"; eval "\$_od"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_dir_glob_iterator() {
-    local gen_name="$1" var_path="$2" var_ret="$3"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local _pattern="\$1" _func="\$2"; shift 2
-    local _on="\$(shopt -p nullglob)" _od="\$(shopt -p dotglob)"
-    shopt -s nullglob dotglob
-    local ${var_path} ${var_ret}=0
-    for ${var_path} in \$_pattern; do
-        [ -d "\$${var_path}" ] || continue
-        ${var_path}="\${${var_path}%/}"
-        ${var_ret}=0
-        "\$_func" "\$${var_path}" "\$@" || ${var_ret}=\$?
-        if [ "\$${var_ret}" -ne 0 ]; then
-            eval "\$_on"; eval "\$_od"; return "\$${var_ret}"
-        fi
-    done
-    eval "\$_on"; eval "\$_od"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-# ============================================================================
-# 3. SYNC REKURZOR (DFS)
-# ============================================================================
-
-Make_recursor() {
-    local gen_name="$1" var_path="$2"
-    local body
-    body=$(cat <<EOF
-${gen_name}() {
-    local ${var_path}="\$1" _enter="\$2" _leave="\$3"; shift 3
-    if [ -n "\$_enter" ]; then "\$_enter" "\$${var_path}" "\$@" || return \$?; fi
-    local _on="\$(shopt -p nullglob)"; shopt -s nullglob
-    local _sub
-    for _sub in "\$${var_path}"/*/; do
-        [ -d "\$_sub" ] || continue
-        ${gen_name} "\${_sub%/}" "\$_enter" "\$_leave" "\$@" || {
-            local _rc=\$?; eval "\$_on"; return \$_rc
-        }
-    done
-    eval "\$_on"
-    if [ -n "\$_leave" ]; then "\$_leave" "\$${var_path}" "\$@" || return \$?; fi
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-# ============================================================================
-# 4. ASYNC ITERÁTORY
-# ============================================================================
-
-Make_async_iterator() {
-    local ns="$1" array_name="$2" var_start="$3" var_end="$4" var_elem="$5"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_${array_name}() {
-    local ${var_start}="\$1" ${var_end}="\$2"
-    local func="\$3" cleanup_func="\${4:-}"
-    shift 4 2>/dev/null || shift \$#
-    local idx
-    for (( idx=${var_start}; idx<=${var_end}; idx++ )); do
-        local ${var_elem}
-        printf -v ${var_elem} '%s' "\${${array_name}[\$idx]}"
-        ${ns}_job_pool_submit "\$func" "\$cleanup_func" "\$${var_elem}" "\$@"
-    done
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_async_file_iterator() {
-    local ns="$1" var_line="$2"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_file() {
-    local _file="\$1" _func="\$2" _cleanup="\${3:-}"
-    shift 3 2>/dev/null || shift \$#
-    [ -r "\$_file" ] || return 1
-    local ${var_line} _ln=0
-    while IFS= read -r ${var_line} || [ -n "\$${var_line}" ]; do
-        _ln=\$(( _ln + 1 ))
-        [ -n "\$${var_line}" ] || continue
-        ${ns}_job_pool_submit "\$_func" "\$_cleanup" "\$${var_line}" "\$@"
-    done < "\$_file"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_async_range_iterator() {
-    local ns="$1" var_i="$2"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_range() {
-    local _start="\$1" _end="\$2" _step="\$3" _func="\$4" _cleanup="\${5:-}"
-    shift 5 2>/dev/null || shift \$#
-    local ${var_i}
-    for (( ${var_i}=_start; ${var_i}<=_end; ${var_i}+=_step )); do
-        ${ns}_job_pool_submit "\$_func" "\$_cleanup" "\$${var_i}" "\$@"
-    done
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_async_xy_iterator() {
-    local ns="$1" var_x="$2" var_y="$3"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_xy() {
-    local _xs="\$1" _xe="\$2" _yoff="\$3" _ye="\$4" _ystep="\$5"
-    local _func="\$6" _cleanup="\${7:-}"
-    shift 7 2>/dev/null || shift \$#
-    local ${var_x} ${var_y}
-    for (( ${var_x}=_xs; ${var_x}<=_xe; ${var_x}++ )); do
-        for (( ${var_y}=${var_x}+_yoff; ${var_y}<=_ye; ${var_y}+=_ystep )); do
-            ${ns}_job_pool_submit "\$_func" "\$_cleanup" "\$${var_x}" "\$${var_y}" "\$@"
-        done
-    done
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_async_glob_iterator() {
-    local ns="$1" var_path="$2"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_glob() {
-    local _pattern="\$1" _func="\$2" _cleanup="\${3:-}"
-    shift 3 2>/dev/null || shift \$#
-    local _on="\$(shopt -p nullglob)" _od="\$(shopt -p dotglob)"
-    shopt -s nullglob dotglob
-    local ${var_path}
-    for ${var_path} in \$_pattern; do
-        ${ns}_job_pool_submit "\$_func" "\$_cleanup" "\$${var_path}" "\$@"
-    done
-    eval "\$_on"; eval "\$_od"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-Make_async_dir_glob_iterator() {
-    local ns="$1" var_path="$2"
-    local body
-    body=$(cat <<EOF
-${ns}_async_iterator_over_dir_glob() {
-    local _pattern="\$1" _func="\$2" _cleanup="\${3:-}"
-    shift 3 2>/dev/null || shift \$#
-    local _on="\$(shopt -p nullglob)" _od="\$(shopt -p dotglob)"
-    shopt -s nullglob dotglob
-    local ${var_path}
-    for ${var_path} in \$_pattern; do
-        [ -d "\$${var_path}" ] || continue
-        ${var_path}="\${${var_path}%/}"
-        ${ns}_job_pool_submit "\$_func" "\$_cleanup" "\$${var_path}" "\$@"
-    done
-    eval "\$_on"; eval "\$_od"
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-# ============================================================================
-# 5. ASYNC REKURZOR
-# ============================================================================
-
-Make_async_recursor() {
-    local ns="$1" gen_name="$2" var_path="$3"
-    local body
-    body=$(cat <<EOF
-${ns}_${gen_name}() {
-    local _root="\$1" _enter="\$2" _leave="\$3" _cleanup="\${4:-}"
-    shift 4 2>/dev/null || shift \$#
-    ${ns}_${gen_name}_impl "\$_root" "\$_enter" "\$_leave" "\$_cleanup" "\$@"
-}
-
-${ns}_${gen_name}_impl() {
-    local ${var_path}="\$1" _enter="\$2" _leave="\$3" _cleanup="\$4"; shift 4
-    if [ -n "\$_enter" ]; then "\$_enter" "\$${var_path}" "\$@" || return \$?; fi
-    local _on="\$(shopt -p nullglob)"; shopt -s nullglob
-    local _sub
-    for _sub in "\$${var_path}"/*/; do
-        [ -d "\$_sub" ] || continue
-        ${ns}_${gen_name}_impl "\${_sub%/}" "\$_enter" "\$_leave" "\$_cleanup" "\$@" || {
-            local _rc=\$?; eval "\$_on"; return \$_rc
-        }
-    done
-    eval "\$_on"
-    if [ -n "\$_leave" ]; then
-        ${ns}_job_pool_submit "\$_leave" "\$_cleanup" "\$${var_path}" "\$@"
-    fi
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
+# Přesunuto do samostatné knihovny iterators.bashlib.sh.
+# iterators.bashlib.sh závisí na DALO core API (__asyncobj_eval_body a job pool).
 
 # ============================================================================
 # 6. DEFINICE METOD INSTANCE
@@ -2136,15 +1792,6 @@ object_enable_snapshot() {
 # 10. LOCAL OBJECT ADDRESSING + FD REGISTRIES + RESOURCE_CONTAINER v2
 # ============================================================================
 
-__asyncobj_random_hex() {
-    local bytes="${1:-8}" out=""
-    if [ -r /dev/urandom ]; then
-        out="$(od -An -N "$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return
-    else
-        printf -v out '%08x%08x' "$RANDOM$RANDOM" "$RANDOM$RANDOM"
-    fi
-    printf '%s\n' "$out"
-}
 
 __asyncobj_ensure_global_registries() {
     declare -p ALL_FIFO >/dev/null 2>&1 || declare -gA ALL_FIFO=()
@@ -2392,12 +2039,6 @@ close_resource() {
 # 11. TWO-ASYNC_SCRIPT MIGRATION VERTICAL SLICE v1
 # ============================================================================
 
-__asyncobj_decode_q() {
-    [ $# -eq 2 ] || return 2
-    local encoded="$1" outvar="$2" decoded
-    eval "decoded=$encoded" || return
-    printf -v "$outvar" '%s' "$decoded"
-}
 
 migration_export() {
     [ $# -eq 2 ] || return 2
@@ -2653,13 +2294,6 @@ __asyncscript_target_call() {
     esac
 }
 
-__asyncscript_sha256() {
-    [ $# -eq 1 ] || return 2
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
-    else return 127
-    fi
-}
 
 __asyncscript_implant_worker() {
     [ $# -eq 2 ] || return 2
@@ -2703,7 +2337,7 @@ compile_topology() {
             __asyncscript_implant_worker "$ns" "$worker_file" || return
             local -n wa="${as}_WORKER_ARTIFACT" wh="${as}_WORKER_SHA256" wo="${as}_WORKER_ORIGIN"
             wa["$obj"]="$outdir/${ns}.worker.bash"
-            wh["$obj"]="$(__asyncscript_sha256 "${wa[$obj]}")" || return
+            wh["$obj"]="$(__dalo_sha256_file "${wa[$obj]}")" || return
             wo["$obj"]="IMPLANTED"
             printf 'WORKER\t%s\t%s\t%s\t%s\n' "$obj" "$ns" "${wh[$obj]}" "${wo[$obj]}" >>"$outdir/topology.graph"
         else
@@ -2801,7 +2435,7 @@ migration_export_with_worker() {
     sed -i $'s/^OBJECT_TYPE\t.*/OBJECT_TYPE\tBLANK/' "$bundle_dir/object.snapshot"
 
     cp "$artifact" "$bundle_dir/worker.bash" || return
-    actual="$(__asyncscript_sha256 "$bundle_dir/worker.bash")" || return
+    actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 5
     printf '%s\n' "$expected" >"$bundle_dir/worker.sha256"
     printf '%s\n' "${ns}_UUID" >"$bundle_dir/source.uuid.var"
@@ -2815,7 +2449,7 @@ migration_import_with_worker() {
     [[ -r "$bundle_dir/object.snapshot" && -r "$bundle_dir/worker.bash" &&
        -r "$bundle_dir/worker.sha256" ]] || return 3
     IFS= read -r expected <"$bundle_dir/worker.sha256" || return
-    actual="$(__asyncscript_sha256 "$bundle_dir/worker.bash")" || return
+    actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 4
 
     # STEP16 migration_import(snapshot,new_ns) creates a fresh object identity,
@@ -4133,7 +3767,7 @@ compile_project() {
     mkdir -p -- "$outdir" || return
     local source="$outdir/project.dalo" machine="$outdir/async_script.bash" hash
     save_project "$project" "$source" || return
-    hash="$(__asyncscript_sha256 "$source")" || return
+    hash="$(__dalo_sha256_file "$source")" || return
     __asyncmachine_link "$project" "$source" "$machine" "$hash" || return
 
     # Compilation is non-destructive: the project remains editable and may be
@@ -4363,16 +3997,6 @@ declare -g -A DALO_WORKER_DEF_FILE=()
 declare -g -A DALO_WORKER_DEF_JSON=()
 declare -g -A DALO_WORKER_DEF_ARTIFACT=()
 
-__dalo_sha256_file() {
-    [ $# -eq 1 ] || return 2
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -- "$1" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -- "$1" | awk '{print $1}'
-    else
-        return 127
-    fi
-}
 
 __dalo_worker_resolve_artifact() {
     [ $# -eq 2 ] || return 2
