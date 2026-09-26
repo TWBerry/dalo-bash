@@ -1089,13 +1089,9 @@ define_summon_worker() {
     local ns="$1"
     local body
     body=$(cat <<EOF
-# Compatibility entry point: ordinary objects have canonical input "in".
+# Canonical OBJECT -> WORKER boundary.
+# ABI: summon_worker INPUT_PORT DATA...
 ${ns}_summon_worker() {
-    ${ns}_job_pool_add_work_port in "\$@"
-}
-
-# Canonical graph DATA entry point. Destination input identity is preserved.
-${ns}_receive() {
     [ \$# -ge 1 ] || return 2
     local input_port="\$1"; shift
     [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
@@ -2300,7 +2296,7 @@ define_vector_forward_hook() {
 "
     while (( $# )); do
         src="$1"; dst_ns="$2"; dst_port="$3"; shift 3
-        printf -v body '%s            %q) %s_receive %q "$value" ;;\n' "$body" "$src" "$dst_ns" "$dst_port"
+        printf -v body '%s            %q) %s_summon_worker %q "$value" ;;\n' "$body" "$src" "$dst_ns" "$dst_port"
     done
     body+="            *) printf 'Chyba [${ns}/${obj_type}]: output port bez route: %s\\n' \"\$port\" >&2; return 70 ;;
         esac
@@ -3740,7 +3736,7 @@ __asyncmachine_link() {
                 printf '  local slot_id="$1" output_port="$2"; shift 2\n'
                 printf '  %s_OUTPUT_DATA_VECTOR["$slot_id|$output_port"]="$*"\n' "$ns"
                 printf '}\n'
-                printf '%s_receive() {\n' "$ns"
+                printf '%s_summon_worker() {\n' "$ns"
                 printf '  [[ $# -ge 1 ]] || return 2\n'
                 printf '  local input_port="$1"; shift\n'
                 printf '  %s_fast_slot=$((%s_fast_slot + 1))\n' "$ns" "$ns"
@@ -3750,7 +3746,6 @@ __asyncmachine_link() {
                 printf '  %s_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"\n' "$ns"
                 printf '  %s_on_job_completed "$slot_id" 0\n' "$ns"
                 printf '}\n'
-                printf '%s_summon_worker() { %s_receive in "$@"; }\n' "$ns" "$ns"
                 printf '%s_job_pool_wait() { :; }\n' "$ns"
             } >>"$out"
 
