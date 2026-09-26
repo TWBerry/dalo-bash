@@ -1,46 +1,55 @@
 # DALO `helpers.bashlib.sh`
 
-## Účel
+## Purpose
 
-`helpers.bashlib.sh` obsahuje nízkoúrovňové utility sdílené DALO moduly.
+`helpers.bashlib.sh` is the lowest-level shared utility library used by
+DALO runtime modules and generated code. It deliberately contains small,
+reusable mechanisms rather than object policy, scheduling policy, graph
+semantics, or application behavior.
 
-Metadata:
+Library metadata:
 
-```bash
+``` bash
 DALO_LIBRARY_ABI=1
 DALO_LIBRARY_NAME="helpers"
 DALO_LIBRARY_VERSION="1.0.0"
 DALO_LIBRARY_REQUIRES=""
 ```
 
-`helpers` nemá žádné DALO library dependencies.
+`helpers` has no DALO library dependencies.
 
-Doporučené načtení:
+Recommended loading:
 
-```bash
-source ./library.sh
+``` bash
+DALO_LIBRARY_PATH="./runtime"
+source ./runtime/library.sh
 include helpers
 ```
 
-Ve většině aplikací není nutné `helpers` includovat přímo, protože jej načte dependency resolver knihovny, která ho potřebuje.
+Most applications should not need to include `helpers` directly. The
+dependency-aware loader loads it automatically when a higher-level
+library requires it.
 
 ## Include guard
 
-Knihovna používá:
+The library uses:
 
-```bash
+``` bash
 DALO_HELPERS_INCLUDE
 ```
 
-Opakovaný `source` tedy neprovede znovu definici modulu.
+Repeated sourcing therefore does not redefine the module.
 
-## Status API
+## API stability
 
-Funkce s prefixem `__` jsou interní DALO API. Aplikační kód by na nich neměl stavět jako na stabilním veřejném rozhraní.
+Functions whose names begin with `__` are internal DALO APIs. They are
+documented because they are architecturally important, but application
+code should not treat them as stable public interfaces unless a future
+ABI explicitly promotes them.
 
-Aktuální helpery:
+Current helper family:
 
-```text
+``` text
 __asyncobj_ensure_variable_storage
 __asyncobj_record_code
 __asyncobj_eval_body
@@ -49,152 +58,178 @@ __asyncobj_decode_q
 __dalo_sha256_file
 ```
 
-## `__asyncobj_ensure_variable_storage`
+## Canonical generated-code storage
 
-```bash
+DALO uses Bash as both a runtime language and a code-generation
+language. Generated object components must therefore be installable into
+the live shell and representable as canonical object code for
+reconstruction, migration, and standalone MACHINE linking.
+
+### `__asyncobj_ensure_variable_storage`
+
+``` bash
 __asyncobj_ensure_variable_storage NS
 ```
 
-Připraví namespaced storage potřebný pro canonical/generated code.
+Ensures that the namespace has the storage required by generated
+variables and generated code.
 
-Pro namespace `FOO` zajistí existenci:
+For namespace `FOO`, the helper prepares structures conceptually
+equivalent to:
 
-```text
+``` text
 FOO_VARIABLE_TYPE
 FOO_VARIABLE_VALUE
 FOO_CODE_ORDER
 FOO_variables_code
 ```
 
-První tři struktury jsou vytvářeny podle potřeby jako globální arrays; `FOO_variables_code` obsahuje agregovaný generovaný Bash kód.
+The first structures hold canonical namespaced state. `FOO_CODE_ORDER`
+preserves deterministic component ordering. `FOO_variables_code` is the
+aggregate Bash source image reconstructed from recorded components.
 
-## `__asyncobj_record_code`
+### `__asyncobj_record_code`
 
-```bash
+``` bash
 __asyncobj_record_code NS COMPONENT CODE
 ```
 
-Zapíše generovaný Bash kód jako komponentu namespace.
+Records generated Bash source as a named component of an object's
+canonical code image.
 
-Klíč má tvar:
+The component is stored under a logical key:
 
-```text
+``` text
 code.<COMPONENT>
 ```
 
-Typ je uložen jako:
+with type:
 
-```text
+``` text
 bash
 ```
 
-Po zápisu se z pořadí `NS_CODE_ORDER` znovu sestaví:
+After the update, the aggregate `${NS}_variables_code` is rebuilt in
+`${NS}_CODE_ORDER`.
 
-```text
-NS_variables_code
-```
+Important properties:
 
-Tím DALO zachovává canonical code image v determinovaném pořadí komponent.
+-   component order is deterministic;
+-   replacing an existing component updates its value without
+    duplicating its order entry;
+-   the stored source is a reconstruction artifact, not merely a
+    debugging dump;
+-   the same representation supports runtime construction and
+    migration-oriented reconstruction.
 
-Pokud komponenta již existuje, její klíč se nepřidává podruhé do `CODE_ORDER`; její hodnota se aktualizuje.
+### `__asyncobj_eval_body`
 
-## `__asyncobj_eval_body`
-
-```bash
+``` bash
 __asyncobj_eval_body NS COMPONENT BODY
 ```
 
-Instaluje dynamicky generovaný Bash body do aktuálního shellu a současně jej zaznamená do canonical code storage.
+Installs generated Bash code into the current shell and records the same
+source in canonical code storage.
 
-Postup:
+Conceptual sequence:
 
-```text
+``` text
 BODY
- ↓
-temporary file
- ↓
+  │
+  ▼
+temporary source
+  │
+  ▼
 bash -n
- ↓
-eval
- ↓
+  │
+  ▼
+eval into live shell
+  │
+  ▼
 __asyncobj_record_code
 ```
 
-Pokud generovaný kód neprojde `bash -n`, funkce jej nevyhodnotí a vrátí chybu.
+If syntax validation fails, the generated body is not evaluated.
 
-Tento helper je důležitý například pro generátory v `iterators.bashlib.sh`.
+This is the preferred installation path for DALO metafunctions because
+it keeps live runtime behavior and the canonical reconstruction image
+synchronized.
 
-## `__asyncobj_random_hex`
+## Random identity helper
 
-```bash
+### `__asyncobj_random_hex`
+
+``` bash
 __asyncobj_random_hex [BYTES]
 ```
 
-Generuje hexadecimální náhodnou hodnotu.
+Writes a hexadecimal random value to stdout. The default size is eight
+bytes.
 
-Výchozí:
+When available, `/dev/urandom` is used. A Bash `$RANDOM`-based fallback
+exists for constrained environments.
 
-```bash
-__asyncobj_random_hex
-```
+This helper is suitable for runtime identifiers and nonce-like local
+values. It is not documented as a cryptographic protocol primitive.
 
-používá 8 bytů.
+## Bash `%q` decoding
 
-Pokud je dostupné `/dev/urandom`, čte náhodná data z něj. Jinak používá fallback založený na Bash `$RANDOM`.
+### `__asyncobj_decode_q`
 
-Výstup je zapsán na stdout.
-
-## `__asyncobj_decode_q`
-
-```bash
+``` bash
 __asyncobj_decode_q ENCODED OUTVAR
 ```
 
-Dekóduje Bash-escaped hodnotu a uloží výsledek do proměnné pojmenované `OUTVAR`.
+Decodes a Bash-escaped value and stores the result in the variable named
+by `OUTVAR`.
 
-Příklad použití interního API:
+Example:
 
-```bash
+``` bash
 encoded='hello\ world'
 __asyncobj_decode_q "$encoded" result
 printf '%s\n' "$result"
 ```
 
-Výsledkem je:
+Result:
 
-```text
+``` text
 hello world
 ```
 
-Helper používá Bash `eval`, proto je určen pro DALO-interní hodnoty/framing, nikoli jako obecný parser nedůvěryhodného vstupu.
+The helper uses Bash evaluation semantics. It exists for DALO-controlled
+framing and canonical encodings; it must not be treated as a general
+parser for arbitrary untrusted text.
 
-## `__dalo_sha256_file`
+## File hashing
 
-```bash
+### `__dalo_sha256_file`
+
+``` bash
 __dalo_sha256_file FILE
 ```
 
-Vrátí SHA-256 souboru na stdout.
+Writes the SHA-256 digest of `FILE` to stdout.
 
-Preferuje:
+Backend preference:
 
-```text
+``` text
 sha256sum
-```
-
-a pokud není dostupný, použije:
-
-```text
+    ↓ fallback
 shasum -a 256
 ```
 
-Pokud není dostupný ani jeden backend, vrací status `127`.
+If neither backend exists, the helper returns status `127`.
 
-## Vztah k ostatním knihovnám
+Hashes are useful for worker artifacts, generated artifacts, identity
+checks, cache validation, and migration integrity checks. A digest alone
+is not authentication.
 
-Aktuální dependency vztah:
+## Dependency position
 
-```text
+The current core dependency direction is:
+
+``` text
 helpers
    ↓
  dalo
@@ -202,4 +237,6 @@ helpers
 iterators
 ```
 
-`helpers` je spodní utility vrstva. Nemá obsahovat vysokou DALO objektovou logiku ani aplikační funkce; jeho účelem jsou malé sdílené mechanismy používané více moduly.
+`helpers` must remain a mechanism layer. Object scheduling, topology,
+worker semantics, orchestration policy, and distributed resource policy
+belong above it.

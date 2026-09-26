@@ -1,144 +1,156 @@
 # DALO `iterators.bashlib.sh`
 
-## Účel
+## Purpose
 
-`iterators.bashlib.sh` obsahuje generátory synchronních a asynchronních iteratorů a DFS recursorů.
+`iterators.bashlib.sh` provides metafunctions that generate specialized
+synchronous iterators, asynchronous job-pool iterators, and depth-first
+recursive traversals.
 
 Metadata:
 
-```bash
+``` bash
 DALO_LIBRARY_ABI=1
 DALO_LIBRARY_NAME="iterators"
 DALO_LIBRARY_VERSION="1.0.0"
 DALO_LIBRARY_REQUIRES="dalo helpers"
 ```
 
-Doporučené načtení:
+Recommended loading:
 
-```bash
-source ./library.sh
+``` bash
+DALO_LIBRARY_PATH="./runtime"
+source ./runtime/library.sh
 include iterators
 ```
 
-Loader automaticky zajistí dependency pořadí.
+The loader resolves `helpers` and `dalo` automatically.
+
+## Why iterator generators exist
+
+DALO deliberately uses metafunctions rather than forcing every traversal
+through one generic runtime dispatcher. A `Make_*` function specializes
+Bash source for known variable names, arrays, namespaces, and callback
+shape.
+
+The generated code can therefore be:
+
+-   evaluated into the current shell;
+-   namespace-specialized;
+-   recorded as canonical object code when running in DALO mode;
+-   reconstructed as part of a migratable/generated object image.
+
+This is the same metaprogramming model used throughout the runtime.
 
 ## Include guard
 
-Modul používá:
+The module uses:
 
-```bash
+``` bash
 ITERATORS_INCLUDE
 ```
 
-Opakované načtení knihovny je no-op.
+Repeated loading is a no-op.
 
-## Režimy instalace generovaného kódu
+## Installation modes
 
-Interní helper:
+Internal helper:
 
-```bash
+``` bash
 __dalo_iterator_install_body NS COMPONENT BODY
 ```
 
-rozlišuje dva režimy.
+supports two installation contexts.
 
-### DALO režim
+### DALO mode
 
-Pokud:
+When:
 
-```bash
+``` bash
 DALO_INCLUDE=1
 ```
 
-generovaný body se instaluje přes:
+generated source is installed through:
 
-```bash
+``` bash
 __asyncobj_eval_body
 ```
 
-Tím se kód nejen vyhodnotí, ale také uloží do namespaced/canonical code image.
+The source is therefore syntax-checked, evaluated, and recorded in the
+namespace's canonical code image.
 
-### Standalone režim
+### Standalone mode
 
-Pokud:
+When:
 
-```bash
+``` bash
 DALO_INCLUDE=0
 ```
 
-body se instaluje přímo přes:
+generated source is evaluated directly.
 
-```bash
-eval
-```
+Synchronous generators therefore accept an additional namespace argument
+in DALO mode. Asynchronous generators are inherently namespaced because
+they submit work to a DALO job pool.
 
-Synchronní `Make_*` generátory proto v DALO režimu přijímají namespace jako první argument. Async generátory jsou namespaced ze své podstaty.
-
----
-
-# Synchronní iterátory
+# Synchronous generators
 
 ## `Make_iterator`
 
 Standalone:
 
-```bash
+``` bash
 Make_iterator ARRAY START_VAR END_VAR ELEMENT_VAR RETURN_VAR
 ```
 
-DALO režim:
+DALO mode:
 
-```bash
+``` bash
 Make_iterator NS ARRAY START_VAR END_VAR ELEMENT_VAR RETURN_VAR
 ```
 
-Vytvoří:
+Generates:
 
-```text
+``` text
 iterator_over_<ARRAY>
 ```
 
-Generovaný iterator přijímá:
+Generated call:
 
-```bash
+``` bash
 iterator_over_ARRAY START END CALLBACK [ARGS...]
 ```
 
-Prochází indexy včetně obou hranic a volá callback:
+The iterator traverses both boundary indexes and invokes:
 
-```text
+``` text
 CALLBACK INDEX ELEMENT [ARGS...]
 ```
 
-Nenulový návrat callbacku ukončí iteraci a propaguje návratový kód.
+A non-zero callback status stops traversal and is propagated.
 
 ## `Make_file_iterator`
 
 Standalone:
 
-```bash
+``` bash
 Make_file_iterator NAME LINE_VAR RETURN_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_file_iterator NS NAME LINE_VAR RETURN_VAR
 ```
 
-Vytvoří funkci `NAME`.
+Generated call:
 
-Použití generované funkce:
-
-```bash
+``` bash
 NAME FILE CALLBACK [ARGS...]
 ```
 
-Čte soubor po řádcích. Prázdné řádky přeskakuje.
+The file is read line by line. Empty lines are skipped. Callback:
 
-Callback dostává:
-
-```text
+``` text
 CALLBACK LINE_NUMBER LINE [ARGS...]
 ```
 
@@ -146,349 +158,298 @@ CALLBACK LINE_NUMBER LINE [ARGS...]
 
 Standalone:
 
-```bash
+``` bash
 Make_range_iterator NAME I_VAR RETURN_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_range_iterator NS NAME I_VAR RETURN_VAR
 ```
 
-Generovaná funkce:
+Generated call:
 
-```bash
+``` bash
 NAME START END STEP CALLBACK [ARGS...]
 ```
 
 Callback:
 
-```text
+``` text
 CALLBACK VALUE [ARGS...]
 ```
 
-Aktuální implementace iteruje směrem `VALUE <= END`; záporný krok tedy není obecný descending-range mechanismus. Volající musí také zajistit smysluplný nenulový `STEP`.
+The current implementation uses a `VALUE <= END` termination model. It
+is therefore not a general descending-range implementation; callers must
+also provide a meaningful non-zero step.
 
 ## `Make_xy_iterator`
 
 Standalone:
 
-```bash
+``` bash
 Make_xy_iterator NAME X_VAR Y_VAR RETURN_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_xy_iterator NS NAME X_VAR Y_VAR RETURN_VAR
 ```
 
-Generovaná funkce:
+Generated call:
 
-```bash
+``` bash
 NAME X_START X_END Y_OFFSET Y_END Y_STEP CALLBACK [ARGS...]
 ```
 
-Pro každé `x` začíná `y` na:
+For each `x`, `y` begins at:
 
-```text
+``` text
 x + Y_OFFSET
 ```
 
-a iteruje do `Y_END`.
-
 Callback:
 
-```text
+``` text
 CALLBACK X Y [ARGS...]
 ```
 
-Volající musí zajistit nenulový `Y_STEP`.
+`Y_STEP` must be non-zero.
 
 ## `Make_glob_iterator`
 
 Standalone:
 
-```bash
+``` bash
 Make_glob_iterator NAME PATH_VAR RETURN_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_glob_iterator NS NAME PATH_VAR RETURN_VAR
 ```
 
-Generovaná funkce:
+Generated call:
 
-```bash
+``` bash
 NAME PATTERN CALLBACK [ARGS...]
 ```
 
-Dočasně zapíná:
+The generated iterator temporarily enables `nullglob` and `dotglob`,
+restores their prior state afterward, and calls:
 
-```bash
-nullglob
-dotglob
-```
-
-a po dokončení obnoví původní stav.
-
-Callback:
-
-```text
+``` text
 CALLBACK PATH [ARGS...]
 ```
+
+for each match.
 
 ## `Make_dir_glob_iterator`
 
 Standalone:
 
-```bash
+``` bash
 Make_dir_glob_iterator NAME PATH_VAR RETURN_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_dir_glob_iterator NS NAME PATH_VAR RETURN_VAR
 ```
 
-Stejný model jako glob iterator, ale callback dostane pouze položky, které projdou:
+This follows the glob iterator model but submits/calls only paths
+satisfying:
 
-```bash
+``` bash
 [ -d PATH ]
 ```
 
-Trailing `/` je před callbackem odstraněno.
+A trailing slash is removed before the callback.
 
----
-
-# Synchronní DFS recursor
+# Synchronous DFS recursion
 
 ## `Make_recursor`
 
 Standalone:
 
-```bash
+``` bash
 Make_recursor NAME PATH_VAR
 ```
 
-DALO:
+DALO mode:
 
-```bash
+``` bash
 Make_recursor NS NAME PATH_VAR
 ```
 
-Generuje depth-first traversal funkci:
+Generated call:
 
-```bash
+``` bash
 NAME ROOT ENTER_CALLBACK LEAVE_CALLBACK [ARGS...]
 ```
 
-Průchod:
+Traversal order:
 
-```text
+``` text
 ENTER(root)
-  recurse child 1
-  recurse child 2
+  child 1
+  child 2
   ...
 LEAVE(root)
 ```
 
-Prázdný callback lze předat jako prázdný string.
+An empty callback may be represented by an empty string. A non-zero
+ENTER or LEAVE status terminates traversal and is propagated.
 
-Nenulový návrat `ENTER` nebo `LEAVE` zastaví traversal a propaguje návratový kód.
+The current implementation discovers subdirectories with a `ROOT/*/`
+style traversal and `-d` checks. It does not maintain an independent
+visited set and does not provide general filesystem-cycle detection.
 
-Aktuální implementace prochází podadresáře pomocí:
+# Asynchronous generators
 
-```text
-ROOT/*/
-```
+Asynchronous iterators submit work to the namespaced DALO job pool. They
+therefore require a namespace with the corresponding job-pool API.
 
-a testu `-d`. Nemá vlastní visited-set/cycle detection.
-
----
-
-# Asynchronní iterátory
-
-Async iterátory předávají práci namespaced DALO job poolu:
-
-```text
-NS_job_pool_submit
-```
-
-Proto vyžadují odpovídající DALO namespace/job pool.
+The important distinction is that these generators create work;
+synchronization remains the responsibility of the object or
+PROJECT-level wait semantics.
 
 ## `Make_async_iterator`
 
-```bash
+``` bash
 Make_async_iterator NS ARRAY START_VAR END_VAR ELEMENT_VAR
 ```
 
-Vytvoří:
+Generates:
 
-```text
+``` text
 NS_async_iterator_over_ARRAY
 ```
 
-Použití:
+Call:
 
-```bash
+``` bash
 NS_async_iterator_over_ARRAY START END CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Každý element je submitnut jako samostatná job-pool práce.
+Each selected element becomes a separate job-pool submission.
 
 ## `Make_async_file_iterator`
 
-```bash
+``` bash
 Make_async_file_iterator NS LINE_VAR
 ```
 
-Vytvoří:
+Generates:
 
-```text
+``` text
 NS_async_iterator_over_file
 ```
 
-Použití:
+Call:
 
-```bash
+``` bash
 NS_async_iterator_over_file FILE CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Čte neprázdné řádky a submituje jejich obsah do job poolu.
+Each non-empty line is submitted as work.
 
 ## `Make_async_range_iterator`
 
-```bash
+``` bash
 Make_async_range_iterator NS I_VAR
 ```
 
-Vytvoří:
+Call:
 
-```text
-NS_async_iterator_over_range
-```
-
-Použití:
-
-```bash
+``` bash
 NS_async_iterator_over_range START END STEP CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Každá hodnota range je submitnuta do job poolu.
-
-Stejně jako synchronní varianta používá podmínku `VALUE <= END`; `STEP` musí být nenulový.
+Each range value becomes a job. The same current ascending-range
+limitation as the synchronous generator applies.
 
 ## `Make_async_xy_iterator`
 
-```bash
+``` bash
 Make_async_xy_iterator NS X_VAR Y_VAR
 ```
 
-Vytvoří:
+Call:
 
-```text
-NS_async_iterator_over_xy
-```
-
-Použití:
-
-```bash
+``` bash
 NS_async_iterator_over_xy X_START X_END Y_OFFSET Y_END Y_STEP CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Každá dvojice `X Y` je submitnuta do job poolu.
+Each `X Y` pair becomes a submitted job.
 
 ## `Make_async_glob_iterator`
 
-```bash
+``` bash
 Make_async_glob_iterator NS PATH_VAR
 ```
 
-Vytvoří:
+Call:
 
-```text
-NS_async_iterator_over_glob
-```
-
-Použití:
-
-```bash
+``` bash
 NS_async_iterator_over_glob PATTERN CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Každá odpovídající cesta je submitnuta jako job.
+Each matching path becomes a submitted job.
 
 ## `Make_async_dir_glob_iterator`
 
-```bash
+``` bash
 Make_async_dir_glob_iterator NS PATH_VAR
 ```
 
-Vytvoří:
+Call:
 
-```text
-NS_async_iterator_over_dir_glob
-```
-
-Použití:
-
-```bash
+``` bash
 NS_async_iterator_over_dir_glob PATTERN CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Submitují se pouze adresáře.
+Only directories are submitted.
 
----
-
-# Asynchronní DFS recursor
+# Asynchronous DFS recursion
 
 ## `Make_async_recursor`
 
-```bash
+``` bash
 Make_async_recursor NS NAME PATH_VAR
 ```
 
-Vytvoří:
+Generates public/implementation functions conceptually named:
 
-```text
+``` text
 NS_NAME
 NS_NAME_impl
 ```
 
-Veřejná generovaná funkce:
+Public call:
 
-```bash
+``` bash
 NS_NAME ROOT ENTER_CALLBACK LEAVE_CALLBACK [CLEANUP] [ARGS...]
 ```
 
-Traversal samotný je DFS.
+Traversal itself remains depth-first and synchronous. `ENTER_CALLBACK`
+executes during traversal. After descendants have been visited,
+`LEAVE_CALLBACK` is submitted to the namespaced job pool.
 
-`ENTER_CALLBACK` se provádí během traversal synchronně.
+This is important: "async recursor" does not mean that directory
+discovery itself becomes an unconstrained parallel traversal.
 
-`LEAVE_CALLBACK` se po zpracování potomků submituje přes:
+# Example
 
-```text
-NS_job_pool_submit
-```
-
-s volitelným cleanup callbackem.
-
-Tento rozdíl je důležitý: async recursor neznamená, že samotná rekurzivní navigace stromem probíhá paralelně; asynchronně se submituje leave práce.
-
----
-
-# Příklad s loaderem
-
-```bash
+``` bash
 #!/usr/bin/env bash
 
-DALO_LIBRARY_PATH="."
-source ./library.sh
+DALO_LIBRARY_PATH="./runtime"
+source ./runtime/library.sh
 include iterators
 
 items=(alpha beta gamma)
@@ -497,15 +458,16 @@ asyncobj_constructor DEMO
 DEMO_job_pool_init 4
 
 Make_async_iterator DEMO items begin end element
-
 DEMO_async_iterator_over_items 0 2 worker ""
 ```
 
-Konkrétní worker/job-pool lifecycle závisí na API `dalo.bashlib.sh`; `iterators.bashlib.sh` pouze generuje traversal/submit funkce.
+The exact worker lifecycle and wait semantics belong to
+`dalo.bashlib.sh`; the iterator library is responsible for generating
+traversal/submission functions.
 
-# Přehled generátorů
+# Generator inventory
 
-```text
+``` text
 SYNC
   Make_iterator
   Make_file_iterator
@@ -525,4 +487,15 @@ ASYNC
   Make_async_recursor
 ```
 
-Celkem 14 generátorů.
+There are currently fourteen generator families.
+
+# Relationship to PROJECT quiescence
+
+Object-local job-pool waits and PROJECT-wide quiescence are different
+contracts. An iterator can submit downstream work that causes further
+graph activity after the originating object becomes locally idle. A
+compiled PROJECT therefore uses PROJECT-level quiescence when it needs
+the stronger guarantee that the complete local graph has settled.
+
+Iterator code must not emulate this with arbitrary sleeps or by manually
+waiting on a presumed graph order.
