@@ -290,10 +290,6 @@ __NS___fifo_send() {
     printf '%s\n' "$frame" >&"$fd"
 }
 
-__NS___fifo_output() {
-    local slot_id="$1"; shift
-    __NS___fifo_send O "$slot_id|out" "$*"
-}
 
 # Port-aware DATA output. The worker owns output-vector semantics; runtime only
 # records the member under <slot>|<port> and transports it to the parent.
@@ -424,6 +420,7 @@ ${ns}_job_pool_init() {
     # Persistent task storage. No task API or argv storage yet (STEP 1 only).
     declare -gA ${ns}_TASK_STATUS
     declare -gA ${ns}_TASK_FUNC
+    declare -gA ${ns}_TASK_INPUT_PORT
     declare -gA ${ns}_TASK_ATTEMPT
     declare -gA ${ns}_TASK_RETRIES
     declare -gA ${ns}_TASK_CREATED
@@ -502,15 +499,17 @@ define_task_mutation_api() {
     body=$(cat <<EOF
 # Parent/owner-side task mutations. These are the canonical state writers.
 ${ns}_task_do_submit() {
-    [ \$# -ge 1 ] || return 2
-    local worker_func="\$1"
-    shift
+    [ \$# -ge 2 ] || return 2
+    local input_port="\$1" worker_func="\$2"
+    shift 2
+    [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
 
     local task_id="\${${ns}_NEXT_TASK_ID}"
     ${ns}_NEXT_TASK_ID=\$((task_id + 1))
 
     ${ns}_TASK_STATUS[\$task_id]="QUEUED"
     ${ns}_TASK_FUNC[\$task_id]="\$worker_func"
+    ${ns}_TASK_INPUT_PORT[\$task_id]="\$input_port"
     ${ns}_TASK_ATTEMPT[\$task_id]=0
     ${ns}_TASK_RETRIES[\$task_id]="\${${ns}_DEFAULT_RETRIES}"
     printf -v "${ns}_TASK_CREATED[\$task_id]" '%(%s)T' -1
@@ -582,8 +581,8 @@ ${ns}_task() {
 
     case "\$op" in
         submit)
-            [ \$# -ge 1 ] || {
-                echo "Chyba: ${ns}_task submit vyžaduje worker funkci." >&2
+            [ \$# -ge 2 ] || {
+                echo "Chyba: ${ns}_task submit vyžaduje INPUT_PORT a worker funkci." >&2
                 return 2
             }
             ${ns}_task_do_submit "\$@"
@@ -801,6 +800,8 @@ ${ns}_task_do_start() {
     [ "\${${ns}_TASK_STATUS[\$task_id]}" = "QUEUED" ] || return 1
 
     local func="\${${ns}_TASK_FUNC[\$task_id]}"
+    local input_port="\${${ns}_TASK_INPUT_PORT[\$task_id]:-}"
+    [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
     local -a argv=()
     ${ns}_task_argv_get "\$task_id" argv || return 1
     local attempt=\$(( \${${ns}_TASK_ATTEMPT[\$task_id]:-0} + 1 ))
@@ -811,7 +812,7 @@ ${ns}_task_do_start() {
     printf -v "${ns}_TASK_STARTED[\$task_id]" '%(%s)T' -1
     unset "${ns}_TASK_FINISHED[\$task_id]" 2>/dev/null || true
 
-    if ${ns}_job_pool_submit_task "\$task_id" "\$attempt" "\$func" "" "\${argv[@]}"; then
+    if ${ns}_job_pool_submit_task_port "\$task_id" "\$attempt" "\$input_port" "\$func" "" "\${argv[@]}"; then
         return 0
     else
         local rc=\$?
@@ -1091,9 +1092,6 @@ define_job_pool_add_work() {
     local ns="$1"
     local body
     body=$(cat <<EOF
-${ns}_job_pool_add_work() {
-    ${ns}_job_pool_add_work_port in "\$@"
-}
 
 ${ns}_job_pool_add_work_port() {
     [ \$# -ge 1 ] || return 2
@@ -1112,8 +1110,10 @@ define_job_pool_submit() {
     local body
     body=$(cat <<EOF
 ${ns}_job_pool_submit_core() {
-    local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}" input_port="\${5:-in}"
-    shift 5 2>/dev/null || shift \$#
+    [ \$# -ge 5 ] || return 2
+    local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}" input_port="\$5"
+    shift 5
+    [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
 
     while [ "\${${ns}_PENDING_JOBS}" -ge "\${${ns}_MAX_JOBS}" ]; do
         ${ns}_reap_one
@@ -1165,11 +1165,6 @@ ${ns}_job_pool_submit_core() {
     ${ns}_WORKER_PIDS["\$slot_id"]=\$!
 }
 
-${ns}_job_pool_submit() {
-    local cmd_func="\$1" cleanup_func="\${2:-}"
-    shift 2 2>/dev/null || shift \$#
-    ${ns}_job_pool_submit_core "" "" "\$cmd_func" "\$cleanup_func" in "\$@"
-}
 
 ${ns}_job_pool_submit_port() {
     local input_port="\$1" cmd_func="\$2" cleanup_func="\${3:-}"
@@ -1177,11 +1172,6 @@ ${ns}_job_pool_submit_port() {
     ${ns}_job_pool_submit_core "" "" "\$cmd_func" "\$cleanup_func" "\$input_port" "\$@"
 }
 
-${ns}_job_pool_submit_task() {
-    local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}"
-    shift 4 2>/dev/null || shift \$#
-    ${ns}_job_pool_submit_core "\$task_id" "\$attempt" "\$cmd_func" "\$cleanup_func" in "\$@"
-}
 
 ${ns}_job_pool_submit_task_port() {
     local task_id="\$1" attempt="\$2" input_port="\$3" cmd_func="\$4" cleanup_func="\${5:-}"
@@ -3628,10 +3618,6 @@ __asyncmachine_link() {
             {
                 printf '\n# Generic vector-aware INLINE execution for %s.\n' "$ns"
                 printf '%s_fast_slot=0\n' "$ns"
-                printf '%s_fifo_output() {\n' "$ns"
-                printf '  local slot_id="$1"; shift\n'
-                printf '  %s_OUTPUT_DATA_VECTOR["$slot_id|out"]="$*"\n' "$ns"
-                printf '}\n'
                 printf '%s_fifo_output_port() {\n' "$ns"
                 printf '  [[ $# -ge 3 ]] || return 2\n'
                 printf '  local slot_id="$1" output_port="$2"; shift 2\n'
@@ -3821,9 +3807,7 @@ async_perf_instrument_object() {
     # different subsets of the runtime ABI.
     async_perf_wrap_function "$ns" summon_worker SUMMON_NS 2>/dev/null || true
     async_perf_wrap_function "$ns" on_job_completed COMPLETE_HOOK_NS 2>/dev/null || true
-    # Canonical DATA ABI is port-aware. fifo_output remains a compatibility
-    # alias for legacy single-output workers, but instrumentation follows the
-    # canonical fifo_output_port boundary.
+    # Canonical DATA ABI is strictly port-aware.
     async_perf_wrap_function "$ns" fifo_output_port FIFO_OUTPUT_NS 2>/dev/null || true
 }
 
