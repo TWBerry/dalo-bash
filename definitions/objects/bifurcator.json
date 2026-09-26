@@ -26,10 +26,11 @@
   "features": [
     "core",
     "data",
+    "worker",
     "structural"
   ],
   "worker": {
-    "required": false
+    "required": true
   },
   "execution": [
     "INLINE"

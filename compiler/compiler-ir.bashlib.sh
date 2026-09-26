@@ -10,7 +10,7 @@ dalo_ir_init() {
     local p="$1"
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
-    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=()"
+    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=()"
     eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=()"
 }
 dalo_ir_set_project_name() {
