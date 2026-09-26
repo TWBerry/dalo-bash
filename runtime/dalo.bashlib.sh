@@ -1070,21 +1070,6 @@ EOF
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
-define_forward_hook() {
-    local ns="$1" ns_out="$2"
-    local body
-    body=$(cat <<EOF
-${ns}_on_job_completed() {
-    local slot_id="\$1" exit_code="\$2" output="\$3"
-    if [ "\$exit_code" -eq 0 ]; then
-        ${ns_out}_summon_worker "\$output"
-    fi
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
 define_summon_worker() {
     local ns="$1"
     local body
@@ -1330,8 +1315,9 @@ ${ns}_endpoint_close() {
 # (Přepíše defaultní chování – forward hook nebyl definován, protože
 #  endpoint nemá ns_out.)
 ${ns}_on_job_completed() {
-    local slot_id="\$1" exit_code="\$2" output="\$3"
+    local slot_id="\$1" exit_code="\$2"
     [ "\$exit_code" -eq 0 ] || return 0
+    local output="\${${ns}_OUTPUT_DATA_VECTOR["\$slot_id|out"]:-}"
     ${ns}_endpoint_append "\$output"
 }
 
@@ -1648,7 +1634,7 @@ EOF
 # ============================================================================
 
 asyncobj_constructor() {
-    local ns="$1" ns_out="${2:-}"
+    local ns="$1"
 
     define_variable_api            "$ns"
     printf -v "${ns}_CODE_PATCH_SEQ" '%s' 0
@@ -1679,10 +1665,6 @@ asyncobj_constructor() {
     define_backend_descriptor_api   "$ns"
     define_discovery_api            "$ns"
 
-    if [ -n "$ns_out" ]; then
-        define_forward_hook "$ns" "$ns_out"
-    fi
-
     "${ns}_job_pool_init"
     "${ns}_backend_register" fifo local send receive
     "${ns}_backend_register" tcp universal connect send receive listen
@@ -1692,10 +1674,14 @@ asyncobj_constructor() {
 # Origin: vždy má downstream (nebo je sám o sobě jednorázový stage).
 async_pipeline_origin_constructor() {
     local ns="$1" ns_out="${2:-}"
-    asyncobj_constructor "$ns" "$ns_out"
+    asyncobj_constructor "$ns"
+    if [[ -n "$ns_out" ]]; then
+        define_vector_forward_hook "$ns" ORIGIN out "$ns_out" in
+    fi
 }
 
-# Pipe: musí mít downstream – jinak je to endpoint.
+# Legacy convenience constructor. Its scalar downstream argument is translated
+# once into the canonical vector route out -> downstream.in.
 async_pipeline_pipe_constructor() {
     local ns="$1" ns_out="${2:-}"
     if [ -z "$ns_out" ]; then
@@ -1703,7 +1689,8 @@ async_pipeline_pipe_constructor() {
         echo "       Použij: async_pipeline_endpoint_constructor $ns <out_fd> [buffer_file] [threshold]" >&2
         return 1
     fi
-    asyncobj_constructor "$ns" "$ns_out"
+    asyncobj_constructor "$ns"
+    define_vector_forward_hook "$ns" PIPE out "$ns_out" in
 }
 
 # Endpoint: terminální stupeň. Buffer + flush na out_fd.
@@ -1724,8 +1711,9 @@ async_pipeline_endpoint_constructor() {
     define_endpoint_api "$ns" "$out_fd" "$buffer_file" "$threshold"
 
     # Default worker pro endpoint, pokud si uživatel nenastaví vlastní.
-    if [ -z "${!ns_TARGET_WORKER_FUNC:-}" ]; then
-        printf -v "${ns}_TARGET_WORKER_FUNC" '%s' "${ns}_default_endpoint_worker"
+    local target_worker_var="${ns}_TARGET_WORKER_FUNC"
+    if [[ -z "${!target_worker_var:-}" ]]; then
+        printf -v "$target_worker_var" '%s' "${ns}_default_endpoint_worker"
     fi
 }
 
