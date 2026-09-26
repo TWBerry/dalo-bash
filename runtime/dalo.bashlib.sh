@@ -2311,60 +2311,6 @@ ${ns}_on_job_completed() {
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
-define_t_forward_hook() {
-    [ $# -eq 3 ] || return 2
-    local ns="$1" ns_out="$2" ns_out2="$3" body
-    body=$(cat <<EOF
-${ns}_on_job_completed() {
-    local slot_id="\$1" exit_code="\$2" output="\$3" output2="\${4:-\$3}"
-    if [ "\$exit_code" -eq 0 ]; then
-        ${ns_out2}_summon_worker "\$output2"
-        ${ns_out}_summon_worker "\$output"
-    fi
-}
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-# Structural Y only: input ports are explicit entry points. No buffering,
-# pairing, fading memory, DSP policy, or other semantics are imposed here.
-define_y_structural_hooks() {
-    [ $# -eq 2 ] || return 2
-    local ns="$1" ns_out="$2" body
-    body=$(cat <<EOF
-${ns}_receive_in1() { ${ns}_summon_worker "\$@"; }
-${ns}_receive_in2() { ${ns}_summon_worker "\$@"; }
-EOF
-)
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-    define_forward_hook "$ns" "$ns_out"
-}
-
-__asyncscript_find_edge() {
-    [ $# -eq 5 ] || return 2
-    local as="$1" src="$2" sport="$3" out_ns="$4" out_port="$5" e s sp d dp
-    local -n edges="${as}_EDGES" smap="${as}_DECL_SLOT"
-    for e in "${edges[@]}"; do
-        IFS=$'\t' read -r s sp d dp <<<"$e"
-        [[ "$s" == "$src" && "$sp" == "$sport" ]] || continue
-        printf -v "$out_ns" '%s' "${smap[$d]}"; printf -v "$out_port" '%s' "$dp"; return 0
-    done
-    return 1
-}
-
-# Generate a forwarding function appropriate to the destination input port.
-__asyncscript_target_call() {
-    local dst_ns="$1" dst_port="$2"
-    case "$dst_port" in
-        in)  printf '%s_summon_worker' "$dst_ns" ;;
-        in1) printf '%s_receive_in1' "$dst_ns" ;;
-        in2) printf '%s_receive_in2' "$dst_ns" ;;
-        *) return 2 ;;
-    esac
-}
-
-
 __asyncscript_implant_worker() {
     [ $# -eq 2 ] || return 2
     local ns="$1" file="$2" def renamed
@@ -2415,47 +2361,20 @@ compile_topology() {
         fi
     done
 
-    # Y entry points must exist before upstream forwarding hooks are compiled.
-    for obj in "${objs[@]}"; do
-        [[ "${types[$obj]}" == Y ]] || continue
-        ns="${smap[$obj]}"
-        __asyncscript_find_edge "$as" "$obj" out dst1 port1 || return 30
-        call1="$(__asyncscript_target_call "$dst1" "$port1")" || return
-        # define_y_structural_hooks expects a namespace with summon_worker; for
-        # nonstandard destination ports use a tiny generated adapter namespace.
-        if [[ "$port1" == in ]]; then
-            define_y_structural_hooks "$ns" "$dst1" || return
-        else
-            local adapter="${ns}_yout_adapter"
-            eval "${adapter}_summon_worker() { ${call1} \"\$@\"; }"
-            define_y_structural_hooks "$ns" "$adapter" || return
-        fi
-    done
-
-    # Compile structural forwarding.
+    # Compile all DATA forwarding from the canonical EDGE graph. T, Y, PIPE,
+    # COLUMN and future object types share the same vector routing mechanism.
+    local route_args dst_ns
     for obj in "${objs[@]}"; do
         ns="${smap[$obj]}"; type="${types[$obj]}"
-        case "$type" in
-            T)
-                __asyncscript_find_edge "$as" "$obj" out1 dst1 port1 || return 20
-                __asyncscript_find_edge "$as" "$obj" out2 dst2 port2 || return 21
-                call1="$(__asyncscript_target_call "$dst1" "$port1")" || return
-                call2="$(__asyncscript_target_call "$dst2" "$port2")" || return
-                local a1="${ns}_out1_adapter" a2="${ns}_out2_adapter"
-                eval "${a1}_summon_worker() { ${call1} \"\$@\"; }"
-                eval "${a2}_summon_worker() { ${call2} \"\$@\"; }"
-                define_t_forward_hook "$ns" "$a1" "$a2" || return
-                ;;
-            Y|ENDPOINT|DRIVER|GOD) ;;
-            *)
-                if __asyncscript_find_edge "$as" "$obj" out dst1 port1; then
-                    call1="$(__asyncscript_target_call "$dst1" "$port1")" || return
-                    local a="${ns}_out_adapter"
-                    eval "${a}_summon_worker() { ${call1} \"\$@\"; }"
-                    define_forward_hook "$ns" "$a" || return
-                fi
-                ;;
-        esac
+        route_args=()
+        for e in "${edges[@]}"; do
+            IFS=$'\t' read -r s sp d dp <<<"$e"
+            [[ "$s" == "$obj" ]] || continue
+            dst_ns="${smap[$d]:-}"
+            [[ -n "$dst_ns" ]] || return 33
+            route_args+=("$sp" "$dst_ns" "$dp")
+        done
+        define_vector_forward_hook "$ns" "$type" "${route_args[@]}" || return
     done
 
     for e in "${edges[@]}"; do
@@ -3576,33 +3495,6 @@ __asyncmachine_emit_worker() {
     # knowing the compiler-assigned machine namespace in advance.
     printf '%s_worker() { local ASYNC_WORKER_NS=%q; %s "$@"; }\n' "$ns" "$ns" "$impl" >>"$out"
 }
-__asyncproject_target_call() {
-    [ $# -eq 4 ] || return 2
-    local project="$1" dst="$2" port="$3" out="$4"
-    local -n machine_ns="${project}_COMPILE_NS"
-    local ns="${machine_ns[$dst]:-}"
-    [[ -n "$ns" ]] || return 3
-    case "$port" in
-        in)  printf -v "$out" '%s_summon_worker' "$ns" ;;
-        in1) printf -v "$out" '%s_receive_in1' "$ns" ;;
-        in2) printf -v "$out" '%s_receive_in2' "$ns" ;;
-        *) return 4 ;;
-    esac
-}
-
-__asyncproject_find_edge() {
-    [ $# -eq 5 ] || return 2
-    local project="$1" src="$2" sport="$3" out_dst="$4" out_port="$5"
-    local -n edges="${project}_EDGES"
-    local edge s sp d dp
-    for edge in "${edges[@]}"; do
-        IFS=$'\t' read -r s sp d dp <<<"$edge"
-        [[ "$s" == "$src" && "$sp" == "$sport" ]] || continue
-        printf -v "$out_dst" '%s' "$d"; printf -v "$out_port" '%s' "$dp"; return 0
-    done
-    return 1
-}
-
 __asyncmachine_link() {
     [ $# -eq 4 ] || return 2
     local project="$1" project_file="$2" out="$3" project_hash="$4"
