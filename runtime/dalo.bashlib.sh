@@ -3498,7 +3498,9 @@ __asyncmachine_link() {
     [ $# -eq 4 ] || return 2
     local project="$1" project_file="$2" out="$3" project_hash="$4"
     local library_source="${BASH_SOURCE[0]}"
-    [[ -r "$library_source" ]] || return 3
+    local helper_source
+    helper_source="$(cd -- "$(dirname -- "$library_source")" && pwd)/helpers.bashlib.sh"
+    [[ -r "$library_source" && -r "$helper_source" ]] || return 3
 
     local -n objs="${project}_DECL_OBJECTS" types="${project}_DECL_TYPE"
     local -n wf="${project}_DECL_WORKER_FILE" dw="${project}_DECL_WORKERS"
@@ -3522,7 +3524,16 @@ __asyncmachine_link() {
         printf '# Machine ABI: 2\n# Project SHA256: %s\n' "$project_hash"
         printf '# Runtime identity and FIFOs are created only when this machine starts.\n'
         printf '# ==============================================================================\n\n'
-        tail -n +2 "$library_source"
+        # A MACHINE is standalone: embed helpers first, then the runtime body.
+        # Remove only the runtime's library-relative helpers bootstrap because
+        # helpers are already physically linked above.
+        tail -n +2 "$helper_source"
+        awk '
+          /^__dalo_library_dir=.*BASH_SOURCE/ { skip=1; next }
+          skip && /^source .*helpers\.bashlib\.sh/ { next }
+          skip && /^unset __dalo_library_dir/ { skip=0; next }
+          { print }
+        ' "$library_source" | tail -n +2
         printf '\n# ============================================================================\n# GENERATED MACHINE IMAGE\n# ============================================================================\n'
         printf 'ASYNC_MACHINE_ABI=2\nASYNC_MACHINE_PROJECT_SHA256=%q\nASYNC_MACHINE_NAME=%q\n' "$project_hash" "$project"
     } >"$out" || return

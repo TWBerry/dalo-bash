@@ -11,7 +11,7 @@ dalo_ir_init() {
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
     eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=()"
-    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=()"
+    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=()"
 }
 dalo_ir_set_project_name() {
     [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || { printf 'daloc: invalid PROJECT NAME %s\n' "$2" >&2; return 20; }
@@ -35,3 +35,6 @@ dalo_ir_validate_header(){
     [[ -n "${!nv}" ]] || { printf 'daloc: PROJECT NAME is required\n' >&2; return 24; }
     [[ -n "${!vv}" ]] || { printf 'daloc: PROJECT VERSION is required\n' >&2; return 25; }
 }
+
+dalo_ir_set_worker_code(){ local -n a="${1}_WORKER_CODE"; a["$2"]="$3"; }
+dalo_ir_set_worker_type(){ local -n a="${1}_WORKER_TYPE"; a["$2"]="$3"; }

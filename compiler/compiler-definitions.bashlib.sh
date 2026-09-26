@@ -26,9 +26,9 @@ dalo_worker_definition_register(){
 dalo_definitions_load_tree(){
  local root="$1" f
  command -v jq >/dev/null || { printf 'daloc: jq is required\n' >&2; return 4; }
- for f in "$root"/definitions/features/*.json; do [[ -e "$f" ]] && dalo_feature_definition_register "$f" || return; done
- for f in "$root"/definitions/objects/*.json; do [[ -e "$f" ]] && dalo_object_definition_register "$f" || return; done
- for f in "$root"/definitions/workers/*.json; do [[ -e "$f" ]] && dalo_worker_definition_register "$f" || return; done
+ for f in "$root"/definitions/features/*.json; do [[ -e "$f" ]] || continue; dalo_feature_definition_register "$f" || return; done
+ for f in "$root"/definitions/objects/*.json; do [[ -e "$f" ]] || continue; dalo_object_definition_register "$f" || return; done
+ for f in "$root"/definitions/workers/*.json; do [[ -e "$f" ]] || continue; dalo_worker_definition_register "$f" || return; done
 }
 dalo_definition_validate_ir(){
  local p="$1" o type file field field_type required min value
@@ -59,5 +59,23 @@ dalo_definition_validate_ir(){
      esac
    done < <(jq -r '(.instance_fields//{}) | to_entries[] |
        [.key,.value.type,(.value.required//false),(.value.min//null)] | @tsv' "$file")
+
+   local -n worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE"
+   local worker_required mode
+   worker_required="$(jq -r '(.worker.required // false)' "$file")"
+   if [[ "$worker_required" == true && -z "${worker_code[$o]:-}" ]]; then
+       printf 'daloc: OBJECT %s (%s) requires WORKER CODE\n' "$o" "$type" >&2; return 36
+   fi
+   if [[ -n "${worker_code[$o]:-}" ]]; then
+       [[ -r "${worker_code[$o]}" ]] || { printf 'daloc: WORKER CODE not readable: %s\n' "${worker_code[$o]}" >&2; return 37; }
+       bash -n "${worker_code[$o]}" || return 38
+       mode="${worker_type[$o]:-inline}"
+       case "$mode" in
+         inline) jq -e '.execution | index("INLINE") != null' "$file" >/dev/null || {
+             printf 'daloc: OBJECT %s does not allow INLINE execution\n' "$o" >&2; return 39; } ;;
+         include) jq -e '.execution | index("INCLUDE") != null' "$file" >/dev/null || {
+             printf 'daloc: OBJECT %s does not allow INCLUDE execution\n' "$o" >&2; return 39; } ;;
+       esac
+   fi
  done
 }

@@ -4,6 +4,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DALO_LIBRARY_PATH="$ROOT/compiler:$ROOT/runtime"
 export DALO_LIBRARY_PATH
 source "$ROOT/runtime/library.sh"
+include dalo
 include compiler-parser
 include compiler-definitions
 include compiler-connect
