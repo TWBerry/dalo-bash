@@ -1,0 +1,22 @@
+PROJECT
+	NAME connect_via
+	VERSION 1.0
+
+OBJECT origin1
+	TYPE ORIGIN
+
+OBJECT T1
+	TYPE T
+
+OBJECT pipe1
+	TYPE PIPE
+
+OBJECT Y1
+	TYPE Y
+
+OBJECT endpoint1
+	TYPE ENDPOINT
+
+CONNECT origin1.out VIA T1.out1 pipe1.in
+CONNECT T1.out1 VIA pipe1 Y1.in1
+CONNECT pipe1.out VIA Y1.in1 endpoint1.in

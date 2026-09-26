@@ -10,7 +10,7 @@ dalo_ir_init() {
     local p="$1"
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
-    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=()"
+    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=()"
     eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=()"
 }
 dalo_ir_set_project_name() {
@@ -29,6 +29,7 @@ dalo_ir_add_object() {
 dalo_ir_set_object_type(){ local -n t="${1}_OBJECT_TYPE"; [[ -v t["$2"] ]] || return 23; t["$2"]="$3"; }
 dalo_ir_set_object_field(){ local -n f="${1}_OBJECT_FIELD"; f["$2.$3"]="$4"; }
 dalo_ir_add_connect_text(){ local -n a="${1}_CONNECT_TEXT"; a+=("$2"); }
+dalo_ir_add_edge(){ local -n a="${1}_EDGES"; a+=("$2"$'\t'"$3"$'\t'"$4"$'\t'"$5"); }
 dalo_ir_validate_header(){
     local nv="${1}_NAME" vv="${1}_VERSION"
     [[ -n "${!nv}" ]] || { printf 'daloc: PROJECT NAME is required\n' >&2; return 24; }
