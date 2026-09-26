@@ -292,7 +292,16 @@ __NS___fifo_send() {
 
 __NS___fifo_output() {
     local slot_id="$1"; shift
-    __NS___fifo_send O "$slot_id" "$*"
+    __NS___fifo_send O "$slot_id|out" "$*"
+}
+
+# Port-aware DATA output. The worker owns output-vector semantics; runtime only
+# records the member under <slot>|<port> and transports it to the parent.
+__NS___fifo_output_port() {
+    [ $# -ge 3 ] || return 2
+    local slot_id="$1" output_port="$2"; shift 2
+    [[ "$output_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
+    __NS___fifo_send O "$slot_id|$output_port" "$*"
 }
 
 __NS___fifo_set() {
@@ -882,7 +891,7 @@ ${ns}_try_release_slot() {
     if [ "\${${ns}_JOB_STATUS_VECTOR[\$slot_id]}" != "PROTOCOL_INCONSISTENCY" ] && \
        declare -f "${ns}_on_job_completed" >/dev/null 2>&1; then
         "${ns}_on_job_completed" "\$slot_id" "\$completion_rc" \
-            "\${${ns}_OUTPUT_DATA_VECTOR[\$slot_id]:-}"
+            "\${${ns}_OUTPUT_DATA_VECTOR["\$slot_id|out"]:-}"
     fi
 
     local worker_dir="\${${ns}_WORKER_TMP_DIR[\$slot_id]:-}"
@@ -1080,8 +1089,17 @@ define_summon_worker() {
     local ns="$1"
     local body
     body=$(cat <<EOF
+# Compatibility entry point: ordinary objects have canonical input "in".
 ${ns}_summon_worker() {
-    ${ns}_job_pool_add_work "\$@"
+    ${ns}_job_pool_add_work_port in "\$@"
+}
+
+# Canonical graph DATA entry point. Destination input identity is preserved.
+${ns}_receive() {
+    [ \$# -ge 1 ] || return 2
+    local input_port="\$1"; shift
+    [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
+    ${ns}_job_pool_add_work_port "\$input_port" "\$@"
 }
 EOF
 )
@@ -1093,9 +1111,15 @@ define_job_pool_add_work() {
     local body
     body=$(cat <<EOF
 ${ns}_job_pool_add_work() {
+    ${ns}_job_pool_add_work_port in "\$@"
+}
+
+${ns}_job_pool_add_work_port() {
+    [ \$# -ge 1 ] || return 2
+    local input_port="\$1"; shift
     local worker_func="\${${ns}_TARGET_WORKER_FUNC}"
     local cleanup_func="\${${ns}_TARGET_CLEANUP_FUNC}"
-    ${ns}_job_pool_submit "\$worker_func" "\$cleanup_func" "\$@"
+    ${ns}_job_pool_submit_port "\$input_port" "\$worker_func" "\$cleanup_func" "\$@"
 }
 EOF
 )
@@ -1107,8 +1131,8 @@ define_job_pool_submit() {
     local body
     body=$(cat <<EOF
 ${ns}_job_pool_submit_core() {
-    local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}"
-    shift 4 2>/dev/null || shift \$#
+    local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}" input_port="\${5:-in}"
+    shift 5 2>/dev/null || shift \$#
 
     while [ "\${${ns}_PENDING_JOBS}" -ge "\${${ns}_MAX_JOBS}" ]; do
         ${ns}_reap_one
@@ -1132,8 +1156,12 @@ ${ns}_job_pool_submit_core() {
     local worker_dir="\$main_tmp/${ns}_slot_\$slot_id"
     rm -rf -- "\$worker_dir"; mkdir -p "\$worker_dir"
 
-    ${ns}_INPUT_DATA_VECTOR["\$slot_id"]="\$*"
-    unset "${ns}_OUTPUT_DATA_VECTOR[\$slot_id]" "${ns}_EXIT_CODE_VECTOR[\$slot_id]" \
+    ${ns}_INPUT_DATA_VECTOR["\$slot_id|\$input_port"]="\$*"
+    local vector_key
+    for vector_key in "\${!${ns}_OUTPUT_DATA_VECTOR[@]}"; do
+        [[ "\$vector_key" == "\$slot_id|"* ]] && unset '${ns}_OUTPUT_DATA_VECTOR['"\$vector_key"']'
+    done
+    unset "${ns}_EXIT_CODE_VECTOR[\$slot_id]" \
           "${ns}_JOB_STATUS_VECTOR[\$slot_id]" "${ns}_COMPLETED_PIDS[\$slot_id]" \
           "${ns}_COMPLETION_EXIT_CODES[\$slot_id]" "${ns}_REAPED_PIDS[\$slot_id]" \
           "${ns}_REAP_EXIT_CODES[\$slot_id]" 2>/dev/null || true
@@ -1159,13 +1187,25 @@ ${ns}_job_pool_submit_core() {
 ${ns}_job_pool_submit() {
     local cmd_func="\$1" cleanup_func="\${2:-}"
     shift 2 2>/dev/null || shift \$#
-    ${ns}_job_pool_submit_core "" "" "\$cmd_func" "\$cleanup_func" "\$@"
+    ${ns}_job_pool_submit_core "" "" "\$cmd_func" "\$cleanup_func" in "\$@"
+}
+
+${ns}_job_pool_submit_port() {
+    local input_port="\$1" cmd_func="\$2" cleanup_func="\${3:-}"
+    shift 3 2>/dev/null || shift \$#
+    ${ns}_job_pool_submit_core "" "" "\$cmd_func" "\$cleanup_func" "\$input_port" "\$@"
 }
 
 ${ns}_job_pool_submit_task() {
     local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}"
     shift 4 2>/dev/null || shift \$#
-    ${ns}_job_pool_submit_core "\$task_id" "\$attempt" "\$cmd_func" "\$cleanup_func" "\$@"
+    ${ns}_job_pool_submit_core "\$task_id" "\$attempt" "\$cmd_func" "\$cleanup_func" in "\$@"
+}
+
+${ns}_job_pool_submit_task_port() {
+    local task_id="\$1" attempt="\$2" input_port="\$3" cmd_func="\$4" cleanup_func="\${5:-}"
+    shift 5 2>/dev/null || shift \$#
+    ${ns}_job_pool_submit_core "\$task_id" "\$attempt" "\$cmd_func" "\$cleanup_func" "\$input_port" "\$@"
 }
 EOF
 )
@@ -2240,6 +2280,40 @@ add_file()   { [ $# -ge 3 ] && [ $# -le 4 ] || return 2; __asyncscript_add_resou
 add_stdin()  { [ $# -eq 2 ] || return 2; __asyncscript_add_resource "$1" "$2" stdin ""; }
 add_stdout() { [ $# -eq 2 ] || return 2; __asyncscript_add_resource "$1" "$2" stdout ""; }
 add_stderr() { [ $# -eq 2 ] || return 2; __asyncscript_add_resource "$1" "$2" stderr ""; }
+
+# Generic vector routing metafunction.
+# Object JSON is consumed by the compiler. Resolved routes are passed here,
+# keeping generated MACHINE/runtime independent of jq and descriptor files.
+# Vector keys are "<slot>|<port>"; worker owns vector semantics, runtime routing.
+define_vector_forward_hook() {
+    [ $# -ge 2 ] || return 2
+    local ns="$1" obj_type="$2"; shift 2
+    (( $# % 3 == 0 )) || return 2
+    local body src dst_ns dst_port
+    body="${ns}_forward_output_vector() {
+    local slot_id=\"\$1\" key port value prefix=\"\$1|\"
+    for key in \"\${!${ns}_OUTPUT_DATA_VECTOR[@]}\"; do
+        [[ \"\$key\" == \"\$prefix\"* ]] || continue
+        port=\"\${key#\"\$prefix\"}\"
+        value=\"\${${ns}_OUTPUT_DATA_VECTOR[\$key]}\"
+        case \"\$port\" in
+"
+    while (( $# )); do
+        src="$1"; dst_ns="$2"; dst_port="$3"; shift 3
+        printf -v body '%s            %q) %s_receive %q "$value" ;;\n' "$body" "$src" "$dst_ns" "$dst_port"
+    done
+    body+="            *) printf 'Chyba [${ns}/${obj_type}]: output port bez route: %s\\n' \"\$port\" >&2; return 70 ;;
+        esac
+    done
+}
+${ns}_on_job_completed() {
+    local slot_id=\"\$1\" exit_code=\"\$2\"
+    (( exit_code == 0 )) || return 0
+    ${ns}_forward_output_vector \"\$slot_id\"
+}
+"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
 
 define_t_forward_hook() {
     [ $# -eq 3 ] || return 2
@@ -3613,28 +3687,24 @@ __asyncmachine_link() {
         fi
     done
 
-    local dst1 p1 dst2 p2 call1 call2
+    # Generic DATA routing. The compiler resolves canonical EDGE records into
+    # concrete namespace/port triples. Runtime never reads Object JSON.
+    local edge esrc esport edst edport dst_ns route_count
     for obj in "${objs[@]}"; do
-        ns="${machine_ns[$obj]}"; type="${types[$obj]}"
-        case "$type" in
-            Y)
-                __asyncproject_find_edge "$project" "$obj" out dst1 p1 || return 30
-                __asyncproject_target_call "$project" "$dst1" "$p1" call1 || return
-                printf '\n%s_receive_in1() { %s_summon_worker "$@"; }\n%s_receive_in2() { %s_summon_worker "$@"; }\n' "$ns" "$ns" "$ns" "$ns" >>"$out"
-                printf '%s_on_job_completed() { local slot_id="$1" exit_code="$2" output="$3"; [ "$exit_code" -eq 0 ] && %s "$output"; }\n' "$ns" "$call1" >>"$out" ;;
-            T)
-                __asyncproject_find_edge "$project" "$obj" out1 dst1 p1 || return 31
-                __asyncproject_find_edge "$project" "$obj" out2 dst2 p2 || return 32
-                __asyncproject_target_call "$project" "$dst1" "$p1" call1 || return
-                __asyncproject_target_call "$project" "$dst2" "$p2" call2 || return
-                printf '\n%s_on_job_completed() { local slot_id="$1" exit_code="$2" output="$3" output2="${4:-$3}"; if [ "$exit_code" -eq 0 ]; then %s "$output2"; %s "$output"; fi; }\n' "$ns" "$call2" "$call1" >>"$out" ;;
-            ENDPOINT|DRIVER|GOD) ;;
-            *)
-                if __asyncproject_find_edge "$project" "$obj" out dst1 p1; then
-                    __asyncproject_target_call "$project" "$dst1" "$p1" call1 || return
-                    printf '\n%s_on_job_completed() { local slot_id="$1" exit_code="$2" output="$3"; [ "$exit_code" -eq 0 ] && %s "$output"; }\n' "$ns" "$call1" >>"$out"
-                fi ;;
-        esac
+        ns="${machine_ns[$obj]}"; type="${types[$obj]}"; route_count=0
+        printf '\n# Generic output-vector routes for %q.\n' "$obj" >>"$out"
+        printf 'define_vector_forward_hook %q %q' "$ns" "$type" >>"$out"
+        for edge in "${project}_EDGES"; do :; done
+        local -n __route_edges="${project}_EDGES"
+        for edge in "${__route_edges[@]}"; do
+            IFS=$'\t' read -r esrc esport edst edport <<<"$edge"
+            [[ "$esrc" == "$obj" ]] || continue
+            dst_ns="${machine_ns[$edst]:-}"
+            [[ -n "$dst_ns" ]] || return 33
+            printf ' %q %q %q' "$esport" "$dst_ns" "$edport" >>"$out"
+            ((route_count+=1))
+        done
+        printf '\n' >>"$out"
     done
 
     # STEP31 process-boundary execution lowering.
@@ -3659,23 +3729,28 @@ __asyncmachine_link() {
 
         if [[ "$emode" == INLINE ]]; then
             {
-                printf '\n# STEP31 INLINE execution: local DATA stays in the parent shell for %s.\n' "$ns"
+                printf '\n# Generic vector-aware INLINE execution for %s.\n' "$ns"
                 printf '%s_fast_slot=0\n' "$ns"
                 printf '%s_fifo_output() {\n' "$ns"
                 printf '  local slot_id="$1"; shift\n'
-            } >>"$out"
-            if [[ "$type" == ENDPOINT || "$type" == DRIVER || "$type" == GOD ]]; then
-                printf '  : # terminal DATA sink\n' >>"$out"
-            else
-                printf '  %s_on_job_completed "$slot_id" 0 "$*"\n' "$ns" >>"$out"
-            fi
-            {
+                printf '  %s_OUTPUT_DATA_VECTOR["$slot_id|out"]="$*"\n' "$ns"
                 printf '}\n'
-                printf '%s_summon_worker() {\n' "$ns"
+                printf '%s_fifo_output_port() {\n' "$ns"
+                printf '  [[ $# -ge 3 ]] || return 2\n'
+                printf '  local slot_id="$1" output_port="$2"; shift 2\n'
+                printf '  %s_OUTPUT_DATA_VECTOR["$slot_id|$output_port"]="$*"\n' "$ns"
+                printf '}\n'
+                printf '%s_receive() {\n' "$ns"
+                printf '  [[ $# -ge 1 ]] || return 2\n'
+                printf '  local input_port="$1"; shift\n'
                 printf '  %s_fast_slot=$((%s_fast_slot + 1))\n' "$ns" "$ns"
-                printf '  local slot_id="$%s_fast_slot"\n' "$ns"
+                printf '  local slot_id="$%s_fast_slot" key\n' "$ns"
+                printf '  %s_INPUT_DATA_VECTOR["$slot_id|$input_port"]="$*"\n' "$ns"
+                printf '  for key in "${!%s_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$slot_id|"* ]] && unset '\''%s_OUTPUT_DATA_VECTOR['\''"$key"'\'']'\''; done\n' "$ns" "$ns"
                 printf '  %s_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"\n' "$ns"
+                printf '  %s_on_job_completed "$slot_id" 0\n' "$ns"
                 printf '}\n'
+                printf '%s_summon_worker() { %s_receive in "$@"; }\n' "$ns" "$ns"
                 printf '%s_job_pool_wait() { :; }\n' "$ns"
             } >>"$out"
 
