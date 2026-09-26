@@ -1,0 +1,11 @@
+PROJECT
+	NAME hello
+	VERSION 1.0
+
+OBJECT source
+	TYPE ORIGIN
+
+OBJECT sink
+	TYPE ENDPOINT
+
+CONNECT source.out sink.in
