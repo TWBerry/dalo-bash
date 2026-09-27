@@ -779,6 +779,10 @@ ${ns}_job_pool_init() {
 
     ${ns}_TARGET_WORKER_FUNC="\${2:-}"
     ${ns}_TARGET_CLEANUP_FUNC="\${3:-}"
+    ${ns}_SCHEDULER_NS=
+    ${ns}_SCHED_CPU_PER_JOB=0
+    ${ns}_SCHED_MEMORY_PER_JOB=0
+    declare -gA ${ns}_SLOT_RESERVATION=()
 
     declare -gA ${ns}_INPUT_DATA_VECTOR=()
     declare -gA ${ns}_OUTPUT_DATA_VECTOR=()
@@ -1269,6 +1273,10 @@ ${ns}_try_release_slot() {
             "\${${ns}_OUTPUT_DATA_VECTOR["\$slot_id|out"]:-}"
     fi
 
+    ${ns}_scheduler_release_slot "\$slot_id" || {
+        printf 'Chyba [${ns}]: scheduler reservation release selhal: slot=%s\n' "\$slot_id" >&2
+        return 1
+    }
     local worker_dir="\${${ns}_WORKER_TMP_DIR[\$slot_id]:-}"
     [ -n "\$worker_dir" ] && rm -rf -- "\$worker_dir" 2>/dev/null || true
 
@@ -1320,6 +1328,10 @@ ${ns}_finalize_missing_completion() {
             "\${${ns}_JOB_STATUS_VECTOR[\$slot_id]}"
     fi
 
+    ${ns}_scheduler_release_slot "\$slot_id" || {
+        printf 'Chyba [${ns}]: scheduler reservation release selhal: slot=%s\n' "\$slot_id" >&2
+        return 1
+    }
     local worker_dir="\${${ns}_WORKER_TMP_DIR[\$slot_id]:-}"
     [ -n "\$worker_dir" ] && rm -rf -- "\$worker_dir" 2>/dev/null || true
 
@@ -1449,6 +1461,50 @@ EOF
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
+define_scheduler_binding_api() {
+    local ns="$1" body
+    body=$(cat <<EOF
+${ns}_scheduler_bind() {
+    [ \$# -eq 3 ] || return 64
+    local scheduler_ns="\$1" cpu="\$2" memory="\$3"
+    [[ "\$scheduler_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*\$ ]] || return 71
+    [[ "\$cpu" =~ ^[0-9]+\$ && "\$memory" =~ ^[0-9]+\$ ]] || return 64
+    declare -F "\${scheduler_ns}_scheduler_reserve" >/dev/null 2>&1 || return 66
+    declare -F "\${scheduler_ns}_scheduler_release" >/dev/null 2>&1 || return 66
+    ${ns}_SCHEDULER_NS="\$scheduler_ns"
+    ${ns}_SCHED_CPU_PER_JOB="\$cpu"
+    ${ns}_SCHED_MEMORY_PER_JOB="\$memory"
+}
+${ns}_scheduler_unbind() {
+    [ \$# -eq 0 ] || return 64
+    (( \${#${ns}_SLOT_RESERVATION[@]} == 0 )) || return 74
+    ${ns}_SCHEDULER_NS=
+    ${ns}_SCHED_CPU_PER_JOB=0
+    ${ns}_SCHED_MEMORY_PER_JOB=0
+}
+${ns}_scheduler_reserve_slot() {
+    [ \$# -eq 2 ] || return 64
+    local slot_id="\$1" outvar="\$2" scheduler_ns="\${${ns}_SCHEDULER_NS:-}"
+    local slot_reservation_id=
+    [ -n "\$scheduler_ns" ] || { printf -v "\$outvar" '%s' ''; return 0; }
+    "\${scheduler_ns}_scheduler_reserve" slot_reservation_id "ns:${ns}" \
+        "\${${ns}_SCHED_CPU_PER_JOB:-0}" "\${${ns}_SCHED_MEMORY_PER_JOB:-0}" || return
+    ${ns}_SLOT_RESERVATION["\$slot_id"]="\$slot_reservation_id"
+    printf -v "\$outvar" '%s' "\$slot_reservation_id"
+}
+${ns}_scheduler_release_slot() {
+    [ \$# -eq 1 ] || return 64
+    local slot_id="\$1" rid="\${${ns}_SLOT_RESERVATION[\$slot_id]:-}" scheduler_ns="\${${ns}_SCHEDULER_NS:-}"
+    [ -n "\$rid" ] || return 0
+    [ -n "\$scheduler_ns" ] || return 84
+    "\${scheduler_ns}_scheduler_release" "ns:${ns}" "\$rid" || return
+    unset '${ns}_SLOT_RESERVATION['"\$slot_id"']'
+}
+EOF
+)
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
 define_summon_worker() {
     local ns="$1"
     local body
@@ -1512,6 +1568,13 @@ ${ns}_job_pool_submit_core() {
     if [ "\$slot_id" -eq 0 ]; then
         echo "Chyba [${ns}]: žádný volný slot" >&2
         return 1
+    fi
+
+    local scheduler_reservation=
+    ${ns}_scheduler_reserve_slot "\$slot_id" scheduler_reservation || return
+    if ! ${ns}_reconfiguration_admission_open; then
+        ${ns}_scheduler_release_slot "\$slot_id" || true
+        return 75
     fi
 
     ${ns}_PENDING_JOBS=\$(( ${ns}_PENDING_JOBS + 1 ))
@@ -2499,13 +2562,13 @@ __NS___scheduler_reserve() {
     (( memory <= __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED )) || return 81
 
     __NS___RESERVATION_SEQ=$(( __NS___RESERVATION_SEQ + 1 ))
-    local rid="res:__NS__:${BASHPID}:${__NS___RESERVATION_SEQ}"
-    __NS___RES_CPU["$rid"]="$cpu"
-    __NS___RES_MEMORY["$rid"]="$memory"
-    __NS___RES_OWNER["$rid"]="$owner"
+    local reservation_id="res:__NS__:${BASHPID}:${__NS___RESERVATION_SEQ}"
+    __NS___RES_CPU["$reservation_id"]="$cpu"
+    __NS___RES_MEMORY["$reservation_id"]="$memory"
+    __NS___RES_OWNER["$reservation_id"]="$owner"
     __NS___CPU_RESERVED=$(( __NS___CPU_RESERVED + cpu ))
     __NS___MEMORY_RESERVED=$(( __NS___MEMORY_RESERVED + memory ))
-    printf -v "$outvar" '%s' "$rid"
+    printf -v "$outvar" '%s' "$reservation_id"
 }
 
 __NS___scheduler_release() {
@@ -2584,6 +2647,7 @@ asyncobj_constructor() {
     define_backend_descriptor_api   "$ns"
     define_discovery_api            "$ns"
     define_reconfiguration_api      "$ns"
+    define_scheduler_binding_api    "$ns"
 
     "${ns}_job_pool_init"
     "${ns}_reconfiguration_init"
