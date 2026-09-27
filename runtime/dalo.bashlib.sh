@@ -604,6 +604,41 @@ __NS___drain_fifo() {
                            fi
                        fi
                        ;;
+                   SCHED_RESERVE)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           declare -F "__NS___scheduler_reserve" >/dev/null 2>&1 || ctl_rc=67
+                       fi
+                       if ((ctl_rc == 0)); then
+                           local sched_rid
+                           __NS___scheduler_reserve sched_rid "$ctl_source" \
+                               "${ctl_args[0]}" "${ctl_args[1]}" || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=("$sched_rid")
+                       fi
+                       ;;
+                   SCHED_RELEASE)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           declare -F "__NS___scheduler_release" >/dev/null 2>&1 || ctl_rc=67
+                       fi
+                       if ((ctl_rc == 0)); then
+                           __NS___scheduler_release "$ctl_source" "${ctl_args[0]}" || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}")
+                       fi
+                       ;;
+                   SCHED_QUERY)
+                       ((${#ctl_args[@]} == 0)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           declare -F "__NS___scheduler_diagnose" >/dev/null 2>&1 || ctl_rc=67
+                       fi
+                       if ((ctl_rc == 0)); then
+                           __NS___scheduler_diagnose || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=(
+                               "${__NS___CPU_TOTAL:-0}" "${__NS___CPU_RESERVED:-0}"
+                               "${__NS___MEMORY_TOTAL:-0}" "${__NS___MEMORY_RESERVED:-0}"
+                           )
+                       fi
+                       ;;
                    RECONFIG_PREPARE)
                        ((${#ctl_args[@]} == 0)) || ctl_rc=64
                        ((ctl_rc != 0)) || __NS___reconfiguration_prepare || ctl_rc=$?
@@ -2419,6 +2454,98 @@ orchestrator_constructor() {
     "${ns}_job_pool_init"
     "${ns}_control_lifecycle_init"
     "${ns}_orchestrator_init"
+}
+
+
+# ============================================================================
+# PER-MACHINE SCHEDULER FOUNDATION
+# ============================================================================
+# One SCHEDULER owns one MACHINE resource ledger. It is a CONTROL endpoint,
+# not an OBJECT-state owner. v1 accounts abstract CPU slots and memory bytes.
+define_scheduler_api() {
+    [ $# -eq 1 ] || return 2
+    local ns="$1" body
+    body="$(cat <<'SCHED_EOF'
+__NS___scheduler_init() {
+    [ $# -eq 2 ] || return 64
+    local cpu_total="$1" memory_total="$2"
+    [[ "$cpu_total" =~ ^[0-9]+$ && "$memory_total" =~ ^[0-9]+$ ]] || return 64
+    __NS___SCHEDULER_STATE=ACTIVE
+    __NS___CPU_TOTAL="$cpu_total"
+    __NS___CPU_RESERVED=0
+    __NS___MEMORY_TOTAL="$memory_total"
+    __NS___MEMORY_RESERVED=0
+    __NS___RESERVATION_SEQ=0
+    declare -gA __NS___RES_CPU=()
+    declare -gA __NS___RES_MEMORY=()
+    declare -gA __NS___RES_OWNER=()
+}
+
+__NS___scheduler_available_cpu() {
+    printf '%s\n' "$(( __NS___CPU_TOTAL - __NS___CPU_RESERVED ))"
+}
+__NS___scheduler_available_memory() {
+    printf '%s\n' "$(( __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED ))"
+}
+
+__NS___scheduler_reserve() {
+    [ $# -eq 4 ] || return 64
+    local outvar="$1" owner="$2" cpu="$3" memory="$4"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$owner" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 71
+    [[ "$cpu" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || return 64
+    [[ "${__NS___SCHEDULER_STATE:-ACTIVE}" == ACTIVE ]] || return 74
+    (( cpu <= __NS___CPU_TOTAL - __NS___CPU_RESERVED )) || return 80
+    (( memory <= __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED )) || return 81
+
+    __NS___RESERVATION_SEQ=$(( __NS___RESERVATION_SEQ + 1 ))
+    local rid="res:__NS__:${BASHPID}:${__NS___RESERVATION_SEQ}"
+    __NS___RES_CPU["$rid"]="$cpu"
+    __NS___RES_MEMORY["$rid"]="$memory"
+    __NS___RES_OWNER["$rid"]="$owner"
+    __NS___CPU_RESERVED=$(( __NS___CPU_RESERVED + cpu ))
+    __NS___MEMORY_RESERVED=$(( __NS___MEMORY_RESERVED + memory ))
+    printf -v "$outvar" '%s' "$rid"
+}
+
+__NS___scheduler_release() {
+    [ $# -eq 2 ] || return 64
+    local owner="$1" rid="$2"
+    [[ -v "__NS___RES_OWNER[$rid]" ]] || return 82
+    [[ "${__NS___RES_OWNER[$rid]}" == "$owner" ]] || return 83
+    local cpu="${__NS___RES_CPU[$rid]}" memory="${__NS___RES_MEMORY[$rid]}"
+    __NS___CPU_RESERVED=$(( __NS___CPU_RESERVED - cpu ))
+    __NS___MEMORY_RESERVED=$(( __NS___MEMORY_RESERVED - memory ))
+    unset '__NS___RES_CPU['"$rid"']' '__NS___RES_MEMORY['"$rid"']' '__NS___RES_OWNER['"$rid"']'
+}
+
+__NS___scheduler_diagnose() {
+    (( __NS___CPU_RESERVED >= 0 && __NS___CPU_RESERVED <= __NS___CPU_TOTAL )) || return 84
+    (( __NS___MEMORY_RESERVED >= 0 && __NS___MEMORY_RESERVED <= __NS___MEMORY_TOTAL )) || return 84
+    local rid cpu_sum=0 memory_sum=0
+    for rid in "${!__NS___RES_OWNER[@]}"; do
+        [[ -v "__NS___RES_CPU[$rid]" && -v "__NS___RES_MEMORY[$rid]" ]] || return 84
+        cpu_sum=$(( cpu_sum + __NS___RES_CPU[$rid] ))
+        memory_sum=$(( memory_sum + __NS___RES_MEMORY[$rid] ))
+    done
+    (( cpu_sum == __NS___CPU_RESERVED && memory_sum == __NS___MEMORY_RESERVED ))
+}
+SCHED_EOF
+)"
+    body="${body//__NS__/$ns}"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
+scheduler_constructor() {
+    [ $# -eq 3 ] || return 2
+    local ns="$1" cpu_total="$2" memory_total="$3"
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    define_fifo_api "$ns"
+    define_scheduler_api "$ns"
+    define_job_pool_init "$ns"
+    "${ns}_job_pool_init"
+    "${ns}_control_lifecycle_init"
+    "${ns}_scheduler_init" "$cpu_total" "$memory_total"
 }
 
 # ============================================================================
