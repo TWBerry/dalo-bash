@@ -604,6 +604,25 @@ __NS___drain_fifo() {
                            fi
                        fi
                        ;;
+                   RECONFIG_PREPARE)
+                       ((${#ctl_args[@]} == 0)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___reconfiguration_prepare || ctl_rc=$?
+                       ;;
+                   RECONFIG_COMMIT)
+                       ((${#ctl_args[@]} == 0)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___reconfiguration_commit_prepared || ctl_rc=$?
+                       ;;
+                   RECONFIG_ABORT)
+                       ((${#ctl_args[@]} == 0)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___reconfiguration_abort_prepared || ctl_rc=$?
+                       ;;
+                   RECONFIG_RECONNECT_PREPARED)
+                       ((${#ctl_args[@]} == 3)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           __NS___reconfiguration_reconnect_prepared \
+                               "${ctl_args[0]}" "${ctl_args[1]}" "${ctl_args[2]}" || ctl_rc=$?
+                       fi
+                       ;;
                    OBJECT_RECONNECT)
                        ((${#ctl_args[@]} == 3)) || ctl_rc=64
                        if ((ctl_rc == 0)); then
@@ -2096,6 +2115,44 @@ __NS___reconfiguration_replace_worker() {
     fi
 }
 
+__NS___reconfiguration_prepare() {
+    [ $# -eq 0 ] || return 64
+    __NS___reconfiguration_begin || return
+    if ! __NS___reconfiguration_quiesce; then
+        local rc=$?
+        __NS___reconfiguration_abort || true
+        return "$rc"
+    fi
+}
+
+__NS___reconfiguration_commit_prepared() {
+    [ $# -eq 0 ] || return 64
+    [[ "${__NS___RECONFIG_STATE:-ACTIVE}" == QUIESCED ]] || return 74
+    __NS___reconfiguration_resume
+}
+
+__NS___reconfiguration_abort_prepared() {
+    [ $# -eq 0 ] || return 64
+    case "${__NS___RECONFIG_STATE:-ACTIVE}" in
+        QUIESCING|QUIESCED|FAILED) __NS___reconfiguration_abort ;;
+        ACTIVE) return 0 ;;
+        *) return 74 ;;
+    esac
+}
+
+__NS___reconfiguration_reconnect_prepared() {
+    [ $# -eq 3 ] || return 64
+    local src_port="$1" dst_ns="$2" dst_port="$3"
+    [[ "${__NS___RECONFIG_STATE:-ACTIVE}" == QUIESCED ]] || return 74
+    [[ "$src_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    [[ "$dst_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$dst_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1 || return 66
+    [[ -v "__NS___ROUTE_DST_NS[$src_port]" && -v "__NS___ROUTE_DST_PORT[$src_port]" ]] || return 71
+    __NS___ROUTE_DST_NS["$src_port"]="$dst_ns"
+    __NS___ROUTE_DST_PORT["$src_port"]="$dst_port"
+}
+
 __NS___reconfiguration_reconnect() {
     [ $# -eq 3 ] || return 64
     local src_port="$1" dst_ns="$2" dst_port="$3"
@@ -2260,6 +2317,89 @@ __NS___orchestrator_replace_worker() {
 __NS___orchestrator_reconnect() {
     [ $# -eq 5 ] || return 64
     __NS___orchestrator_issue "$1" "$2" OBJECT_RECONNECT 0 "$3" "$4" "$5"
+}
+
+
+# Multi-OBJECT topology transaction v1.
+# Spec format per reconnect: TARGET SRC_PORT DST_NS DST_PORT.
+__NS___orchestrator_tx_reconnect() {
+    [ $# -ge 5 ] || return 64
+    local outvar="$1"; shift
+    (( $# % 4 == 0 )) || return 64
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+
+    local txid="tx:${BASHPID}:${__NS___CONTROL_REQUEST_SEQ:-0}"
+    local -a specs=("$@") participants=() prepared=() snapshots=()
+    local i target src_port dst_ns dst_port req rc=0 p seen
+
+    # Build unique source-object participant set and snapshot routes before closing admission.
+    for ((i=0;i<${#specs[@]};i+=4)); do
+        target="${specs[i]}"; src_port="${specs[i+1]}"
+        dst_ns="${specs[i+2]}"; dst_port="${specs[i+3]}"
+        local tns="${target#ns:}"
+        [[ "$tns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+        declare -F "${tns}_summon_worker" >/dev/null 2>&1 || return 66
+        [[ -v "${tns}_ROUTE_DST_NS[$src_port]" && -v "${tns}_ROUTE_DST_PORT[$src_port]" ]] || return 71
+        declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1 || return 66
+        local -n _rns="${tns}_ROUTE_DST_NS" _rport="${tns}_ROUTE_DST_PORT"
+        snapshots+=("$tns" "$src_port" "${_rns[$src_port]}" "${_rport[$src_port]}")
+        seen=0; for p in "${participants[@]}"; do [[ "$p" == "$target" ]] && seen=1; done
+        ((seen)) || participants+=("$target")
+    done
+
+    # Phase 1: PREPARE every participant.
+    for target in "${participants[@]}"; do
+        __NS___orchestrator_issue req "$target" RECONFIG_PREPARE 0 || { rc=$?; break; }
+        # Object dispatcher and reply endpoint share this shell in v1 tests/runtime.
+        local tns="${target#ns:}"
+        "${tns}_drain_fifo" || true
+        __NS___drain_fifo || true
+        if ! __NS___orchestrator_wait "$req"; then rc="${__NS___ORCH_ERROR[$req]:-1}"; break; fi
+        prepared+=("$target")
+    done
+
+    if ((rc != 0)); then
+        for target in "${prepared[@]}"; do
+            __NS___orchestrator_issue req "$target" RECONFIG_ABORT 0 || true
+            local ans="${target#ns:}"; "${ans}_drain_fifo" 2>/dev/null || true
+            __NS___drain_fifo || true
+        done
+        printf -v "$outvar" '%s' "$txid"
+        return "$rc"
+    fi
+
+    # Phase 2: apply mutations while every participant remains QUIESCED.
+    for ((i=0;i<${#specs[@]};i+=4)); do
+        target="${specs[i]}"; src_port="${specs[i+1]}"; dst_ns="${specs[i+2]}"; dst_port="${specs[i+3]}"
+        __NS___orchestrator_issue req "$target" RECONFIG_RECONNECT_PREPARED 0 "$src_port" "$dst_ns" "$dst_port" || { rc=$?; break; }
+        local pns="${target#ns:}"; "${pns}_drain_fifo" || true; __NS___drain_fifo || true
+        if ! __NS___orchestrator_wait "$req"; then rc="${__NS___ORCH_ERROR[$req]:-1}"; break; fi
+    done
+
+    # Roll back route snapshots before reopening admission if mutation failed.
+    if ((rc != 0)); then
+        for ((i=0;i<${#snapshots[@]};i+=4)); do
+            local sns="${snapshots[i]}" sport="${snapshots[i+1]}"
+            local -n _rns="${sns}_ROUTE_DST_NS" _rport="${sns}_ROUTE_DST_PORT"
+            _rns["$sport"]="${snapshots[i+2]}"
+            _rport["$sport"]="${snapshots[i+3]}"
+        done
+        for target in "${prepared[@]}"; do
+            __NS___orchestrator_issue req "$target" RECONFIG_ABORT 0 || true
+            local ans="${target#ns:}"; "${ans}_drain_fifo" 2>/dev/null || true; __NS___drain_fifo || true
+        done
+        printf -v "$outvar" '%s' "$txid"
+        return "$rc"
+    fi
+
+    # Phase 3: commit/reopen all participants.
+    for target in "${prepared[@]}"; do
+        __NS___orchestrator_issue req "$target" RECONFIG_COMMIT 0 || { rc=$?; break; }
+        local pns="${target#ns:}"; "${pns}_drain_fifo" || true; __NS___drain_fifo || true
+        if ! __NS___orchestrator_wait "$req"; then rc="${__NS___ORCH_ERROR[$req]:-1}"; break; fi
+    done
+    printf -v "$outvar" '%s' "$txid"
+    return "$rc"
 }
 ORCH_EOF
 )"
