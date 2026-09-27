@@ -2160,6 +2160,127 @@ RECONFIG_EOF
 }
 
 
+
+# ============================================================================
+# PROJECT ORCHESTRATOR FOUNDATION
+# ============================================================================
+# The ORCHESTRATOR is a PROJECT-level CONTROL endpoint. It owns only control
+# intent/request state; canonical OBJECT state remains owned by each OBJECT's
+# FIFO dispatcher. It therefore never reads another OBJECT's FIFO.
+define_orchestrator_api() {
+    [ $# -eq 1 ] || return 2
+    local ns="$1" body
+    body="$(cat <<'ORCH_EOF'
+__NS___orchestrator_init() {
+    __NS___ORCHESTRATOR_STATE=ACTIVE
+    declare -gA __NS___ORCH_PENDING=()
+    declare -gA __NS___ORCH_STATUS=()
+    declare -gA __NS___ORCH_OPERATION=()
+    declare -gA __NS___ORCH_RESULT=()
+    declare -gA __NS___ORCH_ERROR=()
+}
+
+__NS___orchestrator_issue() {
+    [ $# -ge 4 ] || return 64
+    [[ "${__NS___ORCHESTRATOR_STATE:-ACTIVE}" == ACTIVE ]] || return 74
+    local outvar="$1" target="$2" op="$3" flags="$4"; shift 4
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    local request_id source='ns:__NS__' reply_target='ns:__NS__'
+    __NS___control_next_request_id request_id || return
+    __NS___ORCH_PENDING["$request_id"]=1
+    __NS___ORCH_STATUS["$request_id"]=PENDING
+    __NS___ORCH_OPERATION["$request_id"]="$op"
+    __NS___ORCH_RESULT["$request_id"]=
+    __NS___ORCH_ERROR["$request_id"]=
+    if ! __NS___control_send_frame_to "$target" Q 1 "$request_id" \
+            "$source" "$target" "$reply_target" "$op" "$flags" "$@"; then
+        local rc=$?
+        unset '__NS___ORCH_PENDING['"$request_id"']'
+        __NS___ORCH_STATUS["$request_id"]=SEND_ERROR
+        __NS___ORCH_ERROR["$request_id"]="$rc"
+        return "$rc"
+    fi
+    printf -v "$outvar" '%s' "$request_id"
+}
+
+__NS___on_control_response() {
+    [ $# -ge 3 ] || return 64
+    local tag="$1" request_id="$2" op="$3"; shift 3
+    [[ "$tag" == K || "$tag" == E ]] || return 67
+    [[ -v "__NS___ORCH_PENDING[$request_id]" ]] || return 76
+    [[ "${__NS___ORCH_OPERATION[$request_id]:-}" == "$op" ]] || return 78
+
+    if [[ "$tag" == K ]]; then
+        __NS___ORCH_STATUS["$request_id"]=ACK
+        __NS___ORCH_RESULT["$request_id"]="$*"
+        __NS___ORCH_ERROR["$request_id"]=
+    else
+        __NS___ORCH_STATUS["$request_id"]=ERROR
+        __NS___ORCH_RESULT["$request_id"]=
+        __NS___ORCH_ERROR["$request_id"]="${1:-1}"
+    fi
+    unset '__NS___ORCH_PENDING['"$request_id"']'
+}
+
+__NS___orchestrator_wait() {
+    [ $# -eq 1 ] || return 64
+    local request_id="$1" spins=0
+    [[ -v "__NS___ORCH_STATUS[$request_id]" ]] || return 76
+    while [[ "${__NS___ORCH_STATUS[$request_id]}" == PENDING ]]; do
+        __NS___drain_fifo || return
+        [[ "${__NS___ORCH_STATUS[$request_id]}" != PENDING ]] && break
+        ((spins+=1))
+        ((spins < 10000)) || return 79
+        sleep 0.001
+    done
+    [[ "${__NS___ORCH_STATUS[$request_id]}" == ACK ]]
+}
+
+__NS___orchestrator_set() {
+    [ $# -eq 4 ] || return 64
+    __NS___orchestrator_issue "$1" "$2" OBJECT_SET 0 "$3" "$4"
+}
+__NS___orchestrator_array_push() {
+    [ $# -eq 4 ] || return 64
+    __NS___orchestrator_issue "$1" "$2" OBJECT_ARRAY_PUSH 0 "$3" "$4"
+}
+__NS___orchestrator_call() {
+    [ $# -ge 3 ] || return 64
+    local outvar="$1" target="$2" method="$3"; shift 3
+    __NS___orchestrator_issue "$outvar" "$target" OBJECT_CALL 0 "$method" "$@"
+}
+__NS___orchestrator_exec() {
+    [ $# -eq 3 ] || return 64
+    __NS___orchestrator_issue "$1" "$2" OBJECT_EXEC 1 "$3"
+}
+__NS___orchestrator_replace_worker() {
+    [ $# -eq 3 ] || return 64
+    __NS___orchestrator_issue "$1" "$2" OBJECT_REPLACE_WORKER 0 "$3"
+}
+__NS___orchestrator_reconnect() {
+    [ $# -eq 5 ] || return 64
+    __NS___orchestrator_issue "$1" "$2" OBJECT_RECONNECT 0 "$3" "$4" "$5"
+}
+ORCH_EOF
+)"
+    body="${body//__NS__/$ns}"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
+orchestrator_constructor() {
+    [ $# -eq 1 ] || return 2
+    local ns="$1"
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    define_fifo_api "$ns"
+    define_orchestrator_api "$ns"
+    # Reuse the proven FIFO/job-pool initialization solely to provision the
+    # endpoint FIFO and common control state. The ORCHESTRATOR never submits jobs.
+    define_job_pool_init "$ns"
+    "${ns}_job_pool_init"
+    "${ns}_control_lifecycle_init"
+    "${ns}_orchestrator_init"
+}
+
 # ============================================================================
 # 8. CONSTRUCTORS
 # ============================================================================
