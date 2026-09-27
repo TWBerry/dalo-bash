@@ -10,8 +10,8 @@ dalo_ir_init() {
     local p="$1"
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
-    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=()"
-    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=()"
+    eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=() ${p}_PARAM_ORDER=()"
+    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
 }
 dalo_ir_set_project_name() {
     [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || { printf 'daloc: invalid PROJECT NAME %s\n' "$2" >&2; return 20; }
@@ -40,3 +40,27 @@ dalo_ir_set_worker_code(){ local -n a="${1}_WORKER_CODE"; a["$2"]="$3"; }
 dalo_ir_set_worker_type(){ local -n a="${1}_WORKER_TYPE"; a["$2"]="$3"; }
 
 dalo_ir_set_worker_execution(){ local -n a="${1}_WORKER_EXECUTION"; a["$2"]="$3"; }
+
+
+dalo_ir_add_project_arg() {
+    [ $# -eq 3 ] || return 2
+    local p="$1" name="$2" type="$3"
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { printf 'daloc: invalid ARG name %s\n' "$name" >&2; return 26; }
+    case "$type" in int|uint|bool|string) ;; *) printf 'daloc: invalid ARG TYPE %s\n' "$type" >&2; return 27;; esac
+    local -n order="${p}_PARAM_ORDER" types="${p}_PARAM_TYPE" defaults="${p}_PARAM_DEFAULT" required="${p}_PARAM_REQUIRED" has_default="${p}_PARAM_HAS_DEFAULT"
+    [[ ! -v types["$name"] ]] || { printf 'daloc: duplicate ARG %s\n' "$name" >&2; return 28; }
+    order+=("$name"); types["$name"]="$type"; defaults["$name"]=""; required["$name"]=0; has_default["$name"]=0
+}
+dalo_ir_set_project_arg_required() {
+    [ $# -eq 3 ] || return 2
+    local -n types="${1}_PARAM_TYPE" required="${1}_PARAM_REQUIRED" has_default="${1}_PARAM_HAS_DEFAULT"
+    [[ -v types["$2"] ]] || return 29
+    case "$3" in YES|yes|1|TRUE|true) [[ "${has_default[$2]:-0}" == 0 ]] || { printf 'daloc: ARG cannot be REQUIRED with DEFAULT\n' >&2; return 31; }; required["$2"]=1;; NO|no|0|FALSE|false) required["$2"]=0;; *) printf 'daloc: ARG REQUIRED must be YES or NO\n' >&2; return 30;; esac
+}
+dalo_ir_set_project_arg_default() {
+    [ $# -eq 3 ] || return 2
+    local -n types="${1}_PARAM_TYPE" defaults="${1}_PARAM_DEFAULT" required="${1}_PARAM_REQUIRED" has_default="${1}_PARAM_HAS_DEFAULT"
+    [[ -v types["$2"] ]] || return 29
+    [[ "${required[$2]:-0}" == 0 ]] || { printf 'daloc: ARG cannot have DEFAULT when REQUIRED\n' >&2; return 31; }
+    defaults["$2"]="$3"; required["$2"]=0; has_default["$2"]=1
+}

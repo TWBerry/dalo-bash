@@ -8,7 +8,7 @@ DALO_COMPILER_PARSER_INCLUDE=1
 
 dalo_parse_project() {
     [ $# -eq 2 ] || return 2
-    local file="$1" ir="$2" raw line indent text key value current="" current_object="" lineno=0
+    local file="$1" ir="$2" raw line indent text key value current="" current_object="" current_arg="" lineno=0
     local project_dir
     project_dir="$(cd -- "$(dirname -- "$file")" && pwd)" || return
     [[ -r "$file" ]] || { printf 'daloc: cannot read %s\n' "$file" >&2; return 3; }
@@ -27,7 +27,7 @@ dalo_parse_project() {
         text="$line"
 
         if ((indent==0)); then
-            current=""; current_object=""
+            current=""; current_object=""; current_arg=""
             case "$text" in
                 PROJECT) current="PROJECT" ;;
                 OBJECT\ *)
@@ -47,6 +47,14 @@ dalo_parse_project() {
                 current="WORKER"
                 continue
             fi
+            if [[ ( "$current" == PROJECT || "$current" == ARG ) && "$text" == ARG\ * ]]; then
+                current_arg="${text#ARG }"
+                [[ "$current_arg" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { printf 'daloc:%d: invalid ARG name\n' "$lineno" >&2; return 20; }
+                # TYPE defaults to string; nested TYPE may replace it below.
+                dalo_ir_add_project_arg "$ir" "$current_arg" string || return
+                current="ARG"
+                continue
+            fi
             key="${text%% *}"; value="${text#"$key"}"; value="${value# }"
             case "$current" in
                 PROJECT)
@@ -55,6 +63,8 @@ dalo_parse_project() {
                         VERSION) dalo_ir_set_project_version "$ir" "$value" ;;
                         *) printf 'daloc:%d: unknown PROJECT field %s\n' "$lineno" "$key" >&2; return 15 ;;
                     esac ;;
+                ARG)
+                    printf 'daloc:%d: ARG fields must use two TABs\n' "$lineno" >&2; return 15 ;;
                 OBJECT)
                     case "$key" in
                         TYPE) dalo_ir_set_object_type "$ir" "$current_object" "$value" ;;
@@ -71,6 +81,22 @@ dalo_parse_project() {
                         *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
                     esac ;;
                 *) printf 'daloc:%d: indented field without PROJECT/OBJECT\n' "$lineno" >&2; return 17 ;;
+            esac
+            continue
+        fi
+
+        if ((indent==2)) && [[ "$current" == ARG ]]; then
+            key="${text%% *}"; value="${text#"$key"}"; value="${value# }"
+            case "$key" in
+                TYPE)
+                    case "$value" in int|uint|bool|string) ;;
+                        *) printf 'daloc:%d: ARG TYPE must be int, uint, bool, or string\n' "$lineno" >&2; return 20;; esac
+                    local -n __arg_types="${ir}_PARAM_TYPE"
+                    __arg_types["$current_arg"]="$value"
+                    ;;
+                REQUIRED) dalo_ir_set_project_arg_required "$ir" "$current_arg" "$value" || return ;;
+                DEFAULT) dalo_ir_set_project_arg_default "$ir" "$current_arg" "$value" || return ;;
+                *) printf 'daloc:%d: unknown ARG field %s\n' "$lineno" "$key" >&2; return 20 ;;
             esac
             continue
         fi

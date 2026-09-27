@@ -2562,13 +2562,13 @@ __NS___scheduler_reserve() {
     (( memory <= __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED )) || return 81
 
     __NS___RESERVATION_SEQ=$(( __NS___RESERVATION_SEQ + 1 ))
-    local reservation_id="res:__NS__:${BASHPID}:${__NS___RESERVATION_SEQ}"
-    __NS___RES_CPU["$reservation_id"]="$cpu"
-    __NS___RES_MEMORY["$reservation_id"]="$memory"
-    __NS___RES_OWNER["$reservation_id"]="$owner"
+    local _sched_generated_reservation_id="res:__NS__:${BASHPID}:${__NS___RESERVATION_SEQ}"
+    __NS___RES_CPU["$_sched_generated_reservation_id"]="$cpu"
+    __NS___RES_MEMORY["$_sched_generated_reservation_id"]="$memory"
+    __NS___RES_OWNER["$_sched_generated_reservation_id"]="$owner"
     __NS___CPU_RESERVED=$(( __NS___CPU_RESERVED + cpu ))
     __NS___MEMORY_RESERVED=$(( __NS___MEMORY_RESERVED + memory ))
-    printf -v "$outvar" '%s' "$reservation_id"
+    printf -v "$outvar" '%s' "$_sched_generated_reservation_id"
 }
 
 __NS___scheduler_release() {
@@ -2702,6 +2702,152 @@ async_pipeline_endpoint_constructor() {
     fi
 }
 
+
+# ============================================================================
+# 8b. MIGRATION RESOURCE ADMISSION ABI v1
+# ============================================================================
+# This layer coordinates source quiescence with destination MACHINE capacity.
+# It deliberately does not perform transport or reconstruction.
+#
+# Transaction states:
+#   PREPARING -> PREPARED -> COMMITTED
+#                         \-> ABORTED
+#
+# PREPARE:
+#   1. close source admission + reach quiescence
+#   2. reserve destination scheduler capacity
+# COMMIT:
+#   retain the destination reservation as the migrated OBJECT's machine lease,
+#   while reopening the source only when explicitly requested by the caller.
+# ABORT:
+#   release destination capacity and reopen the source.
+#
+# The caller owns cutover ordering between PREPARE and COMMIT.
+
+__dalo_migration_resource_init() {
+    declare -p DALO_MIGRATION_TX_STATE >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_STATE=()
+    declare -p DALO_MIGRATION_TX_SOURCE >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_SOURCE=()
+    declare -p DALO_MIGRATION_TX_DEST_SCHED >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_DEST_SCHED=()
+    declare -p DALO_MIGRATION_TX_RESERVATION >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_RESERVATION=()
+    declare -p DALO_MIGRATION_TX_CPU >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_CPU=()
+    declare -p DALO_MIGRATION_TX_MEMORY >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_MEMORY=()
+    declare -p DALO_MIGRATION_TX_LEASE_OWNER >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_LEASE_OWNER=()
+    : "${DALO_MIGRATION_TX_SEQ:=0}"
+}
+
+migration_resource_prepare() {
+    [ $# -eq 5 ] || return 64
+    local outvar="$1" source_ns="$2" dest_sched="$3" cpu="$4" memory="$5"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$source_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$dest_sched" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$cpu" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || return 64
+    declare -F "${source_ns}_reconfiguration_prepare" >/dev/null 2>&1 || return 66
+    declare -F "${source_ns}_reconfiguration_abort_prepared" >/dev/null 2>&1 || return 66
+    declare -F "${dest_sched}_scheduler_reserve" >/dev/null 2>&1 || return 66
+    declare -F "${dest_sched}_scheduler_release" >/dev/null 2>&1 || return 66
+
+    __dalo_migration_resource_init
+    DALO_MIGRATION_TX_SEQ=$(( DALO_MIGRATION_TX_SEQ + 1 ))
+    local migration_tx_id="mig:${BASHPID}:${DALO_MIGRATION_TX_SEQ}"
+    local lease_owner="migration:${migration_tx_id}"
+    local _migration_reserved_id=
+
+    DALO_MIGRATION_TX_STATE["$migration_tx_id"]=PREPARING
+    DALO_MIGRATION_TX_SOURCE["$migration_tx_id"]="$source_ns"
+    DALO_MIGRATION_TX_DEST_SCHED["$migration_tx_id"]="$dest_sched"
+    DALO_MIGRATION_TX_CPU["$migration_tx_id"]="$cpu"
+    DALO_MIGRATION_TX_MEMORY["$migration_tx_id"]="$memory"
+    DALO_MIGRATION_TX_LEASE_OWNER["$migration_tx_id"]="$lease_owner"
+
+    local prepare_rc=0 reserve_rc=0
+    "${source_ns}_reconfiguration_prepare" || prepare_rc=$?
+    if (( prepare_rc != 0 )); then
+        DALO_MIGRATION_TX_STATE["$migration_tx_id"]=ABORTED
+        return "$prepare_rc"
+    fi
+
+    "${dest_sched}_scheduler_reserve" _migration_reserved_id "$lease_owner" "$cpu" "$memory" || reserve_rc=$?
+    if (( reserve_rc != 0 )); then
+        local rollback_rc=0
+        "${source_ns}_reconfiguration_abort_prepared" || rollback_rc=$?
+        DALO_MIGRATION_TX_STATE["$migration_tx_id"]=ABORTED
+        (( rollback_rc == 0 )) || return "$rollback_rc"
+        return "$reserve_rc"
+    fi
+
+    DALO_MIGRATION_TX_RESERVATION["$migration_tx_id"]="$_migration_reserved_id"
+    DALO_MIGRATION_TX_STATE["$migration_tx_id"]=PREPARED
+    printf -v "$outvar" '%s' "$migration_tx_id"
+}
+
+migration_resource_abort() {
+    [ $# -eq 1 ] || return 64
+    local tx_id="$1"
+    __dalo_migration_resource_init
+    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == PREPARED ]] || return 74
+    local source_ns="${DALO_MIGRATION_TX_SOURCE[$tx_id]}"
+    local dest_sched="${DALO_MIGRATION_TX_DEST_SCHED[$tx_id]}"
+    local reservation_id="${DALO_MIGRATION_TX_RESERVATION[$tx_id]}"
+    local lease_owner="${DALO_MIGRATION_TX_LEASE_OWNER[$tx_id]}"
+    local release_rc=0 reopen_rc=0
+
+    "${dest_sched}_scheduler_release" "$lease_owner" "$reservation_id" || release_rc=$?
+    "${source_ns}_reconfiguration_abort_prepared" || reopen_rc=$?
+
+    # Do not claim ABORTED unless both rollback legs completed.
+    (( release_rc == 0 )) || return "$release_rc"
+    (( reopen_rc == 0 )) || return "$reopen_rc"
+    DALO_MIGRATION_TX_STATE["$tx_id"]=ABORTED
+}
+
+migration_resource_commit() {
+    [ $# -eq 2 ] || return 64
+    local tx_id="$1" destination_ns="$2"
+    __dalo_migration_resource_init
+    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == PREPARED ]] || return 74
+    [[ "$destination_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+
+    # Transfer reservation ownership from the temporary migration transaction
+    # to the reconstructed destination OBJECT without changing totals.
+    local dest_sched="${DALO_MIGRATION_TX_DEST_SCHED[$tx_id]}"
+    local reservation_id="${DALO_MIGRATION_TX_RESERVATION[$tx_id]}"
+    local -n owners="${dest_sched}_RES_OWNER"
+    [[ -v "owners[$reservation_id]" ]] || return 82
+    [[ "${owners[$reservation_id]}" == "${DALO_MIGRATION_TX_LEASE_OWNER[$tx_id]}" ]] || return 83
+    owners["$reservation_id"]="ns:${destination_ns}"
+
+    printf -v "${destination_ns}_MACHINE_RESERVATION" '%s' "$reservation_id"
+    printf -v "${destination_ns}_MACHINE_SCHEDULER" '%s' "$dest_sched"
+    printf -v "${destination_ns}_MACHINE_CPU" '%s' "${DALO_MIGRATION_TX_CPU[$tx_id]}"
+    printf -v "${destination_ns}_MACHINE_MEMORY" '%s' "${DALO_MIGRATION_TX_MEMORY[$tx_id]}"
+    DALO_MIGRATION_TX_STATE["$tx_id"]=COMMITTED
+}
+
+migration_resource_release_object() {
+    [ $# -eq 1 ] || return 64
+    local ns="$1"
+    local sched_var="${ns}_MACHINE_SCHEDULER"
+    local rid_var="${ns}_MACHINE_RESERVATION"
+    local scheduler_ns="${!sched_var:-}" reservation_id="${!rid_var:-}"
+    [ -n "$scheduler_ns" ] && [ -n "$reservation_id" ] || return 0
+    "${scheduler_ns}_scheduler_release" "ns:${ns}" "$reservation_id" || return
+    unset "${ns}_MACHINE_RESERVATION" "${ns}_MACHINE_SCHEDULER" \
+          "${ns}_MACHINE_CPU" "${ns}_MACHINE_MEMORY"
+}
+
+migration_resource_source_retire() {
+    [ $# -eq 1 ] || return 64
+    local tx_id="$1"
+    __dalo_migration_resource_init
+    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == COMMITTED ]] || return 74
+    local source_ns="${DALO_MIGRATION_TX_SOURCE[$tx_id]}"
+    # Source stays closed after successful cutover. This marks ownership transfer;
+    # destruction/registry cleanup remains the existing migration layer's job.
+    local source_state_var="${source_ns}_RECONFIG_STATE"
+    [[ "${!source_state_var:-}" == QUIESCED ]] || return 74
+    printf -v "${source_ns}_MIGRATION_RESOURCE_STATE" '%s' RETIRED
+}
 
 # ============================================================================
 # 9. OBJECT SNAPSHOT / MIGRATION SAFEPOINT ABI v1
@@ -2977,6 +3123,7 @@ create_blank_object() {
     printf -v "${ns}_MIGRATION_REQUESTED" '%s' 0
     printf -v "${ns}_MIGRATION_ADMISSION" '%s' 1
     printf -v "${ns}_MIGRATION_STATE" '%s' ACTIVE
+    migration_policy_init_object "$ns" || return
 
     register_object_identity "$ns" "$obj_id" "$uuid" || return
 
@@ -3027,6 +3174,7 @@ open_file() {
     printf -v "${ns}_RESOURCE_PATH" '%s' "$path"
     printf -v "${ns}_RESOURCE_MODE" '%s' "$mode"
     printf -v "${ns}_OBJECT_TYPE" '%s' RESOURCE_CONTAINER
+    migration_policy_bind_resource_container "$ns" || { close_resource "$ns" || true; return 1; }
     printf '%s\n' "$fd"
 }
 
@@ -3081,7 +3229,7 @@ __asyncobj_rebind_uuid() {
     UUID_TO_OBJ_ID["$wanted"]="$obj_id"
 }
 
-migration_import() {
+__migration_import_unsafe() {
     [ $# -ge 2 ] && [ $# -le 3 ] || return 2
     local bundle="$1" out_ns="$2" out_obj_id="${3:-}"
     local tag a b uuid="" source_obj_id="" object_type="" snap=""
@@ -3429,7 +3577,7 @@ migration_export_with_worker() {
     printf '%s\n' "${ns}_OBJ_ID" >"$bundle_dir/source.obj_id.var"
 }
 
-migration_import_with_worker() {
+__migration_import_with_worker_unsafe() {
     [ $# -eq 3 ] || return 2
     local bundle_dir="$1" out_ns="$2" out_obj_id="$3" new_ns=""
     local expected actual old_uuid uuid obj_id
@@ -3464,6 +3612,239 @@ migration_import_with_worker() {
 }
 
 
+
+# Transactional import guard.  Historical import code predates rollback-safe
+# reconstruction and may return after allocating a fresh OBJECT.  Snapshot the
+# namespace registry and discard every namespace created by a failed import.
+__migration_capture_namespaces() {
+    [ $# -eq 1 ] || return 64
+    local outvar="$1" ns
+    local -n _migration_ns_snapshot="$outvar"
+    _migration_ns_snapshot=()
+    __asyncobj_ensure_global_registries || return
+    for ns in "${!ALL_NS[@]}"; do
+        _migration_ns_snapshot["$ns"]=1
+    done
+}
+
+__migration_cleanup_new_namespaces() {
+    [ $# -eq 1 ] || return 64
+    local before_name="$1" ns cleanup_rc=0
+    local -n _migration_before="$before_name"
+    __asyncobj_ensure_global_registries || return
+    local -a created=()
+    for ns in "${!ALL_NS[@]}"; do
+        [[ -v "_migration_before[$ns]" ]] || created+=("$ns")
+    done
+    for ns in "${created[@]}"; do
+        migration_discard_imported_object "$ns" || cleanup_rc=$?
+    done
+    (( cleanup_rc == 0 ))
+}
+
+migration_import() {
+    [ $# -ge 2 ] && [ $# -le 3 ] || return 2
+    local bundle="$1" out_ns="$2" out_obj_id="${3:-}"
+    local -A _migration_before_ns=()
+    local rc=0
+    __migration_capture_namespaces _migration_before_ns || return
+    __migration_import_unsafe "$bundle" "$out_ns" "$out_obj_id" || rc=$?
+    if (( rc != 0 )); then
+        __migration_cleanup_new_namespaces _migration_before_ns || true
+        return "$rc"
+    fi
+}
+
+migration_import_with_worker() {
+    [ $# -eq 3 ] || return 2
+    local bundle_dir="$1" out_ns="$2" out_obj_id="$3"
+    local -A _migration_before_ns=()
+    local rc=0
+    __migration_capture_namespaces _migration_before_ns || return
+    __migration_import_with_worker_unsafe "$bundle_dir" "$out_ns" "$out_obj_id" || rc=$?
+    if (( rc != 0 )); then
+        __migration_cleanup_new_namespaces _migration_before_ns || true
+        return "$rc"
+    fi
+}
+
+
+# ============================================================================
+# 13b. RESOURCE-AWARE MIGRATION CUTOVER ABI v1
+# ============================================================================
+# Reuses the reconfiguration/resource PREPARE barrier.  Snapshot/export below
+# therefore MUST NOT invoke migration_quiesce a second time.
+
+migration_discard_imported_object() {
+    [ $# -eq 1 ] || return 64
+    local ns="$1"
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    __asyncobj_ensure_global_registries || return
+
+    local obj_id_var="${ns}_OBJECT_ID" uuid_var="${ns}_OBJECT_UUID"
+    local fifo_fd_var="${ns}_FIFO_FD" fifo_path_var="${ns}_FIFO_PATH"
+    local obj_id="${!obj_id_var:-}" uuid="${!uuid_var:-}"
+    local fifo_fd="${!fifo_fd_var:-}" fifo_path="${!fifo_path_var:-}"
+    local fd fn var
+
+    # An imported destination must be idle; this primitive is rollback-only.
+    local pending_var="${ns}_PENDING_JOBS"
+    (( ${!pending_var:-0} == 0 )) || return 74
+
+    # Drop a committed destination machine lease if one was already attached.
+    migration_resource_release_object "$ns" || return
+
+    if [[ -n "$fifo_fd" ]]; then
+        fifo_close "$fifo_fd"
+        unregister_fd "$fifo_fd" || true
+    fi
+    [[ -z "$fifo_path" ]] || rm -f -- "$fifo_path"
+    [[ -z "$obj_id" ]] || unregister_fifo "$obj_id" || true
+
+    if [[ -n "$uuid" && -v "UUID_TO_OBJ_ID[$uuid]" && "${UUID_TO_OBJ_ID[$uuid]}" == "$obj_id" ]]; then
+        unset 'UUID_TO_OBJ_ID['"$uuid"']'
+    fi
+    if [[ -n "$obj_id" && -v "OBJ_ID_TO_NS[$obj_id]" && "${OBJ_ID_TO_NS[$obj_id]}" == "$ns" ]]; then
+        unset 'OBJ_ID_TO_NS['"$obj_id"']'
+    fi
+    if [[ -v "ALL_NS[$ns]" ]]; then
+        unset 'ALL_NS['"$ns"']'
+    fi
+
+    # Remove namespace-local generated functions and variables only after all
+    # values needed for registry cleanup have been captured.
+    while IFS= read -r fn; do
+        [[ "$fn" == "${ns}_"* ]] || continue
+        unset -f "$fn"
+    done < <(declare -F | awk '{print $3}')
+    while IFS= read -r var; do
+        [[ "$var" == "${ns}_"* ]] || continue
+        unset "$var"
+    done < <(compgen -A variable "${ns}_")
+}
+
+migration_export_prepared_with_worker() {
+    [ $# -eq 3 ] || return 64
+    local as="$1" obj="$2" bundle_dir="$3"
+    local -n smap="${as}_DECL_SLOT" wa="${as}_WORKER_ARTIFACT" wh="${as}_WORKER_SHA256"
+    [[ -v "smap[$obj]" ]] || return 3
+    local ns="${smap[$obj]}" artifact="${wa[$obj]:-}" expected="${wh[$obj]:-}" actual
+    local state_var="${ns}_RECONFIG_STATE" pending_var="${ns}_PENDING_JOBS"
+    [[ "${!state_var:-}" == QUIESCED ]] || return 74
+    (( ${!pending_var:-0} == 0 )) || return 74
+    [[ -n "$artifact" && -r "$artifact" && -n "$expected" ]] || return 4
+    mkdir -p "$bundle_dir" || return
+
+    # Existing snapshot ABI requires MIGRATION_STATE=QUIESCED.  Mirror the
+    # already-proven reconfiguration safepoint; do not run a second quiesce.
+    printf -v "${ns}_MIGRATION_STATE" '%s' QUIESCED
+    printf -v "${ns}_MIGRATION_ADMISSION" '%s' 0
+    "${ns}_snapshot_write" "$bundle_dir/raw.snapshot" || return
+
+    local uuid_var="${ns}_OBJECT_UUID" type_var="${ns}_OBJECT_TYPE" id_var="${ns}_OBJECT_ID"
+    local snapshot_payload="$bundle_dir/object.snapshot.snapshot"
+    cp "$bundle_dir/raw.snapshot" "$snapshot_payload" || return
+    {
+        printf 'ASYNC_OBJECT_MIGRATION\t1\n'
+        printf 'UUID\t%q\n' "${!uuid_var}"
+        printf 'SOURCE_OBJ_ID\t%q\n' "${!id_var}"
+        printf 'OBJECT_TYPE\t%q\n' BLANK
+        printf 'SNAPSHOT\t%q\n' "$snapshot_payload"
+        printf 'END\n'
+    } > "$bundle_dir/object.snapshot" || return
+
+    printf '%s\n' "${!type_var:-BLANK}" > "$bundle_dir/object.type" || return
+    cp "$artifact" "$bundle_dir/worker.bash" || return
+    actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
+    [[ "$actual" == "$expected" ]] || return 5
+    printf '%s\n' "$expected" > "$bundle_dir/worker.sha256"
+}
+
+migration_cutover_with_worker() {
+    [ $# -eq 8 ] || return 64
+    local out_ns="$1" out_obj_id="$2" as="$3" obj="$4" dest_sched="$5" cpu="$6" memory="$7" bundle_dir="$8"
+    [[ "$out_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$out_obj_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    local -n smap="${as}_DECL_SLOT"
+    [[ -v "smap[$obj]" ]] || return 3
+    local source_ns="${smap[$obj]}"
+    local source_uuid_var="${source_ns}_OBJECT_UUID"
+    local source_uuid="${!source_uuid_var:-}"
+    [[ -n "$source_uuid" ]] || return 71
+
+    local migration_tx= destination_ns= destination_obj_id=
+    local rc=0 committed=0 migration_plan=
+
+    # Policy gate MUST precede quiesce and destination reservation.
+    migration_policy_plan migration_plan "$source_ns" || return $?
+    migration_resource_prepare migration_tx "$source_ns" "$dest_sched" "$cpu" "$memory" || return
+
+    migration_export_prepared_with_worker "$as" "$obj" "$bundle_dir" || rc=$?
+
+    # Test/debug fault boundary. This is intentionally inert unless explicitly
+    # requested by the caller environment.
+    if (( rc == 0 )) && [[ "${DALO_MIGRATION_FAULT_POINT:-}" == AFTER_EXPORT ]]; then
+        rc=90
+    fi
+
+    # Local/same-shell vertical slice: stable UUID is globally unique. Hand its
+    # registry entry from source to destination only for the reconstruction
+    # window. The source object itself remains intact until final retirement.
+    local source_obj_id_var="${source_ns}_OBJECT_ID"
+    local source_obj_id="${!source_obj_id_var:-}"
+    local uuid_handoff=0
+    if (( rc == 0 )); then
+        if [[ -v "UUID_TO_OBJ_ID[$source_uuid]" && "${UUID_TO_OBJ_ID[$source_uuid]}" == "$source_obj_id" ]]; then
+            unset 'UUID_TO_OBJ_ID['"$source_uuid"']'
+            uuid_handoff=1
+        else
+            rc=86
+        fi
+    fi
+
+    if (( rc == 0 )); then
+        migration_import_with_worker "$bundle_dir" destination_ns destination_obj_id || rc=$?
+    fi
+
+    if (( rc == 0 )) && [[ "${DALO_MIGRATION_FAULT_POINT:-}" == AFTER_IMPORT ]]; then
+        rc=91
+    fi
+
+    if (( rc == 0 )); then
+        local destination_uuid_var="${destination_ns}_OBJECT_UUID"
+        [[ "${!destination_uuid_var:-}" == "$source_uuid" ]] || rc=85
+    fi
+
+    if (( rc == 0 )); then
+        migration_resource_commit "$migration_tx" "$destination_ns" || rc=$?
+        (( rc == 0 )) && committed=1
+    fi
+
+    if (( rc == 0 )); then
+        migration_resource_source_retire "$migration_tx" || rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        if [[ -n "$destination_ns" ]]; then
+            migration_discard_imported_object "$destination_ns" || true
+        fi
+        if (( uuid_handoff == 1 )) && [[ ! -v "UUID_TO_OBJ_ID[$source_uuid]" ]]; then
+            UUID_TO_OBJ_ID["$source_uuid"]="$source_obj_id"
+        fi
+        if (( committed == 0 )); then
+            migration_resource_abort "$migration_tx" || true
+        else
+            # Commit transferred the reservation to destination.  If retirement
+            # then fails, discard released that lease; reopen the source.
+            "${source_ns}_reconfiguration_abort_prepared" || true
+            DALO_MIGRATION_TX_STATE["$migration_tx"]=ABORTED
+        fi
+        return "$rc"
+    fi
+
+    declare -g "$out_ns" "$out_obj_id"
+    printf -v "$out_ns" '%s' "$destination_ns"
+    printf -v "$out_obj_id" '%s' "$destination_obj_id"
+}
 
 # ============================================================================
 # 14. COMM API + POINT-TO-POINT TCP BRIDGE ABI v2 (STEP34)
@@ -4549,25 +4930,40 @@ __asyncmachine_link() {
         printf 'ASYNC_MACHINE_SCRIPT_UUID="$ASYNC_MACHINE_OBJECT_UUID"\n'
     } >>"$out"
 
-    # Link positional parameter ABI directly into the executable.
+    # MACHINE / PROJECT Command-Line ABI v1. DALO runtime options and PROJECT
+    # arguments are parsed by the MACHINE owner; workers never inherit MACHINE $@.
     local -n porder="${project}_PARAM_ORDER" ptypes="${project}_PARAM_TYPE"
     local -n pdefaults="${project}_PARAM_DEFAULT" prequired="${project}_PARAM_REQUIRED"
     {
-        printf '\nasync_machine_parse_args() {\n'
-        printf '  local argc="$#" idx=1 value name type required default\n'
+        printf '\nASYNC_MACHINE_PROJECT_ARGC=0\n'
+        printf 'declare -a ASYNC_MACHINE_PROJECT_ARGV=()\n'
+        printf 'declare -A ASYNC_MACHINE_PROJECT_ARG_SEEN=()\n'
+        printf 'async_machine_parse_args() {\n'
+        printf '  ASYNC_MACHINE_PROJECT_ARGC=0; ASYNC_MACHINE_PROJECT_ARGV=(); ASYNC_MACHINE_PROJECT_ARG_SEEN=()\n'
+        printf '  local arg name value type required default found\n'
+        printf '  while (($#)); do\n'
+        printf '    arg="$1"; shift\n'
+        printf '    [[ "$arg" != -- ]] || { ASYNC_MACHINE_PROJECT_ARGV=("$@"); ASYNC_MACHINE_PROJECT_ARGC=$#; break; }\n'
+        printf '    [[ "$arg" == --* ]] || { printf "Unexpected MACHINE argument: %%s\\n" "$arg" >&2; return 64; }\n'
+        printf '    if [[ "$arg" == *=* ]]; then name="${arg%%=*}"; name="${name#--}"; value="${arg#*=}"; else name="${arg#--}"; (($#)) || { printf "Missing value for --%%s\\n" "$name" >&2; return 64; }; value="$1"; shift; fi\n'
+        printf '    found=0\n'
     } >>"$out"
     local pname
     for pname in "${porder[@]}"; do
-        printf '  name=%q; type=%q; required=%q; default=%q\n' \
-            "$pname" "${ptypes[$pname]}" "${prequired[$pname]}" "${pdefaults[$pname]:-}" >>"$out"
-        printf '  if (( idx <= argc )); then eval "value=\\${$idx}"; else value="$default"; [[ "$required" == 0 ]] || { printf "Missing required parameter: %%s\\\\n" "$name" >&2; return 64; }; fi\n' >>"$out"
-        printf '  case "$type" in int) [[ "$value" =~ ^-?[0-9]+$ ]] || return 65;; uint) [[ "$value" =~ ^[0-9]+$ ]] || return 65;; bool) [[ "$value" == 0 || "$value" == 1 ]] || return 65;; string) :;; esac\n' >>"$out"
-        printf '  printf -v "ASYNC_MACHINE_PARAM_${name}" "%%s" "$value"; export "ASYNC_MACHINE_PARAM_${name}"; ((idx++))\n' >>"$out"
+        printf '    if [[ "$name" == %q ]]; then type=%q; found=1; fi\n' "$pname" "${ptypes[$pname]}" >>"$out"
     done
     {
-        printf '  (( idx > argc )) || { printf "Too many machine arguments\\\\n" >&2; return 64; }\n'
-        printf '}\n'
+        printf '    ((found)) || { printf "Unknown PROJECT argument: --%%s\\n" "$name" >&2; return 64; }\n'
+        printf '    [[ ! -v ASYNC_MACHINE_PROJECT_ARG_SEEN[$name] ]] || { printf "Duplicate PROJECT argument: --%%s\\n" "$name" >&2; return 64; }; ASYNC_MACHINE_PROJECT_ARG_SEEN[$name]=1\n'
+        printf '    case "$type" in int) [[ "$value" =~ ^-?[0-9]+$ ]] || return 65;; uint) [[ "$value" =~ ^[0-9]+$ ]] || return 65;; bool) [[ "$value" == 0 || "$value" == 1 ]] || return 65;; string) :;; esac\n'
+        printf '    printf -v "ASYNC_MACHINE_PARAM_${name}" "%%s" "$value"; export "ASYNC_MACHINE_PARAM_${name}"\n'
+        printf '  done\n'
     } >>"$out"
+    for pname in "${porder[@]}"; do
+        printf '  name=%q; type=%q; required=%q; default=%q\n' "$pname" "${ptypes[$pname]}" "${prequired[$pname]}" "${pdefaults[$pname]:-}" >>"$out"
+        printf '  if [[ ! -v ASYNC_MACHINE_PARAM_${name} ]]; then if [[ "$required" == 1 ]]; then printf "Missing required PROJECT argument: --%%s\\n" "$name" >&2; return 64; else printf -v "ASYNC_MACHINE_PARAM_${name}" "%%s" "$default"; export "ASYNC_MACHINE_PARAM_${name}"; fi; fi\n' >>"$out"
+    done
+    printf '}\n' >>"$out"
 
     local maxv="${project}_MAX_WORKERS_PER_OBJECT" type workers
     for obj in "${objs[@]}"; do
@@ -4766,7 +5162,9 @@ __asyncmachine_link() {
         printf '  async_machine_parse_args "$@" || return\n'
     } >>"$out"
     if [[ -n "$entry_ns" ]]; then
-        printf '  %s_summon_worker "$@" || return\n' "$entry_ns" >>"$out"
+        # __entry__ is a reserved MACHINE startup trigger. It is not a declared
+        # DATA input port and never contains/forwards MACHINE command-line argv.
+        printf '  %s_summon_worker __entry__ || return\n' "$entry_ns" >>"$out"
         printf '  async_machine_wait_all\n' >>"$out"
     fi
     {
@@ -4879,4 +5277,91 @@ async_perf_report() {
         for (e in n)
           printf "%-24s %10d %14.3f %14.3f %14.3f\n", e,n[e],sum[e]/n[e]/1000,min[e]/1000,max[e]/1000;
       }' "$file"
+}
+
+# ============================================================================
+# 13c. MIGRATION POLICY + RESOURCE MIGRATION ABI v1
+# ============================================================================
+# Policy is evaluated before resource PREPARE, so a non-migratable object never
+# closes admission or reserves destination capacity.
+
+migration_policy_init_object() {
+    [ $# -eq 1 ] || return 64
+    local ns="$1"
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    printf -v "${ns}_MIGRATION_POLICY" '%s' MOVABLE
+    eval "declare -g -A ${ns}_MIGRATION_RESOURCE_POLICY=()"
+    eval "declare -g -A ${ns}_MIGRATION_RESOURCE_KIND=()"
+    eval "declare -g -A ${ns}_MIGRATION_RESOURCE_DESCRIPTOR=()"
+    eval "declare -g -A ${ns}_MIGRATION_RESOURCE_BYTES=()"
+}
+
+migration_policy_set() {
+    [ $# -eq 2 ] || return 64
+    local ns="$1" policy="$2" type_var="${1}_OBJECT_TYPE"
+    case "$policy" in MOVABLE|PINNED) ;; *) return 71;; esac
+    # RESOURCE_CONTAINER policy is resource-derived; don't allow a scalar
+    # MOVABLE flag to bypass a pinned FD/resource.
+    if [[ "${!type_var:-}" == RESOURCE_CONTAINER && "$policy" == MOVABLE ]]; then
+        return 87
+    fi
+    printf -v "${ns}_MIGRATION_POLICY" '%s' "$policy"
+}
+
+migration_resource_policy_add() {
+    [ $# -ge 4 ] && [ $# -le 5 ] || return 64
+    local ns="$1" name="$2" kind="$3" policy="$4" descriptor="${5:-}"
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    case "$policy" in PINNED|RECONSTRUCT|TRANSFER) ;; *) return 71;; esac
+    local -n p="${ns}_MIGRATION_RESOURCE_POLICY" k="${ns}_MIGRATION_RESOURCE_KIND"
+    local -n d="${ns}_MIGRATION_RESOURCE_DESCRIPTOR" b="${ns}_MIGRATION_RESOURCE_BYTES"
+    p["$name"]="$policy"; k["$name"]="$kind"; d["$name"]="$descriptor"; b["$name"]=0
+}
+
+migration_resource_policy_set_transfer_bytes() {
+    [ $# -eq 3 ] || return 64
+    local ns="$1" name="$2" bytes="$3"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 71
+    local -n p="${ns}_MIGRATION_RESOURCE_POLICY" b="${ns}_MIGRATION_RESOURCE_BYTES"
+    [[ "${p[$name]:-}" == TRANSFER ]] || return 87
+    b["$name"]="$bytes"
+}
+
+migration_policy_bind_resource_container() {
+    [ $# -eq 1 ] || return 64
+    local ns="$1" type_var="${1}_RESOURCE_TYPE" path_var="${1}_RESOURCE_PATH" mode_var="${1}_RESOURCE_MODE"
+    local kind="${!type_var:-unknown}" desc=""
+    case "$kind" in
+        file) desc="path=${!path_var:-};mode=${!mode_var:-r}" ;;
+        stdin|stdout|stderr) desc="fd=${kind}" ;;
+        *) desc="type=${kind}" ;;
+    esac
+    printf -v "${ns}_MIGRATION_POLICY" '%s' PINNED
+    migration_resource_policy_add "$ns" primary "$kind" PINNED "$desc"
+}
+
+migration_policy_plan() {
+    [ $# -eq 2 ] || return 64
+    local outvar="$1" ns="$2" policy_var="${2}_MIGRATION_POLICY" type_var="${2}_OBJECT_TYPE"
+    local policy="${!policy_var:-MOVABLE}" name transfer=0 pinned=0 reconstruct=0
+    local -n p="${ns}_MIGRATION_RESOURCE_POLICY" b="${ns}_MIGRATION_RESOURCE_BYTES"
+    for name in "${!p[@]}"; do
+        case "${p[$name]}" in
+            PINNED) ((pinned+=1)) ;;
+            RECONSTRUCT) ((reconstruct+=1)) ;;
+            TRANSFER) ((transfer+=${b[$name]:-0})) ;;
+            *) return 71 ;;
+        esac
+    done
+    if [[ "$policy" == PINNED || $pinned -gt 0 ]]; then
+        printf -v "$outvar" 'BLOCKED policy=%s pinned=%d reconstruct=%d transfer_bytes=%d type=%s' "$policy" "$pinned" "$reconstruct" "$transfer" "${!type_var:-UNKNOWN}"
+        return 88
+    fi
+    printf -v "$outvar" 'MOVABLE policy=%s pinned=0 reconstruct=%d transfer_bytes=%d type=%s' "$policy" "$reconstruct" "$transfer" "${!type_var:-UNKNOWN}"
+}
+
+migration_policy_admit() {
+    [ $# -eq 1 ] || return 64
+    local plan
+    migration_policy_plan plan "$1" || return $?
 }

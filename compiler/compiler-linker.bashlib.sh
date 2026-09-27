@@ -13,6 +13,7 @@ dalo_link_machine(){
     local name="${!nv}" version="${!vv}" obj edge mode workers
     local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD"
     local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION"
+    local -n params="${p}_PARAM_ORDER" param_type="${p}_PARAM_TYPE" param_default="${p}_PARAM_DEFAULT" param_required="${p}_PARAM_REQUIRED"
 
     # Backend ABI expected by the established executable-machine linker.
     local backend="DALO_MACHINE_BUILD"
@@ -23,9 +24,16 @@ dalo_link_machine(){
     local -n b_objs="${backend}_DECL_OBJECTS" b_types="${backend}_DECL_TYPE"
     local -n b_wf="${backend}_DECL_WORKER_FILE" b_workers="${backend}_DECL_WORKERS"
     local -n b_edges="${backend}_EDGES" b_exec="${backend}_EXEC_MODE"
+    local -n b_params="${backend}_PARAM_ORDER" b_ptype="${backend}_PARAM_TYPE" b_pdefault="${backend}_PARAM_DEFAULT" b_prequired="${backend}_PARAM_REQUIRED"
 
     b_objs=("${objs[@]}")
     b_edges=("${edges[@]}")
+    b_params=("${params[@]}")
+    for obj in "${params[@]}"; do
+        b_ptype["$obj"]="${param_type[$obj]}"
+        b_pdefault["$obj"]="${param_default[$obj]:-}"
+        b_prequired["$obj"]="${param_required[$obj]}"
+    done
     for obj in "${objs[@]}"; do
         b_types["$obj"]="${types[$obj]}"
         workers="${fields["$obj.MAX_JOBS"]:-1}"
@@ -41,7 +49,22 @@ dalo_link_machine(){
         fi
     done
     printf -v "${backend}_MAX_WORKERS_PER_OBJECT" '%s' 1
-    printf -v "${backend}_ENTRY_OBJECT" '%s' ""
+
+    # MACHINE entry ABI v1: a single ORIGIN is the implicit startup entry.
+    # Multiple ORIGINs remain explicit/manual until PROJECT syntax grows an
+    # explicit ENTRY declaration; silently choosing one would be ambiguous.
+    local entry_obj="" origin_count=0
+    for obj in "${objs[@]}"; do
+        if [[ "${types[$obj]}" == ORIGIN ]]; then
+            entry_obj="$obj"
+            ((origin_count+=1))
+        fi
+    done
+    if (( origin_count == 1 )); then
+        printf -v "${backend}_ENTRY_OBJECT" '%s' "$entry_obj"
+    else
+        printf -v "${backend}_ENTRY_OBJECT" '%s' ""
+    fi
 
     local hash hash_input
     printf -v hash_input '%s\\n' "$name" "$version" "${objs[@]}" "${edges[@]}"
