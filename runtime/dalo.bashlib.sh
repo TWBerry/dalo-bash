@@ -26,11 +26,11 @@ DALO_LIBRARY_REQUIRES="helpers"
 # applies the TCP capability gate before a received control frame reaches FIFO.
 #
 # FIFO Frame ABI v1:
-#   O<TAB>argc<TAB>...  worker output
-#   S<TAB>argc<TAB>...  canonical parent variable mutation
-#   A<TAB>argc<TAB>...  canonical parent array append
-#   C<TAB>argc<TAB>...  parent/object RPC
-#   X<TAB>argc<TAB>...  parent-side code mutation
+#   O<TAB>argc<TAB>...  internal worker output/completion transport
+#   Q<TAB>argc<TAB>...  Control ABI v1 request envelope
+#   K<TAB>argc<TAB>...  Control ABI v1 ACK response
+#   E<TAB>argc<TAB>...  Control ABI v1 ERROR response
+# Legacy S/A/C/X frames remain accepted during the ABI-v1 transition.
 #
 # Requirements: Bash >= 4.3. sha256sum or shasum is required for project hashes.
 # ==============================================================================
@@ -225,20 +225,41 @@ define_fifo_api() {
     local ns="$1"
     local body
     body=$(cat <<'EOF'
+__NS___fifo_field_encode() {
+    [ $# -eq 2 ] || return 2
+    local __in="$1" __out_name="$2" __encoded
+    __encoded="${__in//%/%25}"
+    __encoded="${__encoded//$'\t'/%09}"
+    __encoded="${__encoded//$'\n'/%0A}"
+    __encoded="${__encoded//$'\r'/%0D}"
+    printf -v "$__out_name" '%s' "$__encoded"
+}
+
+__NS___fifo_field_decode() {
+    [ $# -eq 2 ] || return 2
+    local __in="$1" __out_name="$2" __decoded
+    __decoded="${__in//%0D/$'\r'}"
+    __decoded="${__decoded//%0A/$'\n'}"
+    __decoded="${__decoded//%09/$'\t'}"
+    __decoded="${__decoded//%25/%}"
+    printf -v "$__out_name" '%s' "$__decoded"
+}
+
 __NS___fifo_frame_encode() {
     local tag="$1"; shift
-    local frame q arg
+    local frame encoded arg
+    [[ "$tag" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || return 2
     printf -v frame '%s\t%d' "$tag" "$#"
     for arg in "$@"; do
-        printf -v q '%q' "$arg"
-        frame+=$'\t'"$q"
+        __NS___fifo_field_encode "$arg" encoded || return
+        frame+=$'\t'"$encoded"
     done
     printf '%s' "$frame"
 }
 
 __NS___fifo_frame_decode() {
     local frame="$1" out_tag_name="$2" out_argv_name="$3"
-    local _tag _argc _field i
+    local _tag _argc _field i decoded_field
     local -a fields=() decoded=()
     local -n out_tag_ref="$out_tag_name"
     local -n out_argv_ref="$out_argv_name"
@@ -247,49 +268,125 @@ __NS___fifo_frame_decode() {
     ((${#fields[@]} >= 2)) || return 2
     _tag="${fields[0]}"
     _argc="${fields[1]}"
+    [[ "$_tag" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || return 5
     [[ "$_argc" =~ ^[0-9]+$ ]] || return 3
     ((${#fields[@]} == _argc + 2)) || return 4
 
     for ((i=0; i<_argc; i++)); do
         _field="${fields[i+2]}"
-        eval "decoded[i]=$_field"
+        __NS___fifo_field_decode "$_field" decoded_field || return
+        decoded[i]="$decoded_field"
     done
     out_tag_ref="$_tag"
     out_argv_ref=("${decoded[@]}")
 }
 
-__NS___fifo_send() {
-    local tag="$1"; shift
-    local fd="${__NS___FIFO_FD:-}"; [ -n "$fd" ] || return 1
-    local frame frame_bytes atomic_max
-
-    frame="$(__NS___fifo_frame_encode "$tag" "$@")" || return
-
-    # Frame v1 invariant:
-    #   one physical line + trailing LF must fit into one atomic FIFO write budget.
-    # PIPE_BUF is at least 512 by POSIX; Linux FIFOs normally expose 4096.
-    # Allow an explicit override, otherwise query the FIFO path, with 512 as
-    # the conservative portable fallback.
-    atomic_max="${__NS___FIFO_ATOMIC_MAX:-}"
-    if [ -z "$atomic_max" ]; then
-        atomic_max="$(getconf PIPE_BUF "${__NS___FIFO_PATH}" 2>/dev/null || true)"
-        [[ "$atomic_max" =~ ^[0-9]+$ ]] || atomic_max=512
-        __NS___FIFO_ATOMIC_MAX="$atomic_max"
+__NS___fifo_atomic_max() {
+    local path="${1:-${__NS___FIFO_PATH:-}}" out="${2:-}" __atomic_value
+    if [[ -n "$path" && "$path" != "${__NS___FIFO_PATH:-}" ]]; then
+        __atomic_value="$(getconf PIPE_BUF "$path" 2>/dev/null || true)"
+        [[ "$__atomic_value" =~ ^[0-9]+$ ]] || __atomic_value=512
+    else
+        __atomic_value="${__NS___FIFO_ATOMIC_MAX:-}"
+        if [ -z "$__atomic_value" ]; then
+            __atomic_value="$(getconf PIPE_BUF "$path" 2>/dev/null || true)"
+            [[ "$__atomic_value" =~ ^[0-9]+$ ]] || __atomic_value=512
+            __NS___FIFO_ATOMIC_MAX="$__atomic_value"
+        fi
     fi
+    if [ -n "$out" ]; then printf -v "$out" '%s' "$__atomic_value"; else printf '%s' "$__atomic_value"; fi
+}
 
+__NS___fifo_send_raw_fd() {
+    [ $# -ge 2 ] || return 2
+    local fd="$1" frame="$2" path="${3:-${__NS___FIFO_PATH:-}}" frame_bytes atomic_max
+    [[ -n "$fd" ]] || return 1
+    [[ "$frame" != *$'\n'* && "$frame" != *$'\r'* ]] || return 91
+    __NS___fifo_atomic_max "$path" atomic_max || return
     frame_bytes="$(LC_ALL=C printf '%s\n' "$frame" | wc -c)"
     frame_bytes="${frame_bytes//[[:space:]]/}"
-
     if (( frame_bytes > atomic_max )); then
-        printf 'Chyba [__NS__]: FIFO frame je příliš velký (%d > PIPE_BUF %d bytes), tag=%q\n' \
-            "$frame_bytes" "$atomic_max" "$tag" >&2
+        printf 'Chyba [__NS__]: FIFO frame je příliš velký (%d > PIPE_BUF %d bytes)\n' \
+            "$frame_bytes" "$atomic_max" >&2
         return 90
     fi
-
-    # Exactly one shell printf invocation for the complete framed message.
     printf '%s\n' "$frame" >&"$fd"
 }
 
+__NS___fifo_send_raw() {
+    local fd="${__NS___FIFO_FD:-}"; [ -n "$fd" ] || return 1
+    __NS___fifo_send_raw_fd "$fd" "$1" "${__NS___FIFO_PATH:-}"
+}
+
+__NS___fifo_send() {
+    local tag="$1"; shift
+    local frame
+    frame="$(__NS___fifo_frame_encode "$tag" "$@")" || return
+    __NS___fifo_send_raw "$frame"
+}
+
+# Control ABI v1 envelope:
+#   Q 1 REQUEST_ID SOURCE TARGET REPLY_TARGET OP FLAGS ARGS...
+# Targets are logical control endpoints. v1 local routing accepts ns:<namespace>
+# (and bare namespaces for compatibility); '-' means no endpoint/fire-and-forget.
+__NS___control_next_request_id() {
+    [ $# -eq 1 ] || return 2
+    local __out_name="$1" __request_value
+    ((__NS___CONTROL_REQUEST_SEQ=${__NS___CONTROL_REQUEST_SEQ:-0}+1)) || true
+    printf -v __request_value '%s:%s:%s' '__NS__' "${BASHPID:-$$}" "$__NS___CONTROL_REQUEST_SEQ"
+    printf -v "$__out_name" '%s' "$__request_value"
+}
+
+__NS___control_local_ns_from_target() {
+    [ $# -eq 2 ] || return 2
+    local target="$1" out="$2" resolved
+    case "$target" in
+        ns:*) resolved="${target#ns:}" ;;
+        -|'') return 1 ;;
+        *) resolved="$target" ;; # compatibility with pre-v1 local callers
+    esac
+    [[ "$resolved" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    printf -v "$out" '%s' "$resolved"
+}
+
+__NS___control_send_frame_to() {
+    [ $# -ge 2 ] || return 2
+    local target="$1" tag="$2"; shift 2
+    local target_ns fdvar pathvar fd path frame
+    __NS___control_local_ns_from_target "$target" target_ns || return
+    fdvar="${target_ns}_FIFO_FD"; pathvar="${target_ns}_FIFO_PATH"
+    fd="${!fdvar:-}"; path="${!pathvar:-}"
+    [[ -n "$fd" ]] || return 1
+    frame="$(__NS___fifo_frame_encode "$tag" "$@")" || return
+    __NS___fifo_send_raw_fd "$fd" "$frame" "$path"
+}
+
+# Send a request to an arbitrary logical target. SOURCE and REPLY_TARGET are
+# explicit so the wire ABI is independent of Bash namespaces and transport.
+__NS___control_send_to() {
+    [ $# -ge 5 ] || return 2
+    local target="$1" source="$2" reply_target="$3" op="$4" flags="$5"; shift 5
+    local request_id
+    __NS___control_next_request_id request_id || return
+    __NS___control_send_frame_to "$target" Q 1 "$request_id" "$source" "$target" "${reply_target:--}" "$op" "$flags" "$@"
+}
+
+# Child -> own parent convenience path. The physical FIFO is already known;
+# the logical target remains explicit in the envelope.
+__NS___control_send() {
+    [ $# -ge 3 ] || return 2
+    local reply_target="$1" op="$2" flags="$3"; shift 3
+    local request_id source='ns:__NS__' target='ns:__NS__'
+    __NS___control_next_request_id request_id || return
+    __NS___fifo_send Q 1 "$request_id" "$source" "$target" "${reply_target:--}" "$op" "$flags" "$@"
+}
+
+__NS___control_send_response() {
+    [ $# -ge 3 ] || return 2
+    local reply_target="$1" tag="$2" request_id="$3"; shift 3
+    [[ "$reply_target" != '-' && -n "$reply_target" ]] || return 0
+    __NS___control_send_frame_to "$reply_target" "$tag" "$request_id" "$@"
+}
 
 # Port-aware DATA output. The worker owns output-vector semantics; runtime only
 # records the member under <slot>|<port> and transports it to the parent.
@@ -322,14 +419,61 @@ __NS___fifo_msg() {
 
 __NS___fifo_call_parent() {
     local func="$1"; shift
-    local code arg quoted
-    printf -v code '%q' "$func"
-    for arg in "$@"; do
-        printf -v quoted '%q' "$arg"
-        code+=" $quoted"
-    done
-    __NS___fifo_send C "$code"
+    __NS___control_send - CALL 0 "$func" "$@"
 }
+
+# Public OBJECT Control ABI v1 send helpers. These only construct/rout requests;
+# the target dispatcher remains the sole owner of canonical OBJECT state.
+__NS___object_control_set() {
+    [ $# -eq 5 ] || return 2
+    local target="$1" source="$2" reply_target="$3" field="$4" value="$5"
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_SET 0 "$field" "$value"
+}
+
+__NS___object_control_array_push() {
+    [ $# -eq 5 ] || return 2
+    local target="$1" source="$2" reply_target="$3" field="$4" value="$5"
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_ARRAY_PUSH 0 "$field" "$value"
+}
+
+__NS___object_control_call() {
+    [ $# -ge 4 ] || return 2
+    local target="$1" source="$2" reply_target="$3" method="$4"; shift 4
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_CALL 0 "$method" "$@"
+}
+
+__NS___object_control_exec() {
+    [ $# -eq 4 ] || return 2
+    local target="$1" source="$2" reply_target="$3" code="$4"
+    # Flag bit 0 is the explicit privileged-operation marker in Control ABI v1.
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_EXEC 1 "$code"
+}
+
+__NS___object_control_replace_worker() {
+    [ $# -eq 4 ] || return 2
+    local target="$1" source="$2" reply_target="$3" method="$4"
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_REPLACE_WORKER 0 "$method"
+}
+
+__NS___object_control_reconnect() {
+    [ $# -eq 6 ] || return 2
+    local target="$1" source="$2" reply_target="$3" src_port="$4" dst_ns="$5" dst_port="$6"
+    __NS___control_send_to "$target" "$source" "$reply_target" OBJECT_RECONNECT 0 \
+        "$src_port" "$dst_ns" "$dst_port"
+}
+
+# FIFO Control lifecycle uses ordered barrier frames in the same FIFO stream.
+# Q frames before DRAIN are admitted; Q frames after it receive ERROR 69.
+__NS___control_lifecycle_init() { __NS___CONTROL_STATE=ACTIVE; }
+__NS___control_begin_drain() {
+    [[ "${__NS___CONTROL_STATE:-ACTIVE}" == ACTIVE ]] || return 0
+    __NS___fifo_send L DRAIN
+}
+__NS___control_close() {
+    [[ "${__NS___CONTROL_STATE:-ACTIVE}" != CLOSED ]] || return 0
+    __NS___fifo_send L CLOSE
+}
+__NS___control_state() { printf '%s\n' "${__NS___CONTROL_STATE:-ACTIVE}"; }
 
 __NS___drain_fifo() {
     local fd="${__NS___FIFO_FD:-}"; [ -n "$fd" ] || return 0
@@ -345,6 +489,167 @@ __NS___drain_fifo() {
         case "$tag" in
             O) ((${#argv[@]} == 2)) || continue
                __NS___OUTPUT_DATA_VECTOR["${argv[0]}"]="${argv[1]}" ;;
+            L)
+               ((${#argv[@]} == 1)) || continue
+               case "${argv[0]}" in
+                   DRAIN) [[ "${__NS___CONTROL_STATE:-ACTIVE}" == ACTIVE ]] && __NS___CONTROL_STATE=DRAINING ;;
+                   CLOSE) __NS___CONTROL_STATE=CLOSED ;;
+               esac
+               ;;
+            Q)
+               ((${#argv[@]} >= 7)) || continue
+               local ctl_ver="${argv[0]}" ctl_req="${argv[1]}" ctl_source="${argv[2]}" ctl_target="${argv[3]}" ctl_reply="${argv[4]}" ctl_op="${argv[5]}" ctl_flags="${argv[6]}" ctl_rc=0
+               local -a ctl_args=("${argv[@]:7}")
+               [[ "$ctl_ver" == 1 && "$ctl_req" =~ ^[A-Za-z0-9_.:-]+$ ]] || continue
+               [[ "$ctl_target" == 'ns:__NS__' || "$ctl_target" == '__NS__' ]] || ctl_rc=68
+               if ((ctl_rc == 0)); then
+                   case "${__NS___CONTROL_STATE:-ACTIVE}" in
+                       DRAINING) ctl_rc=69 ;;
+                       CLOSED) ctl_rc=70 ;;
+                   esac
+                   if ((ctl_rc != 0)); then
+                       __NS___control_send_response "$ctl_reply" E "$ctl_req" "$ctl_op" "$ctl_rc" || true
+                       continue
+                   fi
+               fi
+               local -a ctl_result=()
+               case "$ctl_op" in
+                   # Legacy Control ABI v1 primitives. Kept for compatibility;
+                   # new orchestration code should use OBJECT_* operations below.
+                   SET)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       ((ctl_rc)) || printf -v "${ctl_args[0]}" '%s' "${ctl_args[1]}" || ctl_rc=$?
+                       ;;
+                   ARRAY_PUSH)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local -n _ctl_arr_ref="${ctl_args[0]}"
+                           _ctl_arr_ref+=("${ctl_args[1]}") || ctl_rc=$?
+                           unset -n _ctl_arr_ref
+                       fi
+                       ;;
+                   CALL)
+                       ((${#ctl_args[@]} >= 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local ctl_func="${ctl_args[0]}"
+                           [[ "$ctl_func" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || ctl_rc=65
+                           if ((ctl_rc == 0)); then
+                               declare -F "$ctl_func" >/dev/null || ctl_rc=66
+                           fi
+                           if ((ctl_rc == 0)); then
+                               "$ctl_func" "${ctl_args[@]:1}" || ctl_rc=$?
+                           fi
+                       fi
+                       ;;
+                   EXEC)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc)) || __NS___apply_code "${ctl_args[0]}" || ctl_rc=$?
+                       ;;
+
+                   # OBJECT Control ABI v1. Fields and methods are relative to
+                   # the target OBJECT namespace; arbitrary parent-shell names
+                   # are deliberately not accepted here.
+                   OBJECT_SET)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local ctl_field="${ctl_args[0]}" ctl_var
+                           [[ "$ctl_field" =~ ^[A-Z][A-Z0-9_]*$ ]] || ctl_rc=71
+                           ctl_var="__NS___${ctl_field}"
+                           if ((ctl_rc == 0)); then
+                               # OBJECT_SET mutates existing canonical state only.
+                               declare -p "$ctl_var" >/dev/null 2>&1 || ctl_rc=71
+                           fi
+                           if ((ctl_rc == 0)); then
+                               printf -v "$ctl_var" '%s' "${ctl_args[1]}" || ctl_rc=$?
+                               ctl_result=("$ctl_field" "${ctl_args[1]}")
+                           fi
+                       fi
+                       ;;
+                   OBJECT_ARRAY_PUSH)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local ctl_field="${ctl_args[0]}" ctl_var ctl_decl
+                           [[ "$ctl_field" =~ ^[A-Z][A-Z0-9_]*$ ]] || ctl_rc=71
+                           ctl_var="__NS___${ctl_field}"
+                           if ((ctl_rc == 0)); then
+                               ctl_decl="$(declare -p "$ctl_var" 2>/dev/null)" || ctl_rc=71
+                           fi
+                           if ((ctl_rc == 0)); then
+                               [[ "$ctl_decl" == 'declare -a '* || "$ctl_decl" == 'declare -A '* ]] || ctl_rc=72
+                           fi
+                           if ((ctl_rc == 0)); then
+                               local -n _ctl_obj_arr_ref="$ctl_var"
+                               _ctl_obj_arr_ref+=("${ctl_args[1]}") || ctl_rc=$?
+                               ctl_result=("$ctl_field" "${#_ctl_obj_arr_ref[@]}")
+                               unset -n _ctl_obj_arr_ref
+                           fi
+                       fi
+                       ;;
+                   OBJECT_CALL)
+                       ((${#ctl_args[@]} >= 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local ctl_method="${ctl_args[0]}" ctl_func
+                           [[ "$ctl_method" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || ctl_rc=71
+                           ctl_func="__NS___${ctl_method}"
+                           if ((ctl_rc == 0)); then
+                               declare -F "$ctl_func" >/dev/null || ctl_rc=66
+                           fi
+                           if ((ctl_rc == 0)); then
+                               # Run in the canonical parent process. Do not use
+                               # command substitution here: it would fork away
+                               # method-side state mutations. stdout remains the
+                               # method's normal data stream; ACK carries status.
+                               "$ctl_func" "${ctl_args[@]:1}" || ctl_rc=$?
+                               ((ctl_rc == 0)) && ctl_result=("$ctl_method")
+                           fi
+                       fi
+                       ;;
+                   OBJECT_RECONNECT)
+                       ((${#ctl_args[@]} == 3)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           __NS___reconfiguration_reconnect \
+                               "${ctl_args[0]}" "${ctl_args[1]}" "${ctl_args[2]}" || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=(
+                               "${ctl_args[0]}" "${ctl_args[1]}" "${ctl_args[2]}"
+                               "${__NS___RECONFIG_GENERATION:-0}"
+                           )
+                       fi
+                       ;;
+                   OBJECT_REPLACE_WORKER)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           __NS___reconfiguration_replace_worker "${ctl_args[0]}" || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=(
+                               "${ctl_args[0]}"
+                               "${__NS___TARGET_WORKER_FUNC:-}"
+                               "${__NS___RECONFIG_GENERATION:-0}"
+                           )
+                       fi
+                       ;;
+                   OBJECT_EXEC)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           [[ "$ctl_flags" =~ ^[0-9]+$ ]] || ctl_rc=73
+                           ((ctl_rc)) || (( (10#$ctl_flags & 1) != 0 )) || ctl_rc=72
+                       fi
+                       ((ctl_rc)) || __NS___apply_code "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("EXECUTED")
+                       ;;
+                   *) ctl_rc=67 ;;
+               esac
+               if ((ctl_rc == 0)); then
+                   __NS___control_send_response "$ctl_reply" K "$ctl_req" "$ctl_op" "${ctl_result[@]}" || true
+               else
+                   __NS___control_send_response "$ctl_reply" E "$ctl_req" "$ctl_op" "$ctl_rc" || true
+               fi
+               ;;
+            K|E)
+               if declare -f "__NS___on_control_response" >/dev/null 2>&1; then
+                   "__NS___on_control_response" "$tag" "${argv[@]}"
+               elif declare -f "__NS___on_fifo_message" >/dev/null 2>&1; then
+                   "__NS___on_fifo_message" "$tag" "${argv[@]}"
+               fi
+               ;;
             S) ((${#argv[@]} == 2)) || continue
                printf -v "${argv[0]}" '%s' "${argv[1]}" ;;
             A) ((${#argv[@]} == 2)) || continue
@@ -380,8 +685,23 @@ ${ns}_worker_cleanup_wrapper() {
         "\$cleanup_func" "\$worker_dir" "\$slot_id" "\$exit_code" || true
     fi
     ${ns}_default_worker_cleanup "\$worker_dir" "\$slot_id" "\$exit_code" || true
-    ${ns}_fifo_call_parent "${ns}_mark_job_completed" \
-        "\$slot_id" "\$BASHPID" "\$exit_code" "\$task_id" "\$attempt"
+
+    # Completion has two valid wire forms:
+    #   non-task worker: slot, pid, rc
+    #   task attempt:    slot, pid, rc, task_id, attempt
+    # Never serialize absent optional identity as empty trailing FIFO fields.
+    if [ -n "\$task_id" ]; then
+        [ -n "\$attempt" ] || {
+            printf 'Chyba [${ns}]: task completion bez attempt: slot=%s pid=%s task=%s\n' \
+                "\$slot_id" "\$BASHPID" "\$task_id" >&2
+            exit 76
+        }
+        ${ns}_fifo_call_parent "${ns}_mark_job_completed" \
+            "\$slot_id" "\$BASHPID" "\$exit_code" "\$task_id" "\$attempt"
+    else
+        ${ns}_fifo_call_parent "${ns}_mark_job_completed" \
+            "\$slot_id" "\$BASHPID" "\$exit_code"
+    fi
     exit "\$exit_code"
 }
 EOF
@@ -406,37 +726,37 @@ ${ns}_job_pool_init() {
     ${ns}_TARGET_WORKER_FUNC="\${2:-}"
     ${ns}_TARGET_CLEANUP_FUNC="\${3:-}"
 
-    declare -gA ${ns}_INPUT_DATA_VECTOR
-    declare -gA ${ns}_OUTPUT_DATA_VECTOR
-    declare -gA ${ns}_EXIT_CODE_VECTOR
-    declare -gA ${ns}_JOB_STATUS_VECTOR
-    declare -gA ${ns}_WORKER_TMP_DIR
-    declare -gA ${ns}_WORKER_PIDS
-    declare -gA ${ns}_COMPLETED_PIDS
-    declare -gA ${ns}_COMPLETION_EXIT_CODES
-    declare -gA ${ns}_REAPED_PIDS
-    declare -gA ${ns}_REAP_EXIT_CODES
+    declare -gA ${ns}_INPUT_DATA_VECTOR=()
+    declare -gA ${ns}_OUTPUT_DATA_VECTOR=()
+    declare -gA ${ns}_EXIT_CODE_VECTOR=()
+    declare -gA ${ns}_JOB_STATUS_VECTOR=()
+    declare -gA ${ns}_WORKER_TMP_DIR=()
+    declare -gA ${ns}_WORKER_PIDS=()
+    declare -gA ${ns}_COMPLETED_PIDS=()
+    declare -gA ${ns}_COMPLETION_EXIT_CODES=()
+    declare -gA ${ns}_REAPED_PIDS=()
+    declare -gA ${ns}_REAP_EXIT_CODES=()
 
     # Persistent task storage. No task API or argv storage yet (STEP 1 only).
-    declare -gA ${ns}_TASK_STATUS
-    declare -gA ${ns}_TASK_FUNC
-    declare -gA ${ns}_TASK_INPUT_PORT
-    declare -gA ${ns}_TASK_ATTEMPT
-    declare -gA ${ns}_TASK_RETRIES
-    declare -gA ${ns}_TASK_CREATED
-    declare -gA ${ns}_TASK_STARTED
-    declare -gA ${ns}_TASK_FINISHED
-    declare -gA ${ns}_DIAG
-    declare -gA ${ns}_RESOURCE
-    declare -gA ${ns}_BACKEND_SCOPE
-    declare -gA ${ns}_BACKEND_CAPABILITIES
-    declare -gA ${ns}_PEER_BACKEND
-    declare -gA ${ns}_PEER_PROTOCOL
-    declare -gA ${ns}_PEER_RESOURCE
+    declare -gA ${ns}_TASK_STATUS=()
+    declare -gA ${ns}_TASK_FUNC=()
+    declare -gA ${ns}_TASK_INPUT_PORT=()
+    declare -gA ${ns}_TASK_ATTEMPT=()
+    declare -gA ${ns}_TASK_RETRIES=()
+    declare -gA ${ns}_TASK_CREATED=()
+    declare -gA ${ns}_TASK_STARTED=()
+    declare -gA ${ns}_TASK_FINISHED=()
+    declare -gA ${ns}_DIAG=()
+    declare -gA ${ns}_RESOURCE=()
+    declare -gA ${ns}_BACKEND_SCOPE=()
+    declare -gA ${ns}_BACKEND_CAPABILITIES=()
+    declare -gA ${ns}_PEER_BACKEND=()
+    declare -gA ${ns}_PEER_PROTOCOL=()
+    declare -gA ${ns}_PEER_RESOURCE=()
 
     # Execution binding: ephemeral slot/attempt -> persistent task identity.
-    declare -gA ${ns}_SLOT_TASK_ID
-    declare -gA ${ns}_SLOT_ATTEMPT
+    declare -gA ${ns}_SLOT_TASK_ID=()
+    declare -gA ${ns}_SLOT_ATTEMPT=()
 
     local main_tmp="\${MAIN_TMP_DIR:-\${TMPDIR:-/tmp}}"
     mkdir -p -- "\$main_tmp"
@@ -1042,8 +1362,12 @@ define_mark_job_completed() {
     local body
     body=$(cat <<EOF
 ${ns}_mark_job_completed() {
-    local slot_id="\$1" worker_pid="\$2" exit_code="\${3:-0}"
+    [ \$# -eq 3 ] || [ \$# -eq 5 ] || return 64
+    local slot_id="\$1" worker_pid="\$2" exit_code="\$3"
     local task_id="\${4:-}" attempt="\${5:-}"
+    if [ \$# -eq 5 ]; then
+        [ -n "\$task_id" ] && [ -n "\$attempt" ] || return 64
+    fi
     local expected_pid="\${${ns}_WORKER_PIDS[\$slot_id]:-}"
     local expected_task="\${${ns}_SLOT_TASK_ID[\$slot_id]:-}"
     local expected_attempt="\${${ns}_SLOT_ATTEMPT[\$slot_id]:-}"
@@ -1115,9 +1439,15 @@ ${ns}_job_pool_submit_core() {
     shift 5
     [[ "\$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$ ]] || return 2
 
+    # Generic reconfiguration admission barrier. Check both before and after
+    # capacity waiting so a safepoint cannot admit a late worker.
+    ${ns}_reconfiguration_admission_open || return 75
+
     while [ "\${${ns}_PENDING_JOBS}" -ge "\${${ns}_MAX_JOBS}" ]; do
         ${ns}_reap_one
     done
+
+    ${ns}_reconfiguration_admission_open || return 75
 
     local slot_id=0 i
     for (( i=1; i<=\${${ns}_MAX_JOBS}; i++ )); do
@@ -1158,7 +1488,22 @@ ${ns}_job_pool_submit_core() {
     (
         set -eu
         cd "\$worker_dir" 2>/dev/null || true
-        trap '${ns}_worker_cleanup_wrapper "\$worker_dir" "\$slot_id" "\$cleanup_func" "\$task_id" "\$attempt"' EXIT INT TERM
+
+        # Capture cleanup identity NOW. A trap executes after this function's
+        # locals may no longer be safely addressable; a deferred attempt value (and
+        # peers) can therefore collapse to empty and corrupt the completion
+        # frame. %q produces one shell-safe word per captured value.
+        local _trap_cmd _q_worker_dir _q_slot_id _q_cleanup_func _q_task_id _q_attempt
+        printf -v _q_worker_dir '%q' "\$worker_dir"
+        printf -v _q_slot_id '%q' "\$slot_id"
+        printf -v _q_cleanup_func '%q' "\$cleanup_func"
+        printf -v _q_task_id '%q' "\$task_id"
+        printf -v _q_attempt '%q' "\$attempt"
+        printf -v _trap_cmd '%s %s %s %s %s %s' \
+            '${ns}_worker_cleanup_wrapper' \
+            "\$_q_worker_dir" "\$_q_slot_id" "\$_q_cleanup_func" "\$_q_task_id" "\$_q_attempt"
+        trap "\$_trap_cmd" EXIT INT TERM
+
         "\$cmd_func" "\$worker_dir" "\$slot_id" "\$@"
     ) &
 
@@ -1641,6 +1986,181 @@ EOF
 }
 
 # ============================================================================
+# 7b. OBJECT RECONFIGURATION / QUIESCENCE ABI v1
+# ============================================================================
+# This is the generic safe-mutation barrier for every OBJECT.
+#
+# DATA/work admission and CONTROL admission are deliberately separate:
+#   RECONFIG_ADMISSION=0 stops new worker submissions.
+#   CONTROL_STATE governs FIFO Q-frame admission/lifecycle.
+#
+# A reconfiguration request itself is handled synchronously by the canonical
+# parent dispatcher, so queued CONTROL frames cannot execute concurrently with
+# the mutation. DATA/work must still be explicitly closed and drained.
+
+define_reconfiguration_api() {
+    local ns="$1" body
+    body="$(cat <<'RECONFIG_EOF'
+__NS___reconfiguration_init() {
+    __NS___RECONFIG_ADMISSION=1
+    __NS___RECONFIG_STATE=ACTIVE
+    __NS___RECONFIG_GENERATION=${__NS___RECONFIG_GENERATION:-0}
+}
+
+__NS___reconfiguration_admission_open() {
+    [[ "${__NS___RECONFIG_ADMISSION:-1}" == 1 ]]
+}
+
+__NS___reconfiguration_begin() {
+    [[ "${__NS___RECONFIG_STATE:-ACTIVE}" == ACTIVE ]] || return 74
+    __NS___RECONFIG_ADMISSION=0
+    __NS___RECONFIG_STATE=QUIESCING
+}
+
+__NS___reconfiguration_quiesce() {
+    case "${__NS___RECONFIG_STATE:-ACTIVE}" in
+        ACTIVE) __NS___reconfiguration_begin || return ;;
+        QUIESCING) ;;
+        QUIESCED) return 0 ;;
+        *) return 74 ;;
+    esac
+
+    __NS___job_pool_wait || {
+        __NS___RECONFIG_STATE=FAILED
+        return 1
+    }
+    __NS___drain_fifo || {
+        __NS___RECONFIG_STATE=FAILED
+        return 1
+    }
+
+    (( ${__NS___PENDING_JOBS:-0} == 0 )) || {
+        __NS___RECONFIG_STATE=FAILED
+        return 1
+    }
+    (( ${#__NS___WORKER_PIDS[@]} == 0 )) || {
+        __NS___RECONFIG_STATE=FAILED
+        return 1
+    }
+    __NS___diagnose || {
+        __NS___RECONFIG_STATE=FAILED
+        return 1
+    }
+
+    __NS___RECONFIG_STATE=QUIESCED
+}
+
+__NS___reconfiguration_resume() {
+    [[ "${__NS___RECONFIG_STATE:-ACTIVE}" == QUIESCED ||
+       "${__NS___RECONFIG_STATE:-ACTIVE}" == FAILED ]] || return 74
+    __NS___RECONFIG_GENERATION=$(( ${__NS___RECONFIG_GENERATION:-0} + 1 ))
+    __NS___RECONFIG_ADMISSION=1
+    __NS___RECONFIG_STATE=ACTIVE
+}
+
+__NS___reconfiguration_replace_worker() {
+    [ $# -eq 1 ] || return 64
+    local method="$1" candidate old_worker old_generation rc
+    [[ "$method" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    candidate="__NS___${method}"
+    declare -F "$candidate" >/dev/null 2>&1 || return 66
+
+    old_worker="${__NS___TARGET_WORKER_FUNC:-}"
+    old_generation="${__NS___RECONFIG_GENERATION:-0}"
+
+    __NS___reconfiguration_begin || return
+    if ! __NS___reconfiguration_quiesce; then
+        rc=$?
+        __NS___TARGET_WORKER_FUNC="$old_worker"
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___reconfiguration_abort || true
+        return "$rc"
+    fi
+
+    __NS___TARGET_WORKER_FUNC="$candidate"
+    if [[ "${__NS___TARGET_WORKER_FUNC:-}" != "$candidate" ]] ||
+       ! declare -F "${__NS___TARGET_WORKER_FUNC}" >/dev/null 2>&1; then
+        __NS___TARGET_WORKER_FUNC="$old_worker"
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___reconfiguration_abort || true
+        return 77
+    fi
+
+    if ! __NS___reconfiguration_resume; then
+        rc=$?
+        __NS___TARGET_WORKER_FUNC="$old_worker"
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___RECONFIG_ADMISSION=1
+        __NS___RECONFIG_STATE=ACTIVE
+        return "$rc"
+    fi
+}
+
+__NS___reconfiguration_reconnect() {
+    [ $# -eq 3 ] || return 64
+    local src_port="$1" dst_ns="$2" dst_port="$3"
+    local old_dst old_port old_generation rc
+
+    [[ "$src_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    [[ "$dst_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$dst_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1 || return 66
+    [[ -v "__NS___ROUTE_DST_NS[$src_port]" && -v "__NS___ROUTE_DST_PORT[$src_port]" ]] || return 71
+
+    old_dst="${__NS___ROUTE_DST_NS[$src_port]}"
+    old_port="${__NS___ROUTE_DST_PORT[$src_port]}"
+    old_generation="${__NS___RECONFIG_GENERATION:-0}"
+
+    __NS___reconfiguration_begin || return
+    if ! __NS___reconfiguration_quiesce; then
+        rc=$?
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___reconfiguration_abort || true
+        return "$rc"
+    fi
+
+    __NS___ROUTE_DST_NS["$src_port"]="$dst_ns"
+    __NS___ROUTE_DST_PORT["$src_port"]="$dst_port"
+
+    if [[ "${__NS___ROUTE_DST_NS[$src_port]:-}" != "$dst_ns" ||
+          "${__NS___ROUTE_DST_PORT[$src_port]:-}" != "$dst_port" ]] ||
+       ! declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1; then
+        __NS___ROUTE_DST_NS["$src_port"]="$old_dst"
+        __NS___ROUTE_DST_PORT["$src_port"]="$old_port"
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___reconfiguration_abort || true
+        return 77
+    fi
+
+    if ! __NS___reconfiguration_resume; then
+        rc=$?
+        __NS___ROUTE_DST_NS["$src_port"]="$old_dst"
+        __NS___ROUTE_DST_PORT["$src_port"]="$old_port"
+        __NS___RECONFIG_GENERATION="$old_generation"
+        __NS___RECONFIG_ADMISSION=1
+        __NS___RECONFIG_STATE=ACTIVE
+        return "$rc"
+    fi
+}
+
+__NS___reconfiguration_abort() {
+    # v1 abort is valid only before structural state has been committed.
+    # Mutation-specific rollback is layered above this primitive.
+    case "${__NS___RECONFIG_STATE:-ACTIVE}" in
+        QUIESCING|QUIESCED|FAILED) ;;
+        *) return 74 ;;
+    esac
+    __NS___RECONFIG_ADMISSION=1
+    __NS___RECONFIG_STATE=ACTIVE
+}
+RECONFIG_EOF
+)"
+    body="${body//__NS__/$ns}"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
+
+# ============================================================================
 # 8. CONSTRUCTORS
 # ============================================================================
 
@@ -1675,8 +2195,10 @@ asyncobj_constructor() {
     define_runtime_resource_api     "$ns"
     define_backend_descriptor_api   "$ns"
     define_discovery_api            "$ns"
+    define_reconfiguration_api      "$ns"
 
     "${ns}_job_pool_init"
+    "${ns}_reconfiguration_init"
     "${ns}_backend_register" fifo local send receive
     "${ns}_backend_register" tcp universal connect send receive listen
     "${ns}_resource_refresh_workers"
@@ -1746,14 +2268,14 @@ __NS___migration_requested() {
 __NS___migration_quiesce() {
     __NS___MIGRATION_STATE=QUIESCING
     __NS___MIGRATION_ADMISSION=0
-    __NS___job_pool_wait || return
-    __NS___drain_fifo || return
-    (( ${__NS___PENDING_JOBS:-0} == 0 )) || { __NS___MIGRATION_STATE=FAILED; return 1; }
-    (( ${#__NS___WORKER_PIDS[@]} == 0 )) || { __NS___MIGRATION_STATE=FAILED; return 1; }
-    __NS___diagnose || { __NS___MIGRATION_STATE=FAILED; return 1; }
+    if ! __NS___reconfiguration_quiesce; then
+        __NS___MIGRATION_STATE=FAILED
+        return 1
+    fi
     __NS___MIGRATION_STATE=QUIESCED
 }
 __NS___migration_resume() {
+    __NS___reconfiguration_resume || return
     __NS___MIGRATION_REQUESTED=0
     __NS___MIGRATION_ADMISSION=1
     __NS___MIGRATION_STATE=ACTIVE
@@ -2284,29 +2806,54 @@ define_vector_forward_hook() {
     [ $# -ge 2 ] || return 2
     local ns="$1" obj_type="$2"; shift 2
     (( $# % 3 == 0 )) || return 2
-    local body src dst_ns dst_port
-    body="${ns}_forward_output_vector() {
-    local slot_id=\"\$1\" key port value prefix=\"\$1|\"
-    for key in \"\${!${ns}_OUTPUT_DATA_VECTOR[@]}\"; do
-        [[ \"\$key\" == \"\$prefix\"* ]] || continue
-        port=\"\${key#\"\$prefix\"}\"
-        value=\"\${${ns}_OUTPUT_DATA_VECTOR[\$key]}\"
-        case \"\$port\" in
-"
+    local body src dst_ns dst_port route_key
+
+    # Canonical mutable routing state. Keys are source output ports and values
+    # are "destination-namespace<TAB>destination-input-port". v1 deliberately
+    # keeps one destination per source port, matching the current generated
+    # case-router semantics.
+    eval "declare -g -A ${ns}_ROUTE_DST_NS=() ${ns}_ROUTE_DST_PORT=()"
     while (( $# )); do
         src="$1"; dst_ns="$2"; dst_port="$3"; shift 3
-        printf -v body '%s            %q) %s_summon_worker %q "$value" ;;\n' "$body" "$src" "$dst_ns" "$dst_port"
+        [[ "$src" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
+        [[ "$dst_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
+        declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1 || return 66
+        printf -v "${ns}_ROUTE_DST_NS[$src]" '%s' "$dst_ns"
+        printf -v "${ns}_ROUTE_DST_PORT[$src]" '%s' "$dst_port"
     done
-    body+="            *) printf 'Chyba [${ns}/${obj_type}]: output port bez route: %s\\n' \"\$port\" >&2; return 70 ;;
-        esac
+
+    body="$(cat <<'ROUTE_EOF'
+__NS___forward_output_vector() {
+    local slot_id="$1" key port prefix="$1|" dst_ns dst_port payload
+    for key in "${!__NS___OUTPUT_DATA_VECTOR[@]}"; do
+        [[ "$key" == "$prefix"* ]] || continue
+        port="${key#"$prefix"}"
+
+        # Use namerefs for associative routing tables. This avoids reparsing
+        # dynamic subscripts under nounset/arithmetic contexts.
+        local -n __route_ns_ref=__NS___ROUTE_DST_NS
+        local -n __route_port_ref=__NS___ROUTE_DST_PORT
+        dst_ns="${__route_ns_ref["$port"]-}"
+        dst_port="${__route_port_ref["$port"]-}"
+        payload="${__NS___OUTPUT_DATA_VECTOR["$key"]-}"
+
+        if [[ -z "$dst_ns" || -z "$dst_port" ]] ||
+           ! declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1; then
+            printf 'Chyba [__NS__/__TYPE__]: output port bez validni route: %s\n' "$port" >&2
+            return 70
+        fi
+        "${dst_ns}_summon_worker" "$dst_port" "$payload"
     done
 }
-${ns}_on_job_completed() {
-    local slot_id=\"\$1\" exit_code=\"\$2\"
+__NS___on_job_completed() {
+    local slot_id="$1" exit_code="$2"
     (( exit_code == 0 )) || return 0
-    ${ns}_forward_output_vector \"\$slot_id\"
+    __NS___forward_output_vector "$slot_id"
 }
-"
+ROUTE_EOF
+)"
+    body="${body//__NS__/$ns}"
+    body="${body//__TYPE__/$obj_type}"
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
@@ -2544,9 +3091,11 @@ __NS___bridge_forward_control_local() {
     local raw="$1" target="${__NS___BRIDGE_CONTROL_TARGET_NS:-}" fdvar fd
     [[ -n "$target" ]] || return 1
     fdvar="${target}_FIFO_FD"
+    local pathvar="${target}_FIFO_PATH" path
     fd="${!fdvar:-}"
+    path="${!pathvar:-}"
     [[ -n "$fd" ]] || return 1
-    printf '%s\n' "$raw" >&"$fd"
+    __NS___fifo_send_raw_fd "$fd" "$raw" "$path"
 }
 
 __NS___bridge_data_encode() {
