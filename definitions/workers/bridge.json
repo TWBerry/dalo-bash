@@ -1,0 +1,24 @@
+{
+  "abi": 1,
+  "name": "bridge",
+  "language": "bash",
+  "entry": "worker",
+  "artifact": "artifacts/bridge.bash",
+  "object_types": [
+    "BRIDGE"
+  ],
+  "inputs": {},
+  "outputs": {},
+  "features": [],
+  "execution": "INLINE",
+  "sha256": "40fc0fcfb13aa96de53c8f60635d5ce95f46c9409161ccd14b5f9ffdc6d4b7bd",
+  "runtime_requires": [
+    "python"
+  ],
+  "lifecycle": {
+    "start": "worker_start",
+    "poll": "worker_poll",
+    "stop": "worker_stop",
+    "keepalive": true
+  }
+}

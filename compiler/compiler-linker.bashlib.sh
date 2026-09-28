@@ -12,18 +12,18 @@ dalo_link_machine(){
     local nv="${p}_NAME" vv="${p}_VERSION"
     local name="${!nv}" version="${!vv}" obj edge mode workers
     local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD"
-    local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION"
+    local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION" worker_start="${p}_WORKER_START" worker_poll="${p}_WORKER_POLL" worker_stop="${p}_WORKER_STOP" worker_keepalive="${p}_WORKER_KEEPALIVE" worker_requires="${p}_WORKER_RUNTIME_REQUIRES"
     local -n params="${p}_PARAM_ORDER" param_type="${p}_PARAM_TYPE" param_default="${p}_PARAM_DEFAULT" param_required="${p}_PARAM_REQUIRED"
 
     # Backend ABI expected by the established executable-machine linker.
     local backend="DALO_MACHINE_BUILD"
     eval "declare -g -a ${backend}_DECL_OBJECTS=() ${backend}_EDGES=() ${backend}_PARAM_ORDER=()"
-    eval "declare -g -A ${backend}_DECL_TYPE=() ${backend}_DECL_WORKER_FILE=() ${backend}_DECL_WORKERS=()"
-    eval "declare -g -A ${backend}_DECL_RESOURCE_KIND=() ${backend}_DECL_RESOURCE_ARG=() ${backend}_EXEC_MODE=()"
+    eval "declare -g -A ${backend}_DECL_TYPE=() ${backend}_DECL_WORKER_FILE=() ${backend}_DECL_WORKERS=() ${backend}_DECL_FIELD=()"
+    eval "declare -g -A ${backend}_DECL_RESOURCE_KIND=() ${backend}_DECL_RESOURCE_ARG=() ${backend}_EXEC_MODE=() ${backend}_WORKER_START=() ${backend}_WORKER_POLL=() ${backend}_WORKER_STOP=() ${backend}_WORKER_KEEPALIVE=() ${backend}_WORKER_RUNTIME_REQUIRES=()"
     eval "declare -g -A ${backend}_PARAM_TYPE=() ${backend}_PARAM_DEFAULT=() ${backend}_PARAM_REQUIRED=()"
     local -n b_objs="${backend}_DECL_OBJECTS" b_types="${backend}_DECL_TYPE"
-    local -n b_wf="${backend}_DECL_WORKER_FILE" b_workers="${backend}_DECL_WORKERS"
-    local -n b_edges="${backend}_EDGES" b_exec="${backend}_EXEC_MODE"
+    local -n b_wf="${backend}_DECL_WORKER_FILE" b_workers="${backend}_DECL_WORKERS" b_fields="${backend}_DECL_FIELD"
+    local -n b_edges="${backend}_EDGES" b_exec="${backend}_EXEC_MODE" b_start="${backend}_WORKER_START" b_poll="${backend}_WORKER_POLL" b_stop="${backend}_WORKER_STOP" b_keepalive="${backend}_WORKER_KEEPALIVE" b_requires="${backend}_WORKER_RUNTIME_REQUIRES"
     local -n b_params="${backend}_PARAM_ORDER" b_ptype="${backend}_PARAM_TYPE" b_pdefault="${backend}_PARAM_DEFAULT" b_prequired="${backend}_PARAM_REQUIRED"
 
     b_objs=("${objs[@]}")
@@ -38,6 +38,11 @@ dalo_link_machine(){
         b_types["$obj"]="${types[$obj]}"
         workers="${fields["$obj.MAX_JOBS"]:-1}"
         b_workers["$obj"]="$workers"
+        local field_key field_prefix="$obj."
+        for field_key in "${!fields[@]}"; do
+            [[ "$field_key" == "$field_prefix"* ]] || continue
+            b_fields["$field_key"]="${fields[$field_key]}"
+        done
         if [[ -n "${worker_code[$obj]:-}" ]]; then
             mode="${worker_type[$obj]:-inline}"
             [[ "$mode" == inline ]] || {
@@ -46,6 +51,7 @@ dalo_link_machine(){
             }
             b_wf["$obj"]="${worker_code[$obj]}"
             b_exec["$obj"]="${worker_execution[$obj]:-INLINE}"
+            b_start["$obj"]="${worker_start[$obj]:-}"; b_poll["$obj"]="${worker_poll[$obj]:-}"; b_stop["$obj"]="${worker_stop[$obj]:-}"; b_keepalive["$obj"]="${worker_keepalive[$obj]:-0}"; b_requires["$obj"]="${worker_requires[$obj]:-}"
         fi
     done
     printf -v "${backend}_MAX_WORKERS_PER_OBJECT" '%s' 1

@@ -1,0 +1,19 @@
+{
+  "abi": 1,
+  "type": "BRIDGE",
+  "name": "Bridge",
+  "instance_fields": {
+    "MODE": {"type": "string", "required": true, "enum": ["listen", "connect"]},
+    "HOST": {"type": "string", "required": true},
+    "PORT": {"type": "uint", "min": 1, "required": true},
+    "PEER": {"type": "string", "required": true}
+  },
+  "ports": {
+    "in": {"direction": "input", "plane": "data", "type": "any"},
+    "out": {"direction": "output", "plane": "data", "type": "any"}
+  },
+  "methods": ["summon_worker", "on_job_completed"],
+  "features": ["core", "data", "worker"],
+  "worker": {"required": true, "default": "bridge"},
+  "execution": ["INLINE", "ASYNC", "PERSISTENT"]
+}

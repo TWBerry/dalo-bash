@@ -4,10 +4,11 @@ DALO_LIBRARY_NAME="python"
 DALO_LIBRARY_VERSION="1.1.0"
 DALO_LIBRARY_REQUIRES=""
 DALO_LIBRARY_INIT="python_init"
+DALO_LIBRARY_ARTIFACTS="python_supervisor.py"
 [ "${DALO_PYTHON_INCLUDE:-0}" -eq 0 ] || return 0
 DALO_PYTHON_INCLUDE=1
 python_init(){
- local dir n i; dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"||return; n="${PYTHON_THREADS:-$(nproc)}"
+ local supervisor n i; dalo_library_artifact_path python python_supervisor.py supervisor || return; n="${PYTHON_THREADS:-$(nproc)}"
  [[ "$n" =~ ^[1-9][0-9]*$ ]]||return 2; DALO_PY_ROOT="${DALO_PY_ROOT:-${TMPDIR:-/tmp}/dalo-python-${UID}}"; mkdir -p "$DALO_PY_ROOT"; chmod 700 "$DALO_PY_ROOT"
  # mkdir is the v1 inter-process bootstrap lock: atomic, portable, and off the request hot path.
  local lock="$DALO_PY_ROOT/start.lock" have_lock=0
@@ -19,7 +20,7 @@ python_init(){
  if [ "$have_lock" -eq 1 ];then
   if [ ! -r "$DALO_PY_ROOT/ready" ] || [ ! -p "$DALO_PY_ROOT/request.fifo" ];then
    rm -f "$DALO_PY_ROOT/ready" "$DALO_PY_ROOT/request.fifo"
-   python3 "$dir/python_supervisor.py" --root "$DALO_PY_ROOT" --workers "$n" </dev/null >>"$DALO_PY_ROOT/supervisor.log" 2>&1 & DALO_PY_SUPERVISOR_PID=$!
+   python3 "$supervisor" --root "$DALO_PY_ROOT" --workers "$n" </dev/null >>"$DALO_PY_ROOT/supervisor.log" 2>&1 & DALO_PY_SUPERVISOR_PID=$!
    for((i=0;i<500;i++));do [ -r "$DALO_PY_ROOT/ready" ]&&[ -p "$DALO_PY_ROOT/request.fifo" ]&&break;sleep .01;done
   fi
   rmdir "$lock" 2>/dev/null || true

@@ -2542,6 +2542,7 @@ __NS___scheduler_init() {
     declare -gA __NS___RES_CPU=()
     declare -gA __NS___RES_MEMORY=()
     declare -gA __NS___RES_OWNER=()
+    declare -gA __NS___BLANK_CLASS=()
 }
 
 __NS___scheduler_available_cpu() {
@@ -2590,7 +2591,7 @@ __NS___scheduler_release() {
     local cpu="${__NS___RES_CPU[$rid]}" memory="${__NS___RES_MEMORY[$rid]}"
     __NS___CPU_RESERVED=$(( __NS___CPU_RESERVED - cpu ))
     __NS___MEMORY_RESERVED=$(( __NS___MEMORY_RESERVED - memory ))
-    unset '__NS___RES_CPU['"$rid"']' '__NS___RES_MEMORY['"$rid"']' '__NS___RES_OWNER['"$rid"']'
+    unset '__NS___RES_CPU['"$rid"']' '__NS___RES_MEMORY['"$rid"']' '__NS___RES_OWNER['"$rid"']' '__NS___BLANK_CLASS['"$rid"']'
 }
 
 __NS___scheduler_diagnose() {
@@ -2602,7 +2603,64 @@ __NS___scheduler_diagnose() {
         cpu_sum=$(( cpu_sum + __NS___RES_CPU[$rid] ))
         memory_sum=$(( memory_sum + __NS___RES_MEMORY[$rid] ))
     done
-    (( cpu_sum == __NS___CPU_RESERVED && memory_sum == __NS___MEMORY_RESERVED ))
+    (( cpu_sum == __NS___CPU_RESERVED && memory_sum == __NS___MEMORY_RESERVED )) || return 84
+    local _blank_rid _blank_class
+    for _blank_rid in "${!__NS___BLANK_CLASS[@]}"; do
+        [[ -v "__NS___RES_OWNER[$_blank_rid]" ]] || return 84
+        _blank_class="${__NS___BLANK_CLASS[$_blank_rid]}"
+        [[ "$_blank_class" == HEADROOM || "$_blank_class" == ANT_CACHE ]] || return 84
+        [[ "${__NS___RES_OWNER[$_blank_rid]}" == "blank:$_blank_class" ]] || return 84
+    done
+}
+
+# BLANK is a typed view of the canonical scheduler reservation ledger.
+# FREE is derived, never stored. HEADROOM and ANT_CACHE are ordinary
+# reservations with explicit class metadata; all admission paths see them.
+__NS___blank_reserve() {
+    [ $# -eq 4 ] || return 64
+    local _blank_out="$1" _blank_class="$2" _blank_cpu="$3" _blank_memory="$4"
+    [[ "$_blank_out" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$_blank_class" == HEADROOM || "$_blank_class" == ANT_CACHE ]] || return 64
+    local _blank_rid=""
+    __NS___scheduler_reserve _blank_rid "blank:$_blank_class" "$_blank_cpu" "$_blank_memory" || return $?
+    __NS___BLANK_CLASS["$_blank_rid"]="$_blank_class"
+    printf -v "$_blank_out" '%s' "$_blank_rid"
+}
+
+__NS___blank_release() {
+    [ $# -eq 2 ] || return 64
+    local _blank_class="$1" _blank_rid="$2"
+    [[ "$_blank_class" == HEADROOM || "$_blank_class" == ANT_CACHE ]] || return 64
+    [[ "${__NS___BLANK_CLASS[$_blank_rid]:-}" == "$_blank_class" ]] || return 83
+    __NS___scheduler_release "blank:$_blank_class" "$_blank_rid"
+}
+
+__NS___blank_query() {
+    [ $# -eq 3 ] || return 64
+    local _blank_out_cpu="$1" _blank_out_memory="$2" _blank_class="$3"
+    [[ "$_blank_out_cpu" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_blank_out_memory" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    local _blank_cpu=0 _blank_memory=0 _blank_rid
+    case "$_blank_class" in
+        FREE)
+            _blank_cpu=$(( __NS___CPU_TOTAL - __NS___CPU_RESERVED ))
+            _blank_memory=$(( __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED ))
+            ;;
+        HEADROOM|ANT_CACHE)
+            for _blank_rid in "${!__NS___BLANK_CLASS[@]}"; do
+                [[ "${__NS___BLANK_CLASS[$_blank_rid]}" == "$_blank_class" ]] || continue
+                _blank_cpu=$(( _blank_cpu + __NS___RES_CPU[$_blank_rid] ))
+                _blank_memory=$(( _blank_memory + __NS___RES_MEMORY[$_blank_rid] ))
+            done
+            ;;
+        RESERVED)
+            _blank_cpu="$__NS___CPU_RESERVED"
+            _blank_memory="$__NS___MEMORY_RESERVED"
+            ;;
+        *) return 64 ;;
+    esac
+    printf -v "$_blank_out_cpu" '%s' "$_blank_cpu"
+    printf -v "$_blank_out_memory" '%s' "$_blank_memory"
 }
 SCHED_EOF
 )"
@@ -2743,6 +2801,7 @@ __dalo_migration_resource_init() {
     declare -p DALO_MIGRATION_TX_CPU >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_CPU=()
     declare -p DALO_MIGRATION_TX_MEMORY >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_MEMORY=()
     declare -p DALO_MIGRATION_TX_LEASE_OWNER >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_LEASE_OWNER=()
+    declare -p DALO_MIGRATION_TX_DEST_BLANK >/dev/null 2>&1 || declare -gA DALO_MIGRATION_TX_DEST_BLANK=()
     : "${DALO_MIGRATION_TX_SEQ:=0}"
 }
 
@@ -2788,6 +2847,34 @@ migration_resource_prepare() {
     fi
 
     DALO_MIGRATION_TX_RESERVATION["$migration_tx_id"]="$_migration_reserved_id"
+
+    # Migration Cutover ABI v2: materialize the destination BLANK during
+    # PREPARE and make it the owner of the already-reserved capacity.  This is
+    # an ownership handoff only; scheduler totals never change.
+    local destination_blank=
+    if ! create_random_blank_object destination_blank; then
+        "${dest_sched}_scheduler_release" "$lease_owner" "$_migration_reserved_id" || true
+        "${source_ns}_reconfiguration_abort_prepared" || true
+        DALO_MIGRATION_TX_STATE["$migration_tx_id"]=ABORTED
+        return 67
+    fi
+    local -n _migration_owners="${dest_sched}_RES_OWNER"
+    if [[ ! -v "_migration_owners[$_migration_reserved_id]" ||
+          "${_migration_owners[$_migration_reserved_id]}" != "$lease_owner" ]]; then
+        migration_discard_imported_object "$destination_blank" || true
+        "${dest_sched}_scheduler_release" "$lease_owner" "$_migration_reserved_id" || true
+        "${source_ns}_reconfiguration_abort_prepared" || true
+        DALO_MIGRATION_TX_STATE["$migration_tx_id"]=ABORTED
+        return 83
+    fi
+    _migration_owners["$_migration_reserved_id"]="blank:${destination_blank}"
+    DALO_MIGRATION_TX_LEASE_OWNER["$migration_tx_id"]="blank:${destination_blank}"
+    DALO_MIGRATION_TX_DEST_BLANK["$migration_tx_id"]="$destination_blank"
+    printf -v "${destination_blank}_MIGRATION_RESERVATION" '%s' "$_migration_reserved_id"
+    printf -v "${destination_blank}_MIGRATION_SCHEDULER" '%s' "$dest_sched"
+    printf -v "${destination_blank}_MIGRATION_CPU" '%s' "$cpu"
+    printf -v "${destination_blank}_MIGRATION_MEMORY" '%s' "$memory"
+
     DALO_MIGRATION_TX_STATE["$migration_tx_id"]=PREPARED
     printf -v "$outvar" '%s' "$migration_tx_id"
 }
@@ -2804,6 +2891,12 @@ migration_resource_abort() {
     local release_rc=0 reopen_rc=0
 
     "${dest_sched}_scheduler_release" "$lease_owner" "$reservation_id" || release_rc=$?
+    local destination_blank="${DALO_MIGRATION_TX_DEST_BLANK[$tx_id]:-}"
+    if (( release_rc == 0 )) && [[ -n "$destination_blank" ]]; then
+        unset "${destination_blank}_MIGRATION_RESERVATION" "${destination_blank}_MIGRATION_SCHEDULER" \
+              "${destination_blank}_MIGRATION_CPU" "${destination_blank}_MIGRATION_MEMORY"
+        migration_discard_imported_object "$destination_blank" || true
+    fi
     "${source_ns}_reconfiguration_abort_prepared" || reopen_rc=$?
 
     # Do not claim ABORTED unless both rollback legs completed.
@@ -2832,6 +2925,9 @@ migration_resource_commit() {
     printf -v "${destination_ns}_MACHINE_SCHEDULER" '%s' "$dest_sched"
     printf -v "${destination_ns}_MACHINE_CPU" '%s' "${DALO_MIGRATION_TX_CPU[$tx_id]}"
     printf -v "${destination_ns}_MACHINE_MEMORY" '%s' "${DALO_MIGRATION_TX_MEMORY[$tx_id]}"
+    unset "${destination_ns}_MIGRATION_RESERVATION" "${destination_ns}_MIGRATION_SCHEDULER" \
+          "${destination_ns}_MIGRATION_CPU" "${destination_ns}_MIGRATION_MEMORY"
+    DALO_MIGRATION_TX_LEASE_OWNER["$tx_id"]="ns:${destination_ns}"
     DALO_MIGRATION_TX_STATE["$tx_id"]=COMMITTED
 }
 
@@ -3241,8 +3337,8 @@ __asyncobj_rebind_uuid() {
 }
 
 __migration_import_unsafe() {
-    [ $# -ge 2 ] && [ $# -le 3 ] || return 2
-    local bundle="$1" out_ns="$2" out_obj_id="${3:-}"
+    [ $# -ge 2 ] && [ $# -le 4 ] || return 2
+    local bundle="$1" out_ns="$2" out_obj_id="${3:-}" prepared_blank="${4:-}"
     local tag a b uuid="" source_obj_id="" object_type="" snap=""
     local new_ns obj_id_var line name type value
     local task status func attempt retries created started finished
@@ -3263,7 +3359,15 @@ __migration_import_unsafe() {
     [[ -n "$uuid" && -r "$snap" ]] || return 11
     [[ "$object_type" == BLANK ]] || return 12
 
-    create_random_blank_object new_ns || return
+    if [[ -n "$prepared_blank" ]]; then
+        [[ "$prepared_blank" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 13
+        [[ -v "ALL_NS[$prepared_blank]" ]] || return 14
+        local prepared_type_var="${prepared_blank}_OBJECT_TYPE"
+        [[ "${!prepared_type_var:-}" == BLANK ]] || return 15
+        new_ns="$prepared_blank"
+    else
+        create_random_blank_object new_ns || return
+    fi
     __asyncobj_rebind_uuid "$new_ns" "$uuid" || return
 
     while IFS= read -r line; do
@@ -3666,6 +3770,48 @@ migration_import() {
     fi
 }
 
+# Flood an already-prepared destination BLANK.  No new OBJECT is allocated.
+migration_flood_blank_with_worker() {
+    [ $# -eq 4 ] || return 64
+    local tx_id="$1" bundle_dir="$2" out_ns="$3" out_obj_id="$4"
+    __dalo_migration_resource_init
+    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == PREPARED ]] || return 74
+    local blank="${DALO_MIGRATION_TX_DEST_BLANK[$tx_id]:-}"
+    [[ -n "$blank" ]] || return 75
+
+    local expected actual
+    [[ -r "$bundle_dir/object.snapshot" && -r "$bundle_dir/worker.bash" &&
+       -r "$bundle_dir/worker.sha256" ]] || return 3
+    IFS= read -r expected <"$bundle_dir/worker.sha256" || return
+    actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
+    [[ "$actual" == "$expected" ]] || return 4
+
+    # FLOOD boundary: the BLANK reservation remains physically reserved.  Only
+    # ownership changes later at migration_resource_commit(); there is no
+    # release/re-reserve window in which another OBJECT could steal the RAM.
+    local imported_ns imported_obj_id
+    __migration_import_unsafe "$bundle_dir/object.snapshot" imported_ns imported_obj_id "$blank" || return
+    [[ "$imported_ns" == "$blank" ]] || return 76
+
+    if [[ -r "$bundle_dir/object.type" ]]; then
+        local restored_type
+        IFS= read -r restored_type <"$bundle_dir/object.type" || return
+        printf -v "${blank}_OBJECT_TYPE" '%s' "$restored_type"
+        # Recreate the generic mutable DATA-routing hook under the destination
+        # namespace. Routes are installed atomically by topology cutover.
+        define_vector_forward_hook "$blank" "$restored_type" || return
+    fi
+    __asyncscript_implant_worker "$blank" "$bundle_dir/worker.bash" || return
+    cp "$bundle_dir/worker.bash" "$bundle_dir/${blank}.worker.bash" || return
+    printf -v "${blank}_WORKER_SHA256" '%s' "$expected"
+    printf -v "${blank}_WORKER_ORIGIN" '%s' MIGRATED
+    printf -v "${blank}_WORKER_ARTIFACT" '%s' "$bundle_dir/${blank}.worker.bash"
+
+    declare -g "$out_ns" "$out_obj_id"
+    printf -v "$out_ns" '%s' "$blank"
+    printf -v "$out_obj_id" '%s' "$imported_obj_id"
+}
+
 migration_import_with_worker() {
     [ $# -eq 3 ] || return 2
     local bundle_dir="$1" out_ns="$2" out_obj_id="$3"
@@ -3771,9 +3917,98 @@ migration_export_prepared_with_worker() {
     printf '%s\n' "$expected" > "$bundle_dir/worker.sha256"
 }
 
+# Migration topology transaction v2.
+# BRIDGE remains an ordinary graph OBJECT.  The caller supplies the declarative
+# source/destination bridge OBJECT names; this layer never knows TCP/Python.
+migration_topology_cutover_v2() {
+    [ $# -eq 6 ] || return 64
+    local as="$1" obj="$2" destination_ns="$3" source_bridge="$4" destination_bridge="$5" out_rollback="$6"
+    local -n types="${as}_DECL_TYPE" smap="${as}_DECL_SLOT" edges="${as}_EDGES"
+    [[ -v "types[$obj]" && -v "types[$source_bridge]" && -v "types[$destination_bridge]" ]] || return 4
+    [[ "${types[$source_bridge]}" == BRIDGE && "${types[$destination_bridge]}" == BRIDGE ]] || return 5
+    [[ -v "smap[$obj]" && -v "smap[$source_bridge]" && -v "smap[$destination_bridge]" ]] || return 6
+
+    local source_ns="${smap[$obj]}" source_bridge_ns="${smap[$source_bridge]}" destination_bridge_ns="${smap[$destination_bridge]}"
+    local incoming_idx=-1 outgoing_idx=-1 destination_idx=-1 i e src sp dst dp
+    local incoming_src incoming_sp outgoing_dp destination_sp destination_dst destination_dp
+    for i in "${!edges[@]}"; do
+        e="${edges[$i]}"; IFS=$'\t' read -r src sp dst dp <<<"$e"
+        if [[ "$dst" == "$obj" ]]; then
+            (( incoming_idx < 0 )) || return 77
+            incoming_idx=$i; incoming_src="$src"; incoming_sp="$sp"
+        fi
+        if [[ "$src" == "$obj" && "$dst" == "$source_bridge" ]]; then
+            (( outgoing_idx < 0 )) || return 78
+            outgoing_idx=$i; outgoing_dp="$dp"
+        fi
+        if [[ "$src" == "$destination_bridge" ]]; then
+            (( destination_idx < 0 )) || return 79
+            destination_idx=$i; destination_sp="$sp"; destination_dst="$dst"; destination_dp="$dp"
+        fi
+    done
+    (( incoming_idx >= 0 && outgoing_idx >= 0 && destination_idx >= 0 )) || return 80
+
+    local incoming_src_ns="${smap[$incoming_src]:-}" destination_dst_ns="${smap[$destination_dst]:-}"
+    [[ -n "$incoming_src_ns" && -n "$destination_dst_ns" ]] || return 81
+
+    # Capture enough state for an exact rollback.
+    printf -v "$out_rollback" '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+        "$source_ns" "$incoming_idx" "${edges[$incoming_idx]}" "$outgoing_idx" "${edges[$outgoing_idx]}" \
+        "$destination_idx" "${edges[$destination_idx]}" "$incoming_src_ns" "$destination_bridge_ns"
+
+    # Canonical graph rewrite:
+    #   upstream -> obj -> bridgeA      becomes upstream -> bridgeA
+    #   bridgeB -> downstream           becomes bridgeB -> obj -> downstream
+    edges[$incoming_idx]="$incoming_src"$'\t'"$incoming_sp"$'\t'"$source_bridge"$'\t'"$outgoing_dp"
+    edges[$outgoing_idx]="$destination_bridge"$'\t'"$destination_sp"$'\t'"$obj"$'\t'"in"
+    edges[$destination_idx]="$obj"$'\t'"out"$'\t'"$destination_dst"$'\t'"$destination_dp"
+    smap["$obj"]="$destination_ns"
+
+    # Runtime mutable routes mirror the canonical graph.  No compiler/BRIDGE
+    # special case is required.
+    local -n in_route_ns="${incoming_src_ns}_ROUTE_DST_NS" in_route_port="${incoming_src_ns}_ROUTE_DST_PORT"
+    local -n db_route_ns="${destination_bridge_ns}_ROUTE_DST_NS" db_route_port="${destination_bridge_ns}_ROUTE_DST_PORT"
+    local -n obj_route_ns="${destination_ns}_ROUTE_DST_NS" obj_route_port="${destination_ns}_ROUTE_DST_PORT"
+    in_route_ns["$incoming_sp"]="$source_bridge_ns"; in_route_port["$incoming_sp"]="$outgoing_dp"
+    db_route_ns["$destination_sp"]="$destination_ns"; db_route_port["$destination_sp"]=in
+    obj_route_ns[out]="$destination_dst_ns"; obj_route_port[out]="$destination_dp"
+}
+
+migration_topology_rollback_v2() {
+    [ $# -eq 4 ] || return 64
+    local as="$1" obj="$2" destination_ns="$3" rollback="$4"
+    local -n smap="${as}_DECL_SLOT" edges="${as}_EDGES"
+    local source_ns incoming_idx incoming_edge outgoing_idx outgoing_edge destination_idx destination_edge incoming_src_ns destination_bridge_ns
+    local -a rollback_fields=()
+    mapfile -t rollback_fields <<<"$rollback"
+    (( ${#rollback_fields[@]} == 9 )) || return 2
+    source_ns="${rollback_fields[0]}"; incoming_idx="${rollback_fields[1]}"; incoming_edge="${rollback_fields[2]}"
+    outgoing_idx="${rollback_fields[3]}"; outgoing_edge="${rollback_fields[4]}"
+    destination_idx="${rollback_fields[5]}"; destination_edge="${rollback_fields[6]}"
+    incoming_src_ns="${rollback_fields[7]}"; destination_bridge_ns="${rollback_fields[8]}"
+    [[ -n "$source_ns" ]] || return 2
+    edges[$incoming_idx]="$incoming_edge"; edges[$outgoing_idx]="$outgoing_edge"; edges[$destination_idx]="$destination_edge"
+    smap["$obj"]="$source_ns"
+
+    local src sp dst dp
+    IFS=$'\t' read -r src sp dst dp <<<"$incoming_edge"
+    local dst_ns="${smap[$dst]:-}"
+    if [[ -n "$incoming_src_ns" && -n "$dst_ns" ]]; then
+        local -n in_route_ns="${incoming_src_ns}_ROUTE_DST_NS" in_route_port="${incoming_src_ns}_ROUTE_DST_PORT"
+        in_route_ns["$sp"]="$dst_ns"; in_route_port["$sp"]="$dp"
+    fi
+    IFS=$'\t' read -r src sp dst dp <<<"$destination_edge"
+    dst_ns="${smap[$dst]:-}"
+    if [[ -n "$destination_bridge_ns" && -n "$dst_ns" ]]; then
+        local -n db_route_ns="${destination_bridge_ns}_ROUTE_DST_NS" db_route_port="${destination_bridge_ns}_ROUTE_DST_PORT"
+        db_route_ns["$sp"]="$dst_ns"; db_route_port["$sp"]="$dp"
+    fi
+}
+
 migration_cutover_with_worker() {
-    [ $# -eq 8 ] || return 64
+    [ $# -eq 8 ] || [ $# -eq 10 ] || return 64
     local out_ns="$1" out_obj_id="$2" as="$3" obj="$4" dest_sched="$5" cpu="$6" memory="$7" bundle_dir="$8"
+    local source_bridge="${9:-}" destination_bridge="${10:-}"
     [[ "$out_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$out_obj_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
     local -n smap="${as}_DECL_SLOT"
     [[ -v "smap[$obj]" ]] || return 3
@@ -3783,7 +4018,7 @@ migration_cutover_with_worker() {
     [[ -n "$source_uuid" ]] || return 71
 
     local migration_tx= destination_ns= destination_obj_id=
-    local rc=0 committed=0 migration_plan=
+    local rc=0 committed=0 migration_plan= topology_committed=0 topology_rollback=
 
     # Policy gate MUST precede quiesce and destination reservation.
     migration_policy_plan migration_plan "$source_ns" || return $?
@@ -3813,7 +4048,7 @@ migration_cutover_with_worker() {
     fi
 
     if (( rc == 0 )); then
-        migration_import_with_worker "$bundle_dir" destination_ns destination_obj_id || rc=$?
+        migration_flood_blank_with_worker "$migration_tx" "$bundle_dir" destination_ns destination_obj_id || rc=$?
     fi
 
     if (( rc == 0 )) && [[ "${DALO_MIGRATION_FAULT_POINT:-}" == AFTER_IMPORT ]]; then
@@ -3830,24 +4065,41 @@ migration_cutover_with_worker() {
         (( rc == 0 )) && committed=1
     fi
 
+    if (( rc == 0 )) && [[ -n "$source_bridge" || -n "$destination_bridge" ]]; then
+        [[ -n "$source_bridge" && -n "$destination_bridge" ]] || rc=64
+        if (( rc == 0 )); then
+            migration_topology_cutover_v2 "$as" "$obj" "$destination_ns" \
+                "$source_bridge" "$destination_bridge" topology_rollback || rc=$?
+            (( rc == 0 )) && topology_committed=1
+        fi
+    fi
+
     if (( rc == 0 )); then
         migration_resource_source_retire "$migration_tx" || rc=$?
     fi
 
     if (( rc != 0 )); then
+        if (( topology_committed == 1 )); then
+            migration_topology_rollback_v2 "$as" "$obj" "$destination_ns" "$topology_rollback" || true
+        fi
         if [[ -n "$destination_ns" ]]; then
             migration_discard_imported_object "$destination_ns" || true
         fi
-        if (( uuid_handoff == 1 )) && [[ ! -v "UUID_TO_OBJ_ID[$source_uuid]" ]]; then
-            UUID_TO_OBJ_ID["$source_uuid"]="$source_obj_id"
-        fi
         if (( committed == 0 )); then
+            # PREPARE owns a destination BLANK even when FLOOD failed before it
+            # could publish destination_ns. Abort releases its reservation and
+            # destroys that BLANK.
             migration_resource_abort "$migration_tx" || true
         else
             # Commit transferred the reservation to destination.  If retirement
             # then fails, discard released that lease; reopen the source.
             "${source_ns}_reconfiguration_abort_prepared" || true
             DALO_MIGRATION_TX_STATE["$migration_tx"]=ABORTED
+        fi
+        # Restore stable UUID only after every destination/BLANK cleanup path; a
+        # partially flooded BLANK may have rebound the UUID before failing.
+        if (( uuid_handoff == 1 )) && [[ ! -v "UUID_TO_OBJ_ID[$source_uuid]" ]]; then
+            UUID_TO_OBJ_ID["$source_uuid"]="$source_obj_id"
         fi
         return "$rc"
     fi
@@ -3884,47 +4136,146 @@ migration_cutover_with_worker() {
 define_comm_api() {
     local ns="$1" body
     body=$(cat <<'COMM_EOF'
-__NS___tcp_init() {
-    [ $# -ge 3 ] && [ $# -le 4 ] || return 2
-    local mode="$1" host="$2" port="$3" helper="${4:-${ASYNC_TCP_HELPER:-/mnt/data/async_tcp_helper_step33.py}}"
-    [[ "$mode" == listen || "$mode" == connect ]] || return 2
-    [[ "$port" =~ ^[0-9]+$ && -x "$helper" ]] || return 3
+# BRIDGE Transport ABI v3: persistent Python Runtime backend.
+# The Bash OBJECT ABI remains DATA/direct + CONTROL/FIFO; only the transport
+# backend changes.  A bridge owns one reserved persistent Python worker whose
+# interpreter holds the listening/connected TCP socket.
+__NS___bridge_python_quote() {
+    [ $# -eq 2 ] || return 2
+    local out="$1" value="$2"
+    value=${value//\\/\\\\}; value=${value//\'/\\\'}
+    value=${value//$'\n'/\\n}; value=${value//$'\r'/\\r}; value=${value//$'\t'/\\t}
+    printf -v "$out" "'%s'" "$value"
+}
 
-    coproc { exec "$helper" --mode "$mode" --host "$host" --port "$port"; }
-    local rfd="${COPROC[0]}" wfd="${COPROC[1]}" pid="$COPROC_PID"
-    printf -v "__NS___TCP_RX_FD" '%s' "$rfd"
-    printf -v "__NS___TCP_TX_FD" '%s' "$wfd"
-    printf -v "__NS___TCP_PID" '%s' "$pid"
+__NS___tcp_init() {
+    [ $# -ge 3 ] && [ $# -le 5 ] || return 2
+    local mode="$1" host="$2" port="$3" local_id="${4:-__NS__}" peer_id="${5:-}"
+    [[ "$mode" == listen || "$mode" == connect ]] || return 2
+    [[ "$port" =~ ^[0-9]+$ ]] || return 3
+    declare -F init_python_thread >/dev/null 2>&1 || return 69
+    declare -F inline_python >/dev/null 2>&1 || return 69
+
+    local handle code qhost qmode qlocal qpeer
+    handle="$(init_python_thread)" || return
+    [[ "$handle" == OK\|* ]] || return 70
+    __NS___bridge_python_quote qhost "$host" || return
+    __NS___bridge_python_quote qmode "$mode" || return
+    __NS___bridge_python_quote qlocal "$local_id" || return
+    __NS___bridge_python_quote qpeer "$peer_id" || return
+    code="import socket, struct
+_dalo_bridge_mode=$qmode
+_dalo_bridge_local_id=$qlocal
+_dalo_bridge_peer_id=$qpeer
+_dalo_bridge_server=None
+_dalo_bridge_sock=None
+_dalo_bridge_host=$qhost
+_dalo_bridge_port=int($port)
+if _dalo_bridge_mode == 'listen':
+    _dalo_bridge_server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    _dalo_bridge_server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    _dalo_bridge_server.bind((_dalo_bridge_host,_dalo_bridge_port))
+    _dalo_bridge_server.listen(1)
+def _dalo_bridge_ensure(_timeout=0):
+    global _dalo_bridge_sock
+    if _dalo_bridge_sock is not None: return _dalo_bridge_sock
+    if _dalo_bridge_mode == 'listen':
+        _dalo_bridge_server.settimeout(None if float(_timeout)==0 else float(_timeout))
+        _dalo_bridge_sock,_=_dalo_bridge_server.accept()
+    else:
+        _dalo_bridge_sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        _last=None
+        for _i in range(100):
+            try:
+                _dalo_bridge_sock.connect((_dalo_bridge_host,_dalo_bridge_port)); _last=None; break
+            except OSError as _e:
+                _last=_e; time.sleep(0.01)
+        if _last is not None: raise _last
+    return _dalo_bridge_sock
+def _dalo_bridge_recv(_timeout=0):
+    _s=_dalo_bridge_ensure(_timeout)
+    _s.settimeout(None if float(_timeout)==0 else float(_timeout))
+    def _rxn(_n):
+        _b=b''
+        while len(_b)<_n:
+            _c=_s.recv(_n-len(_b))
+            if not _c: raise EOFError('bridge peer closed')
+            _b+=_c
+        return _b
+    _n=struct.unpack('!Q',_rxn(8))[0]
+    return _rxn(_n).decode('utf-8')
+"
+    inline_python -t "$handle" -x "$code" || { release_python_thread "$handle" >/dev/null 2>&1 || true; return 71; }
+    printf -v "__NS___PYTHON_THREAD" '%s' "$handle"
+    printf -v "__NS___BRIDGE_MODE" '%s' "$mode"
+    printf -v "__NS___BRIDGE_HOST" '%s' "$host"
+    printf -v "__NS___BRIDGE_PORT" '%s' "$port"
+    printf -v "__NS___BRIDGE_LOCAL_ID" '%s' "$local_id"
+    printf -v "__NS___BRIDGE_PEER_ID" '%s' "$peer_id"
 }
 
 __NS___tcp_send() {
-    local raw="$*" fd="${__NS___TCP_TX_FD:-}"
-    [[ -n "$fd" ]] || return 1
-    [[ "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] || return 3
-    printf '%s\n' "$raw" >&"$fd"
+    [ $# -eq 1 ] || return 2
+    local raw="$1" handle="${__NS___PYTHON_THREAD:-}" qraw code
+    [[ -n "$handle" ]] || return 1
+    __NS___bridge_python_quote qraw "$raw" || return
+    code="import socket, struct, time
+if _dalo_bridge_sock is None:
+    if _dalo_bridge_mode == 'listen':
+        _dalo_bridge_sock,_ = _dalo_bridge_server.accept()
+    else:
+        _dalo_bridge_sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        _last=None
+        for _i in range(100):
+            try:
+                _dalo_bridge_sock.connect((_dalo_bridge_host,_dalo_bridge_port)); _last=None; break
+            except OSError as _e:
+                _last=_e; time.sleep(0.01)
+        if _last is not None: raise _last
+_b=$qraw.encode('utf-8')
+_dalo_bridge_sock.sendall(struct.pack('!Q',len(_b))+_b)
+"
+    inline_python -t "$handle" -x "$code"
+}
+
+__NS___bridge_hex_decode() {
+    [ $# -eq 2 ] || return 2
+    local out="$1" hex="$2" acc="" byte
+    [[ "$hex" =~ ^([0-9a-fA-F][0-9a-fA-F])*$ ]] || return 3
+    while [[ -n "$hex" ]]; do
+        byte="${hex:0:2}"; hex="${hex:2}"
+        printf -v byte '%b' "\\x$byte"
+        acc+="$byte"
+    done
+    printf -v "$out" '%s' "$acc"
 }
 
 __NS___tcp_receive() {
-    local out="$1" timeout="${2:-0}" fd="${__NS___TCP_RX_FD:-}" _tcp_line
-    [[ -n "$fd" ]] || return 1
-    if [[ "$timeout" == 0 ]]; then
-        IFS= read -r -u "$fd" _tcp_line || return
-    else
-        IFS= read -r -t "$timeout" -u "$fd" _tcp_line || return
-    fi
-    printf -v "$out" '%s' "$_tcp_line"
+    [ $# -ge 1 ] && [ $# -le 2 ] || return 2
+    local out="$1" timeout="${2:-0}" handle="${__NS___PYTHON_THREAD:-}" value hex
+    [[ -n "$handle" ]] || return 1
+    [[ "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 2
+    # EVAL results are repr() by Python Runtime ABI v1.  Hex makes that repr pure
+    # ASCII and lets Bash reconstruct UTF-8 bytes without an external process.
+    value="$(inline_python -t "$handle" "_dalo_bridge_recv($timeout).encode('utf-8').hex()")" || return
+    [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]] || return 72
+    hex="${value:1:${#value}-2}"
+    __NS___bridge_hex_decode "$out" "$hex"
 }
+
 
 __NS___forward_tcp() { __NS___tcp_send "$1"; }
 
-# Bind the one and only DATA continuation of this bridge endpoint.
+__NS___bridge_bind_peer() {
+    [ $# -eq 1 ] || return 2
+    printf -v "__NS___BRIDGE_PEER_ID" '%s' "$1"
+}
+
 __NS___bridge_bind_data_target() {
     [ $# -eq 1 ] || return 2
     printf -v "__NS___BRIDGE_DATA_TARGET" '%s' "$1"
 }
 
-# Bind the one and only local FIFO destination for received CONTROL.
-# The target is an object namespace, not an fd, so the fd may be recreated.
 __NS___bridge_bind_control_target() {
     [ $# -eq 1 ] || return 2
     printf -v "__NS___BRIDGE_CONTROL_TARGET_NS" '%s' "$1"
@@ -3936,8 +4287,7 @@ __NS___bridge_forward_control_local() {
     [[ -n "$target" ]] || return 1
     fdvar="${target}_FIFO_FD"
     local pathvar="${target}_FIFO_PATH" path
-    fd="${!fdvar:-}"
-    path="${!pathvar:-}"
+    fd="${!fdvar:-}"; path="${!pathvar:-}"
     [[ -n "$fd" ]] || return 1
     __NS___fifo_send_raw_fd "$fd" "$raw" "$path"
 }
@@ -3958,7 +4308,6 @@ __NS___bridge_data_decode() {
     printf -v "$out" '%s' "$value"
 }
 
-# Normal graph DATA enters Bridge_A directly through this function.
 __NS___bridge_send_data() {
     [ $# -eq 1 ] || return 2
     local frame
@@ -3966,18 +4315,9 @@ __NS___bridge_send_data() {
     __NS___tcp_send "$frame"
 }
 
-# Worker-compatible adapter retained for object/job-pool integration.
-__NS___bridge_worker_func() {
-    local worker_dir="$1" slot_id="$2"; shift 2
-    local payload="${__NS___INPUT_DATA_VECTOR[$slot_id]:-$*}"
-    __NS___bridge_send_data "$payload"
-}
-
-# Receive exactly one transport record and perform at most one local forward.
 __NS___bridge_receive_once() {
     local line payload target
     __NS___tcp_receive line "${1:-1}" || return
-
     case "$line" in
         BRIDGE$'\t'1$'\t'DATA$'\t'*)
             __NS___bridge_data_decode "$line" payload || return
@@ -3989,272 +4329,25 @@ __NS___bridge_receive_once() {
             __NS___tcp_capability_gate "$line" || return
             __NS___bridge_forward_control_local "$__NS___TCP_GATE_RAW"
             ;;
-        *)
-            return 5
-            ;;
+        *) return 5 ;;
     esac
 }
 
 __NS___tcp_close() {
-    local pid="${__NS___TCP_PID:-}" txfd="${__NS___TCP_TX_FD:-}" rxfd="${__NS___TCP_RX_FD:-}"
-    [[ -n "$txfd" ]] && eval "exec ${txfd}>&-" 2>/dev/null || true
-    [[ -n "$rxfd" ]] && eval "exec ${rxfd}<&-" 2>/dev/null || true
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-    [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
-    unset __NS___TCP_PID __NS___TCP_TX_FD __NS___TCP_RX_FD
-}
-COMM_EOF
-)
-    body="${body//__NS__/$ns}"
-    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
-}
-
-# ============================================================================
-# 14B. STEP32 ANT RESOURCE EXCHANGE ABI v1
-#
-# Explicit peer addresses only. There is no broadcast/discovery requirement.
-#
-# HOME MACHINE owns:
-#   job identity, worker artifact, input, completion/retry state.
-#
-# HOST MACHINE owns:
-#   physical ant processes, admission, capacity, and lease lifetime.
-#
-# Protocol records are line-safe and %q encoded:
-#   ANT<TAB>1<TAB>TYPE<TAB>argc<TAB>arg1:%q...
-#
-# A lease reserves execution capacity; it does not migrate an object.
-# ============================================================================
-
-__ant_frame_encode() {
-    [ $# -ge 2 ] || return 2
-    local out="$1" type="$2"; shift 2
-    [[ "$type" =~ ^[A-Z_]+$ ]] || return 2
-    local _ant_encoded="" arg q
-    printf -v _ant_encoded 'ANT\t1\t%s\t%d' "$type" "$#"
-    for arg in "$@"; do
-        [[ "$arg" != *$'\n'* && "$arg" != *$'\r'* ]] || return 3
-        printf -v q '%q' "$arg"
-        _ant_encoded+=$'\t'"$q"
-    done
-    printf -v "$out" '%s' "$_ant_encoded"
-}
-
-__ant_decode_q() {
-    [ $# -eq 2 ] || return 2
-    local out="$1" encoded="$2" value
-    # %q is produced locally/by a cooperating MACHINE. Reject obvious command
-    # substitutions before eval; this is framing, not an authorization layer.
-    [[ "$encoded" != *'$('* && "$encoded" != *'`'* ]] || return 3
-    eval "value=$encoded" || return
-    printf -v "$out" '%s' "$value"
-}
-
-__ant_frame_decode() {
-    [ $# -eq 3 ] || return 2
-    local _ant_raw="$1" _ant_type_out="$2" _ant_argv_out="$3"
-    local _ant_tag _ant_ver _ant_type _ant_argc _ant_value
-    local -a _ant_fields=()
-    IFS=$'\t' read -r -a _ant_fields <<<"$_ant_raw"
-    ((${#_ant_fields[@]} >= 4)) || return 3
-    _ant_tag="${_ant_fields[0]}"; _ant_ver="${_ant_fields[1]}"
-    _ant_type="${_ant_fields[2]}"; _ant_argc="${_ant_fields[3]}"
-    [[ "$_ant_tag" == ANT && "$_ant_ver" == 1 && "$_ant_type" =~ ^[A-Z_]+$ && "$_ant_argc" =~ ^[0-9]+$ ]] || return 3
-    ((${#_ant_fields[@]} == 4 + _ant_argc)) || return 3
-    local -a _ant_decoded=()
-    local _ant_i
-    for ((_ant_i=0; _ant_i<_ant_argc; _ant_i++)); do
-        __ant_decode_q _ant_value "${_ant_fields[4+_ant_i]}" || return
-        _ant_decoded+=("$_ant_value")
-    done
-    printf -v "$_ant_type_out" '%s' "$_ant_type"
-    local -n _ant_argv_ref="$_ant_argv_out"
-    _ant_argv_ref=("${_ant_decoded[@]}")
-}
-
-define_ant_exchange_api() {
-    local ns="$1" body
-    body=$(cat <<'ANT_EOF'
-__NS___ant_init() {
-    eval "declare -g -A __NS___ANT_LEASE_LIMIT=()"
-    eval "declare -g -A __NS___ANT_LEASE_BUSY=()"
-    eval "declare -g -A __NS___ANT_LEASE_OWNER=()"
-    eval "declare -g -A __NS___ANT_JOB_LEASE=()"
-    eval "declare -g -A __NS___ANT_JOB_PID=()"
-    eval "declare -g -A __NS___ANT_JOB_RESULT_FILE=()"
-    eval "declare -g -A __NS___ANT_JOB_DIR=()"
-    eval "declare -g -A __NS___ANT_JOB_RESULT_FILE=()"
-    eval "declare -g -A __NS___ANT_RESULT_RC=()"
-    eval "declare -g -A __NS___ANT_RESULT_DATA=()"
-    printf -v "__NS___ANT_LEASE_SEQ" '%s' 0
-    printf -v "__NS___ANT_JOB_SEQ" '%s' 0
-    printf -v "__NS___ANT_RESERVED" '%s' 0
-}
-
-__NS___ant_available() {
-    __NS___resource_refresh_workers || return
-    local free="${__NS___RESOURCE[workers.free]:-0}" reserved="${__NS___ANT_RESERVED:-0}"
-    free=$((free - reserved)); ((free < 0)) && free=0
-    printf '%s\n' "$free"
-}
-
-__NS___ant_send() {
-    [ $# -ge 1 ] || return 2
-    local frame
-    __ant_frame_encode frame "$@" || return
-    __NS___tcp_send "$frame"
-}
-
-__NS___ant_request_resources() {
-    __NS___ant_send RESOURCE_QUERY
-}
-
-__NS___ant_request_lease() {
-    [ $# -eq 1 ] || return 2
-    [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 2
-    __NS___ant_send LEASE_REQUEST "$1"
-}
-
-__NS___ant_release_lease() {
-    [ $# -eq 1 ] || return 2
-    __NS___ant_send LEASE_RELEASE "$1"
-}
-
-__NS___ant_submit() {
-    [ $# -ge 3 ] || return 2
-    local lease="$1" artifact="$2"; shift 2
-    [[ -r "$artifact" ]] || return 3
-    local code hash job_id
-    code="$(base64 <"$artifact" | tr -d '\n')" || return
-    hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
-    printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
-    job_id="${__NS___ANT_JOB_SEQ}"
-    __NS___ant_send JOB "$lease" "$job_id" "$hash" "$code" "$@"
-    printf '%s\n' "$job_id"
-}
-
-__NS___ant_handle_resource_query() {
-    local total free offered
-    __NS___resource_refresh_workers || return
-    total="${__NS___RESOURCE[workers.total]:-0}"
-    free="$(__NS___ant_available)" || return
-    offered="$free"
-    __NS___ant_send RESOURCE_REPLY "$total" "$free" "$offered"
-}
-
-__NS___ant_handle_lease_request() {
-    local wanted="$1" available grant lease
-    [[ "$wanted" =~ ^[1-9][0-9]*$ ]] || return 2
-    available="$(__NS___ant_available)" || return
-    grant="$wanted"; ((grant > available)) && grant="$available"
-    if ((grant == 0)); then
-        __NS___ant_send LEASE_DENY no_capacity
-        return
+    local handle="${__NS___PYTHON_THREAD:-}"
+    if [[ -n "$handle" ]]; then
+        inline_python -t "$handle" -x "
+try:
+    _dalo_bridge_sock.close() if _dalo_bridge_sock is not None else None
+except Exception: pass
+try:
+    _dalo_bridge_server.close() if _dalo_bridge_server is not None else None
+except Exception: pass
+" >/dev/null 2>&1 || true
+        release_python_thread "$handle" >/dev/null 2>&1 || true
     fi
-    printf -v "__NS___ANT_LEASE_SEQ" '%s' "$(( ${__NS___ANT_LEASE_SEQ:-0} + 1 ))"
-    lease="lease_${__NS___ANT_LEASE_SEQ}"
-    __NS___ANT_LEASE_LIMIT["$lease"]="$grant"
-    __NS___ANT_LEASE_BUSY["$lease"]=0
-    __NS___ANT_LEASE_OWNER["$lease"]="peer"
-    printf -v "__NS___ANT_RESERVED" '%s' "$(( ${__NS___ANT_RESERVED:-0} + grant ))"
-    __NS___ant_send LEASE_GRANT "$lease" "$grant"
-}
-
-__NS___ant_handle_lease_release() {
-    local lease="$1" limit busy
-    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send ERROR unknown_lease; return 1; }
-    busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
-    ((busy == 0)) || { __NS___ant_send ERROR lease_busy "$lease" "$busy"; return 1; }
-    limit="${__NS___ANT_LEASE_LIMIT[$lease]}"
-    printf -v "__NS___ANT_RESERVED" '%s' "$(( ${__NS___ANT_RESERVED:-0} - limit ))"
-    ((__NS___ANT_RESERVED < 0)) && printf -v "__NS___ANT_RESERVED" '%s' 0
-    unset '__NS___ANT_LEASE_LIMIT[$lease]' '__NS___ANT_LEASE_BUSY[$lease]' '__NS___ANT_LEASE_OWNER[$lease]'
-    __NS___ant_send LEASE_RELEASED "$lease"
-}
-
-__NS___ant_handle_job() {
-    [ $# -ge 4 ] || return 2
-    local lease="$1" job_id="$2" expected_hash="$3" code64="$4"; shift 4
-    local limit busy dir artifact actual_hash pid result_file
-    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send RESULT "$job_id" 125 unknown_lease; return 1; }
-    limit="${__NS___ANT_LEASE_LIMIT[$lease]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
-    ((busy < limit)) || { __NS___ant_send RESULT "$job_id" 126 lease_full; return 1; }
-    dir="$(mktemp -d "${TMPDIR:-/tmp}/__NS__.ant.${job_id}.XXXXXX")" || return
-    artifact="$dir/worker.bash"; result_file="$dir/result.frame"
-    printf '%s' "$code64" | base64 -d >"$artifact" || { rm -rf "$dir"; return; }
-    actual_hash="$(sha256sum "$artifact" | awk '{print $1}')" || { rm -rf "$dir"; return; }
-    [[ "$actual_hash" == "$expected_hash" ]] || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 127 hash_mismatch; return 1; }
-    bash -n "$artifact" || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 128 syntax_error; return 1; }
-    __NS___ANT_LEASE_BUSY["$lease"]=$((busy + 1))
-    # Child owns only execution. It returns one local frame through an atomic
-    # rename; only the canonical HOST parent owns and writes the TCP endpoint.
-    (
-        set +e; source "$artifact"
-        if declare -F worker >/dev/null; then result="$(worker "$dir" 0 "$@" 2>&1)"; rc=$?; else result=missing_worker_function; rc=129; fi
-        frame=""; __ant_frame_encode frame CHILD_RESULT "$job_id" "$rc" "$result" || exit 130
-        printf '%s\n' "$frame" >"${result_file}.tmp" && mv -f "${result_file}.tmp" "$result_file"
-    ) &
-    pid=$!
-    __NS___ANT_JOB_LEASE["$job_id"]="$lease"; __NS___ANT_JOB_PID["$job_id"]="$pid"
-    __NS___ANT_JOB_RESULT_FILE["$job_id"]="$result_file"; __NS___ANT_JOB_DIR["$job_id"]="$dir"
-}
-
-__NS___ant_reap() {
-    local job pid lease busy file raw type dir
-    local -a argv=()
-    for job in "${!__NS___ANT_JOB_PID[@]}"; do
-        pid="${__NS___ANT_JOB_PID[$job]}"; file="${__NS___ANT_JOB_RESULT_FILE[$job]}"
-        if [[ -s "$file" ]]; then
-            IFS= read -r raw <"$file" || continue; argv=(); __ant_frame_decode "$raw" type argv || continue
-            [[ "$type" == CHILD_RESULT && "${argv[0]}" == "$job" ]] || continue
-            __NS___ant_send RESULT "$job" "${argv[1]}" "${argv[2]-}" || return
-            wait "$pid" 2>/dev/null || true
-        elif ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true; __NS___ant_send RESULT "$job" 131 child_lost || return
-        else
-            continue
-        fi
-        lease="${__NS___ANT_JOB_LEASE[$job]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-1}"
-        ((busy > 0)) && __NS___ANT_LEASE_BUSY["$lease"]=$((busy - 1))
-        dir="${__NS___ANT_JOB_DIR[$job]:-}"; [[ -n "$dir" ]] && rm -rf "$dir"
-        unset '__NS___ANT_JOB_PID[$job]' '__NS___ANT_JOB_LEASE[$job]' '__NS___ANT_JOB_RESULT_FILE[$job]' '__NS___ANT_JOB_DIR[$job]'
-    done
-}
-
-__NS___ant_receive_once() {
-    local raw type
-    local -a argv=()
-    __NS___ant_reap || return
-    __NS___tcp_receive raw "${1:-1}" || { __NS___ant_reap || true; return 1; }
-    __ant_frame_decode "$raw" type argv || return
-    case "$type" in
-        RESOURCE_QUERY) __NS___ant_handle_resource_query ;;
-        RESOURCE_REPLY)
-            __NS___PEER_RESOURCE["explicit|workers.total"]="${argv[0]}"
-            __NS___PEER_RESOURCE["explicit|workers.free"]="${argv[1]}"
-            __NS___PEER_RESOURCE["explicit|workers.offered"]="${argv[2]}"
-            ;;
-        LEASE_REQUEST) __NS___ant_handle_lease_request "${argv[0]}" ;;
-        LEASE_GRANT)
-            printf -v "__NS___ANT_REMOTE_LEASE" '%s' "${argv[0]}"
-            printf -v "__NS___ANT_REMOTE_GRANTED" '%s' "${argv[1]}"
-            ;;
-        LEASE_DENY) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
-        LEASE_RELEASE) __NS___ant_handle_lease_release "${argv[0]}" ;;
-        LEASE_RELEASED)
-            [[ "${__NS___ANT_REMOTE_LEASE:-}" == "${argv[0]}" ]] && {
-                unset __NS___ANT_REMOTE_LEASE __NS___ANT_REMOTE_GRANTED
-            }
-            ;;
-        JOB) __NS___ant_handle_job "${argv[@]}" ;;
-        RESULT)
-            __NS___ANT_RESULT_RC["${argv[0]}"]="${argv[1]}"
-            __NS___ANT_RESULT_DATA["${argv[0]}"]="${argv[2]-}"
-            ;;
-        ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
-        *) return 4 ;;
-    esac
-    __NS___ant_reap
+    printf -v "__NS___PYTHON_THREAD" '%s' ''
+    declare -F __NS___ant_reap >/dev/null 2>&1 && __NS___ant_reap || true
 }
 
 __NS___ant_wait_result() {
@@ -4268,7 +4361,7 @@ __NS___ant_wait_result() {
     printf '%s\n' "${__NS___ANT_RESULT_DATA[$job]}"
     return "${__NS___ANT_RESULT_RC[$job]}"
 }
-ANT_EOF
+COMM_EOF
 )
     body="${body//__NS__/$ns}"
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
@@ -4276,26 +4369,29 @@ ANT_EOF
 
 ant_endpoint_constructor() {
     [ $# -ge 4 ] && [ $# -le 5 ] || return 2
-    local ns="$1" mode="$2" host="$3" port="$4" helper="${5:-${ASYNC_TCP_HELPER:-/mnt/data/async_tcp_helper_step33.py}}"
+    local ns="$1" mode="$2" host="$3" port="$4"
     asyncobj_constructor "$ns" "" || return
     printf -v "${ns}_OBJECT_TYPE" '%s' RESOURCE_CONTAINER
     define_comm_api "$ns" || return
     define_ant_exchange_api "$ns" || return
     "${ns}_ant_init" || return
-    "${ns}_tcp_init" "$mode" "$host" "$port" "$helper"
+    "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" ""
 }
 
+# BRIDGE OBJECT ABI v3.
+# Compatibility: the first five arguments retain the old constructor shape.
+# Optional arg6 is now declarative peer identity (not a helper executable).
 bridge_constructor() {
     [ $# -ge 4 ] && [ $# -le 6 ] || return 2
-    local ns="$1" mode="$2" host="$3" port="$4" data_target="${5:-}" helper="${6:-${ASYNC_TCP_HELPER:-/mnt/data/async_tcp_helper_step33.py}}"
+    local ns="$1" mode="$2" host="$3" port="$4" data_target="${5:-}" peer_id="${6:-}"
     asyncobj_constructor "$ns" "" || return
     printf -v "${ns}_OBJECT_TYPE" '%s' BRIDGE
     printf -v "${ns}_BRIDGE_DATA_TARGET" '%s' "$data_target"
     printf -v "${ns}_BRIDGE_CONTROL_TARGET_NS" '%s' ""
+    printf -v "${ns}_BRIDGE_PEER_ID" '%s' "$peer_id"
     define_comm_api "$ns" || return
     define_tcp_capability_gate "$ns" || return
-    printf -v "${ns}_TARGET_WORKER_FUNC" '%s' "${ns}_bridge_worker_func"
-    "${ns}_tcp_init" "$mode" "$host" "$port" "$helper"
+    "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" "$peer_id"
 }
 
 
@@ -4752,6 +4848,7 @@ save_project() {
     local -n xs="${project}_DECL_X" ys="${project}_DECL_Y"
     local -n wf="${project}_DECL_WORKER_FILE" dw="${project}_DECL_WORKERS"
     local -n rk="${project}_DECL_RESOURCE_KIND" ra="${project}_DECL_RESOURCE_ARG"
+    local -n decl_fields="${project}_DECL_FIELD"
     local -n edges="${project}_EDGES"
 
     local tmp="${file}.tmp.$$" obj qn qt qs qk qa
@@ -4887,6 +4984,41 @@ __asyncmachine_emit_worker() {
     # knowing the compiler-assigned machine namespace in advance.
     printf '%s_worker() { local ASYNC_WORKER_NS=%q; %s "$@"; }\n' "$ns" "$ns" "$impl" >>"$out"
 }
+
+__asyncmachine_emit_worker_lifecycle() {
+    [ $# -eq 5 ] || return 2
+    local ns="$1" file="$2" symbol="$3" suffix="$4" out="$5" def impl
+    impl="${ns}_worker_${suffix}_impl"
+    [[ -n "$symbol" ]] || return 0
+    def="$(bash -c 'source "$1"; declare -f "$2"' _ "$file" "$symbol")" || return 5
+    def="${def/#${symbol} ()/${impl} ()}"
+    printf '\n# Linked worker lifecycle %s for %s.\n%s\n' "$suffix" "$ns" "$def" >>"$out"
+    printf '%s_worker_%s() { local ASYNC_WORKER_NS=%q; %s "$@"; }\n' "$ns" "$suffix" "$ns" "$impl" >>"$out"
+}
+__asyncmachine_meta_get() {
+    [ $# -ge 3 ] && [ $# -le 4 ] || return 2
+    local out="$1" arr="$2" key="$3" default="${4:-}" q
+    printf -v q '%q' "$key"
+    eval "printf -v '$out' '%s' \"\${${arr}[$q]-\$default}\""
+}
+# Generic Runtime Artifact Lookup ABI v1. Source-tree mode falls back to the
+# library file location; standalone MACHINEs populate the artifact map.
+dalo_library_artifact_path() {
+    [ "$#" -eq 3 ] || return 2
+    local lib="$1" artifact="$2" out="$3" key file dir
+    [[ "$lib" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ && "$artifact" != */* && -n "$artifact" ]] || return 2
+    key="$lib/$artifact"
+    if declare -p DALO_LIBRARY_ARTIFACT_PATH >/dev/null 2>&1 && [[ -n "${DALO_LIBRARY_ARTIFACT_PATH[$key]:-}" ]]; then
+        printf -v "$out" '%s' "${DALO_LIBRARY_ARTIFACT_PATH[$key]}"; return 0
+    fi
+    if declare -p DALO_LIBRARY_LOADED_FILE >/dev/null 2>&1; then file="${DALO_LIBRARY_LOADED_FILE[$lib]:-}"; fi
+    if [[ -z "${file:-}" && "$lib" == "dalo" ]]; then file="${BASH_SOURCE[0]}"; fi
+    [[ -n "${file:-}" ]] || return 1
+    dir="$(cd -- "$(dirname -- "$file")" && pwd)" || return
+    [[ -r "$dir/$artifact" ]] || return 1
+    printf -v "$out" '%s' "$dir/$artifact"
+}
+
 __asyncmachine_link() {
     [ $# -eq 4 ] || return 2
     local project="$1" project_file="$2" out="$3" project_hash="$4"
@@ -4898,6 +5030,39 @@ __asyncmachine_link() {
     local -n objs="${project}_DECL_OBJECTS" types="${project}_DECL_TYPE"
     local -n wf="${project}_DECL_WORKER_FILE" dw="${project}_DECL_WORKERS"
     local -n rk="${project}_DECL_RESOURCE_KIND" ra="${project}_DECL_RESOURCE_ARG"
+    local -n decl_fields="${project}_DECL_FIELD"
+    local wstart_arr="${project}_WORKER_START" wpoll_arr="${project}_WORKER_POLL" wstop_arr="${project}_WORKER_STOP" wkeep_arr="${project}_WORKER_KEEPALIVE" wrequires_arr="${project}_WORKER_RUNTIME_REQUIRES"
+
+    # Generic WORKER runtime dependency closure. Libraries are resolved from the
+    # runtime directory by their standard DALO_LIBRARY_* metadata.
+    local runtime_dir; runtime_dir="$(cd -- "$(dirname -- "$library_source")" && pwd)" || return
+    local -a embedded_lib_order=()
+    local -A embedded_lib_seen=() embedded_lib_file=() embedded_lib_init=() embedded_lib_artifacts=()
+    __asyncmachine_embedded_meta() {
+        local f="$1" key="$2" out="$3" line value
+        line="$(grep -m1 "^${key}=" "$f")" || { printf -v "$out" '%s' ""; return 0; }
+        value="${line#*=}"; value="${value#\"}"; value="${value%\"}"; value="${value#\'}"; value="${value%\'}"
+        printf -v "$out" '%s' "$value"
+    }
+    __asyncmachine_resolve_embedded_lib() {
+        local lib="$1" f req dep init arts
+        [[ -z "${embedded_lib_seen[$lib]:-}" ]] || return 0
+        embedded_lib_seen["$lib"]=1
+        f="$runtime_dir/$lib.bashlib.sh"
+        [[ -r "$f" ]] || { printf 'missing runtime library: %s\n' "$lib" >&2; return 71; }
+        __asyncmachine_embedded_meta "$f" DALO_LIBRARY_REQUIRES req || return
+        __asyncmachine_embedded_meta "$f" DALO_LIBRARY_INIT init || return
+        __asyncmachine_embedded_meta "$f" DALO_LIBRARY_ARTIFACTS arts || return
+        for dep in $req; do __asyncmachine_resolve_embedded_lib "$dep" || return; done
+        embedded_lib_file["$lib"]="$f"; embedded_lib_init["$lib"]="$init"; embedded_lib_artifacts["$lib"]="$arts"
+        embedded_lib_order+=("$lib")
+    }
+    local req_lib
+    for obj in "${objs[@]}"; do
+        __asyncmachine_meta_get req_lib "$wrequires_arr" "$obj" "" || return
+        for req_lib in $req_lib; do __asyncmachine_resolve_embedded_lib "$req_lib" || return; done
+    done
+
     eval "declare -g -A ${project}_COMPILE_NS=()"
     local -n machine_ns="${project}_COMPILE_NS"
 
@@ -4927,6 +5092,28 @@ __asyncmachine_link() {
           skip && /^unset __dalo_library_dir/ { skip=0; next }
           { print }
         ' "$library_source" | tail -n +2
+        if ((${#embedded_lib_order[@]})); then
+            printf '\n# Generic embedded runtime libraries and artifacts.\n'
+            printf 'DALO_MACHINE_RUNTIME_DIR="${DALO_MACHINE_RUNTIME_DIR:-${TMPDIR:-/tmp}/dalo-machine-${BASHPID}}"\nmkdir -p "$DALO_MACHINE_RUNTIME_DIR" || exit $?\nchmod 700 "$DALO_MACHINE_RUNTIME_DIR" || exit $?\ndeclare -gA DALO_LIBRARY_ARTIFACT_PATH=()\n'
+            local lib f art delim init
+            for lib in "${embedded_lib_order[@]}"; do
+                f="${embedded_lib_file[$lib]}"; delim="__DALO_LIB_${lib//[^A-Za-z0-9]/_}_${project_hash:0:12}__"
+                printf '%s\n' "cat >\"\$DALO_MACHINE_RUNTIME_DIR/$lib.bashlib.sh\" <<'$delim'"
+                cat "$f"
+                printf '%s\n' "$delim"
+                for art in ${embedded_lib_artifacts[$lib]}; do
+                    [[ "$art" != */* && -r "$runtime_dir/$art" ]] || return 72
+                    delim="__DALO_ART_${lib//[^A-Za-z0-9]/_}_${art//[^A-Za-z0-9]/_}_${project_hash:0:12}__"
+                    printf '%s\n' "mkdir -p \"\$DALO_MACHINE_RUNTIME_DIR/$lib\"" "cat >\"\$DALO_MACHINE_RUNTIME_DIR/$lib/$art\" <<'$delim'"
+                    cat "$runtime_dir/$art"
+                    printf '%s\n' "$delim"
+                    printf 'DALO_LIBRARY_ARTIFACT_PATH[%q]="$DALO_MACHINE_RUNTIME_DIR/%s/%s"\n' "$lib/$art" "$lib" "$art"
+                done
+                printf 'source "$DALO_MACHINE_RUNTIME_DIR/%s.bashlib.sh" || exit $?\n' "$lib"
+                init="${embedded_lib_init[$lib]}"
+                [[ -z "$init" ]] || printf '%s || exit $?\n' "$init"
+            done
+        fi
         printf '\n# ============================================================================\n# GENERATED MACHINE IMAGE\n# ============================================================================\n'
         printf 'ASYNC_MACHINE_ABI=2\nASYNC_MACHINE_PROJECT_SHA256=%q\nASYNC_MACHINE_NAME=%q\n' "$project_hash" "$project"
     } >"$out" || return
@@ -4987,9 +5174,27 @@ __asyncmachine_link() {
             printf 'printf -v %q %%s %q\n' "${ns}_OBJECT_TYPE" "$type"
             printf 'printf -v %q %%s %q\n' "${ns}_MAX_JOBS" "$workers"
         } >>"$out"
+        # Generic descriptor instance fields. Worker artifacts address them as
+        # ${ASYNC_WORKER_NS}_FIELD_<NAME>; no OBJECT type is special-cased.
+        local field_key field_name field_prefix="$obj."
+        for field_key in "${!decl_fields[@]}"; do
+            [[ "$field_key" == "$field_prefix"* ]] || continue
+            field_name="${field_key#"$field_prefix"}"
+            [[ "$field_name" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 34
+            printf 'printf -v %q %%s %q\n' "${ns}_FIELD_${field_name}" "${decl_fields[$field_key]}" >>"$out"
+        done
         if [[ -n "${wf[$obj]:-}" ]]; then
+            local __ws __wp __wx __wk
+            __asyncmachine_meta_get __ws "$wstart_arr" "$obj" "" || return
+            __asyncmachine_meta_get __wp "$wpoll_arr" "$obj" "" || return
+            __asyncmachine_meta_get __wx "$wstop_arr" "$obj" "" || return
+            __asyncmachine_meta_get __wk "$wkeep_arr" "$obj" "0" || return
             __asyncmachine_emit_worker "$ns" "${wf[$obj]}" "$out" || return
+            __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__ws" start "$out" || return
+            __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__wp" poll "$out" || return
+            __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__wx" stop "$out" || return
             printf 'printf -v %q %%s %q\n' "${ns}_TARGET_WORKER_FUNC" "${ns}_worker" >>"$out"
+            printf 'printf -v %q %%s %q\n' "${ns}_WORKER_KEEPALIVE" "$__wk" >>"$out"
         fi
     done
 
@@ -5122,6 +5327,13 @@ __asyncmachine_link() {
         fi
     done
 
+    # Generic worker lifecycle start. No OBJECT type is inspected here.
+    for obj in "${objs[@]}"; do
+        ns="${machine_ns[$obj]}"
+        local __ws; __asyncmachine_meta_get __ws "$wstart_arr" "$obj" "" || return
+        if [[ -n "$__ws" ]]; then printf '%s_worker_start || exit $?\n' "$ns" >>"$out"; fi
+    done
+
     local path mode
     for obj in "${objs[@]}"; do
         ns="${machine_ns[$obj]}"
@@ -5150,6 +5362,8 @@ __asyncmachine_link() {
     for obj in "${objs[@]}"; do
         ns="${machine_ns[$obj]}"
         printf '    %s_drain_fifo || return\n' "$ns" >>"$out"
+        local __wp; __asyncmachine_meta_get __wp "$wpoll_arr" "$obj" "" || return
+        if [[ -n "$__wp" ]]; then printf '    %s_worker_poll || return\n' "$ns" >>"$out"; fi
     done
     for obj in "${objs[@]}"; do
         ns="${machine_ns[$obj]}"
@@ -5163,6 +5377,8 @@ __asyncmachine_link() {
                 printf '    ((%s_PERSIST_PENDING > 0)) && __dalo_pending=1\n' "$ns" >>"$out"
                 ;;
         esac
+        local __wk; __asyncmachine_meta_get __wk "$wkeep_arr" "$obj" "0" || return
+        [[ "$__wk" == 1 ]] && printf '    __dalo_pending=1\n' >>"$out"
     done
     {
         printf '    ((__dalo_pending == 0)) && return 0\n'
@@ -5180,6 +5396,16 @@ __asyncmachine_link() {
     fi
     {
         printf '}\n'
+        printf 'async_machine_worker_stop_all() { local __rc=0\n'
+    } >>"$out"
+    for obj in "${objs[@]}"; do
+        ns="${machine_ns[$obj]}"
+        local __wx; __asyncmachine_meta_get __wx "$wstop_arr" "$obj" "" || return
+        if [[ -n "$__wx" ]]; then printf '  %s_worker_stop || __rc=$?\n' "$ns" >>"$out"; fi
+    done
+    {
+        printf '  return "$__rc"; }\n'
+        printf 'trap async_machine_worker_stop_all EXIT INT TERM\n'
         printf 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then async_machine_main "$@"; fi\n'
     } >>"$out"
     chmod +x "$out"

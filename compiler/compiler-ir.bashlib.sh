@@ -11,7 +11,7 @@ dalo_ir_init() {
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
     eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=() ${p}_PARAM_ORDER=()"
-    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
+    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_WORKER_DEF=() ${p}_WORKER_START=() ${p}_WORKER_POLL=() ${p}_WORKER_STOP=() ${p}_WORKER_KEEPALIVE=() ${p}_WORKER_RUNTIME_REQUIRES=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
 }
 dalo_ir_set_project_name() {
     [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || { printf 'daloc: invalid PROJECT NAME %s\n' "$2" >&2; return 20; }

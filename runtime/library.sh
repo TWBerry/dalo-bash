@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DALO dependency-aware Bash library loader v2.
+# DALO dependency-aware Bash library loader v3.
 # Public API: include NAME
 
 if [ "${DALO_LIBRARY_LOADER_INCLUDE:-0}" -eq 0 ]; then
@@ -45,8 +45,8 @@ __dalo_metadata() {
 # Resolve and validate one dependency closure. Nothing is sourced here.
 __dalo_resolve() {
     local name="$1" chain="${2:-}" file declared abi requires dep state
-    local state_name="$3" file_name="$4" order_name="$5"
-    local -n _state="$state_name" _file="$file_name" _order="$order_name"
+    local state_name="$3" file_name="$4" order_name="$5" init_name="$6"
+    local -n _state="$state_name" _file="$file_name" _order="$order_name" _init="$init_name"
 
     # Already loaded in this shell: dependency is satisfied immediately.
     if [ "${DALO_LIBRARY_LOADED[$name]:-0}" -eq 1 ]; then
@@ -89,13 +89,31 @@ __dalo_resolve() {
     }
 
     requires="$(__dalo_metadata "$file" DALO_LIBRARY_REQUIRES)" || requires=''
+    _init["$name"]="$(__dalo_metadata "$file" DALO_LIBRARY_INIT)" || _init["$name"]=''
     _file["$name"]="$file"
     for dep in $requires; do
-        __dalo_resolve "$dep" "${chain}${name} -> " "$state_name" "$file_name" "$order_name" || return
+        __dalo_resolve "$dep" "${chain}${name} -> " "$state_name" "$file_name" "$order_name" "$init_name" || return
     done
 
     _state["$name"]=2
     _order+=("$name")
+}
+
+# Generic Runtime Artifact Lookup ABI v1.
+dalo_library_artifact_path() {
+    [ "$#" -eq 3 ] || return 2
+    local lib="$1" artifact="$2" out="$3" file dir key
+    [[ "$lib" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ && "$artifact" != */* && -n "$artifact" ]] || return 2
+    key="$lib/$artifact"
+    if declare -p DALO_LIBRARY_ARTIFACT_PATH >/dev/null 2>&1 && [[ -n "${DALO_LIBRARY_ARTIFACT_PATH[$key]:-}" ]]; then
+        printf -v "$out" '%s' "${DALO_LIBRARY_ARTIFACT_PATH[$key]}"
+        return 0
+    fi
+    file="${DALO_LIBRARY_LOADED_FILE[$lib]:-}"
+    [[ -n "$file" ]] || file="$(__dalo_find_library "$lib")" || return
+    dir="$(cd -- "$(dirname -- "$file")" && pwd)" || return
+    [[ -r "$dir/$artifact" ]] || return 1
+    printf -v "$out" '%s' "$dir/$artifact"
 }
 
 include() {
@@ -104,7 +122,7 @@ include() {
         return 2
     }
 
-    local name="$1" lib file
+    local name="$1" lib file init_func
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || {
         __dalo_loader_error "invalid library name: $name"
         return 2
@@ -119,9 +137,10 @@ include() {
     # dependency closure before sourcing its first library.
     local -A resolve_state=()
     local -A resolve_file=()
+    local -A resolve_init=()
     local -a resolve_order=()
 
-    __dalo_resolve "$name" '' resolve_state resolve_file resolve_order || return
+    __dalo_resolve "$name" '' resolve_state resolve_file resolve_order resolve_init || return
 
     for lib in "${resolve_order[@]}"; do
         [ "${DALO_LIBRARY_LOADED[$lib]:-0}" -eq 1 ] && continue
@@ -130,6 +149,23 @@ include() {
             __dalo_loader_error "source failed: $file"
             return 1
         }
+
+        init_func="${resolve_init[$lib]:-}"
+        if [ -n "$init_func" ]; then
+            [[ "$init_func" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+                __dalo_loader_error "invalid DALO_LIBRARY_INIT '$init_func': $file"
+                return 1
+            }
+            declare -F "$init_func" >/dev/null || {
+                __dalo_loader_error "init function not found: $init_func ($file)"
+                return 1
+            }
+            "$init_func" || {
+                __dalo_loader_error "init failed: $init_func ($file)"
+                return 1
+            }
+        fi
+
         DALO_LIBRARY_LOADED["$lib"]=1
         DALO_LIBRARY_LOADED_FILE["$lib"]="$file"
         DALO_LIBRARY_LOAD_ORDER+=("$lib")
