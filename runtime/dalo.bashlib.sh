@@ -2551,6 +2551,17 @@ __NS___scheduler_available_memory() {
     printf '%s\n' "$(( __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED ))"
 }
 
+# Read-only placement/admission probe.  Unlike reserve+release this does not
+# mutate reservation sequence, ledgers, or accounting state.
+__NS___scheduler_can_fit() {
+    [ $# -eq 2 ] || return 64
+    local cpu="$1" memory="$2"
+    [[ "$cpu" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || return 64
+    [[ "${__NS___SCHEDULER_STATE:-ACTIVE}" == ACTIVE ]] || return 74
+    (( cpu <= __NS___CPU_TOTAL - __NS___CPU_RESERVED )) || return 80
+    (( memory <= __NS___MEMORY_TOTAL - __NS___MEMORY_RESERVED )) || return 81
+}
+
 __NS___scheduler_reserve() {
     [ $# -eq 4 ] || return 64
     local outvar="$1" owner="$2" cpu="$3" memory="$4"
@@ -5364,4 +5375,312 @@ migration_policy_admit() {
     [ $# -eq 1 ] || return 64
     local plan
     migration_policy_plan plan "$1" || return $?
+}
+
+
+# ============================================================================
+# 13d. SCHEDULER PLACEMENT ABI v1
+# ============================================================================
+# Placement is a read-only planning layer.  It MUST NOT quiesce the source,
+# reserve destination capacity, or mutate migration/resource ledgers.
+#
+# Candidate format (v1): MACHINE_ID:SCHEDULER_NAMESPACE
+# The order supplied by the caller is policy order.  The mechanism performs
+# deterministic first-fit over that order after hard migration/resource gates.
+
+placement_candidate_parse() {
+    [ $# -eq 3 ] || return 64
+    local _pcp_spec="$1" _pcp_out_machine="$2" _pcp_out_sched="$3"
+    local _pcp_machine="${_pcp_spec%%:*}" _pcp_sched="${_pcp_spec#*:}"
+    [[ "$_pcp_spec" == *:* && -n "$_pcp_machine" && -n "$_pcp_sched" ]] || return 71
+    [[ "$_pcp_machine" =~ ^[A-Za-z0-9_.-]+$ ]] || return 71
+    [[ "$_pcp_sched" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    printf -v "$_pcp_out_machine" '%s' "$_pcp_machine"
+    printf -v "$_pcp_out_sched" '%s' "$_pcp_sched"
+}
+
+placement_probe_candidate() {
+    [ $# -eq 6 ] || return 64
+    local _ppc_outvar="$1" _ppc_source_ns="$2" _ppc_local_machine="$3"
+    local _ppc_candidate="$4" _ppc_cpu="$5" _ppc_memory="$6"
+    [[ "$_ppc_outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$_ppc_source_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$_ppc_local_machine" =~ ^[A-Za-z0-9_.-]+$ ]] || return 71
+    [[ "$_ppc_cpu" =~ ^[0-9]+$ && "$_ppc_memory" =~ ^[0-9]+$ ]] || return 64
+
+    local _ppc_machine="" _ppc_sched="" _ppc_policy_plan="" _ppc_policy_rc=0 _ppc_rc=0
+    placement_candidate_parse "$_ppc_candidate" _ppc_machine _ppc_sched || return $?
+
+    if [[ "$_ppc_machine" == "$_ppc_local_machine" ]]; then
+        declare -F "${_ppc_sched}_scheduler_can_fit" >/dev/null 2>&1 || return 66
+        if "${_ppc_sched}_scheduler_can_fit" "$_ppc_cpu" "$_ppc_memory"; then
+            printf -v "$_ppc_outvar" 'ELIGIBLE scope=LOCAL machine=%s scheduler=%s cpu=%s memory=%s' "$_ppc_machine" "$_ppc_sched" "$_ppc_cpu" "$_ppc_memory"
+            return 0
+        else
+            _ppc_rc=$?
+        fi
+        printf -v "$_ppc_outvar" 'NO_CAPACITY scope=LOCAL machine=%s scheduler=%s rc=%s cpu=%s memory=%s' "$_ppc_machine" "$_ppc_sched" "$_ppc_rc" "$_ppc_cpu" "$_ppc_memory"
+        return "$_ppc_rc"
+    fi
+
+    migration_policy_plan _ppc_policy_plan "$_ppc_source_ns" || _ppc_policy_rc=$?
+    if (( _ppc_policy_rc != 0 )); then
+        if (( _ppc_policy_rc == 88 )); then
+            printf -v "$_ppc_outvar" 'BLOCKED_POLICY scope=REMOTE machine=%s scheduler=%s %s' "$_ppc_machine" "$_ppc_sched" "$_ppc_policy_plan"
+        fi
+        return "$_ppc_policy_rc"
+    fi
+
+    declare -F "${_ppc_sched}_scheduler_can_fit" >/dev/null 2>&1 || return 66
+    if "${_ppc_sched}_scheduler_can_fit" "$_ppc_cpu" "$_ppc_memory"; then
+        printf -v "$_ppc_outvar" 'ELIGIBLE scope=REMOTE machine=%s scheduler=%s cpu=%s memory=%s %s' "$_ppc_machine" "$_ppc_sched" "$_ppc_cpu" "$_ppc_memory" "$_ppc_policy_plan"
+        return 0
+    else
+        _ppc_rc=$?
+    fi
+    printf -v "$_ppc_outvar" 'NO_CAPACITY scope=REMOTE machine=%s scheduler=%s rc=%s cpu=%s memory=%s %s' "$_ppc_machine" "$_ppc_sched" "$_ppc_rc" "$_ppc_cpu" "$_ppc_memory" "$_ppc_policy_plan"
+    return "$_ppc_rc"
+}
+
+placement_select_first_fit() {
+    [ $# -ge 8 ] || return 64
+    local _psf_out_machine="$1" _psf_out_sched="$2" _psf_out_plan="$3"
+    local _psf_source_ns="$4" _psf_local_machine="$5" _psf_cpu="$6" _psf_memory="$7"
+    shift 7
+    [[ "$_psf_out_machine" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_psf_out_sched" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_psf_out_plan" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    (($# > 0)) || return 64
+
+    local _psf_candidate _psf_machine="" _psf_sched="" _psf_probe="" _psf_rc=0
+    local _psf_saw_policy_block=0 _psf_saw_capacity=0
+    for _psf_candidate in "$@"; do
+        placement_candidate_parse "$_psf_candidate" _psf_machine _psf_sched || return $?
+        _psf_probe=""
+        if placement_probe_candidate _psf_probe "$_psf_source_ns" "$_psf_local_machine" "$_psf_candidate" "$_psf_cpu" "$_psf_memory"; then
+            printf -v "$_psf_out_machine" '%s' "$_psf_machine"
+            printf -v "$_psf_out_sched" '%s' "$_psf_sched"
+            printf -v "$_psf_out_plan" '%s' "$_psf_probe"
+            return 0
+        else
+            _psf_rc=$?
+            case "$_psf_rc" in
+                88) _psf_saw_policy_block=1 ;;
+                80|81) _psf_saw_capacity=1 ;;
+                *) return "$_psf_rc" ;;
+            esac
+        fi
+    done
+
+    if (( _psf_saw_capacity )); then
+        printf -v "$_psf_out_plan" 'NO_CAPACITY'
+        return 89
+    fi
+    if (( _psf_saw_policy_block )); then
+        printf -v "$_psf_out_plan" 'BLOCKED_POLICY'
+        return 88
+    fi
+    printf -v "$_psf_out_plan" 'NO_ELIGIBLE_CANDIDATE'
+    return 89
+}
+
+# ============================================================================
+# 13e. PLACEMENT -> MIGRATION CUTOVER E2E ABI v1
+# ============================================================================
+# Planning remains read-only.  This explicit execute boundary is the first point
+# allowed to mutate placement/migration state.
+#
+# Candidate format remains MACHINE_ID:SCHEDULER_NAMESPACE.
+#
+# Results:
+#   LOCAL    -> source OBJECT remains authoritative; no migration transaction.
+#   MIGRATED -> selected remote scheduler is passed to the existing transactional
+#               migration_cutover_with_worker() path.
+#
+# API:
+# placement_execute_first_fit \
+#   OUT_ACTION OUT_MACHINE OUT_SCHED OUT_NS OUT_OBJ_ID \
+#   AS OBJECT LOCAL_MACHINE CPU MEMORY BUNDLE_DIR CANDIDATE...
+
+placement_execute_first_fit() {
+    [ $# -ge 12 ] || return 64
+    local _pef_out_action="$1" _pef_out_machine="$2" _pef_out_sched="$3"
+    local _pef_out_ns="$4" _pef_out_obj_id="$5"
+    local _pef_as="$6" _pef_obj="$7" _pef_local_machine="$8"
+    local _pef_cpu="$9" _pef_memory="${10}" _pef_bundle_dir="${11}"
+    shift 11
+
+    [[ "$_pef_out_action" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_out_machine" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_out_sched" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_out_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_out_obj_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$_pef_as" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_obj" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_pef_local_machine" =~ ^[A-Za-z0-9_.-]+$ ]] || return 71
+    [[ "$_pef_cpu" =~ ^[0-9]+$ && "$_pef_memory" =~ ^[0-9]+$ ]] || return 64
+    (($# > 0)) || return 64
+
+    local -n _pef_smap="${_pef_as}_DECL_SLOT"
+    [[ -v "_pef_smap[$_pef_obj]" ]] || return 3
+    local _pef_source_ns="${_pef_smap[$_pef_obj]}"
+    local _pef_source_obj_id_var="${_pef_source_ns}_OBJECT_ID"
+    local _pef_source_obj_id="${!_pef_source_obj_id_var:-}"
+    [[ -n "$_pef_source_obj_id" ]] || return 71
+
+    local _pef_machine="" _pef_sched="" _pef_plan=""
+    local _pef_destination_ns="" _pef_destination_obj_id=""
+
+    # This call is deliberately the complete read-only planning phase.
+    placement_select_first_fit _pef_machine _pef_sched _pef_plan \
+        "$_pef_source_ns" "$_pef_local_machine" "$_pef_cpu" "$_pef_memory" "$@" || return $?
+
+    if [[ "$_pef_machine" == "$_pef_local_machine" ]]; then
+        printf -v "$_pef_out_action" '%s' LOCAL
+        printf -v "$_pef_out_machine" '%s' "$_pef_machine"
+        printf -v "$_pef_out_sched" '%s' "$_pef_sched"
+        printf -v "$_pef_out_ns" '%s' "$_pef_source_ns"
+        printf -v "$_pef_out_obj_id" '%s' "$_pef_source_obj_id"
+        return 0
+    fi
+
+    # All state mutation starts here and is delegated to the already
+    # transactional cutover implementation.
+    migration_cutover_with_worker _pef_destination_ns _pef_destination_obj_id \
+        "$_pef_as" "$_pef_obj" "$_pef_sched" "$_pef_cpu" "$_pef_memory" \
+        "$_pef_bundle_dir" || return $?
+
+    printf -v "$_pef_out_action" '%s' MIGRATED
+    printf -v "$_pef_out_machine" '%s' "$_pef_machine"
+    printf -v "$_pef_out_sched" '%s' "$_pef_sched"
+    printf -v "$_pef_out_ns" '%s' "$_pef_destination_ns"
+    printf -v "$_pef_out_obj_id" '%s' "$_pef_destination_obj_id"
+}
+
+
+
+# ============================================================================
+# 13f. HOST_SHUTDOWN EVACUATION ABI v1
+# ============================================================================
+# MACHINE shutdown evacuation is a two-phase operation:
+#
+#   PREFLIGHT (read-only)
+#     - every declared OBJECT must be remotely migratable
+#     - LOCAL candidates are ignored: shutdown cannot evacuate onto itself
+#     - destination capacity is tracked in a shadow ledger so aggregate demand
+#       is validated before the first mutation
+#
+#   EXECUTE
+#     - follows the frozen preflight plan
+#     - each OBJECT uses the existing transactional migration cutover
+#
+# Static blockers therefore fail-before-mutate. Runtime failures during execute
+# retain the existing per-OBJECT rollback semantics; v1 does not reverse already
+# completed earlier OBJECT migrations.
+#
+# Return codes:
+#   88  EVACUATION_BLOCKED by migration/resource policy
+#   89  EVACUATION_BLOCKED by destination capacity / no remote candidate
+#
+# API:
+# host_shutdown_evacuation \
+#   OUT_STATUS AS LOCAL_MACHINE CPU_PER_OBJECT MEMORY_PER_OBJECT BUNDLE_ROOT \
+#   CANDIDATE...
+
+host_shutdown_evacuation() {
+    [ $# -ge 7 ] || return 64
+    local _hse_out_status="$1" _hse_as="$2" _hse_local_machine="$3"
+    local _hse_cpu="$4" _hse_memory="$5" _hse_bundle_root="$6"
+    shift 6
+
+    [[ "$_hse_out_status" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_hse_as" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$_hse_local_machine" =~ ^[A-Za-z0-9_.-]+$ ]] || return 71
+    [[ "$_hse_cpu" =~ ^[0-9]+$ && "$_hse_memory" =~ ^[0-9]+$ ]] || return 64
+    (($# > 0)) || return 64
+
+    local -n _hse_objs="${_hse_as}_DECL_OBJECTS"
+    local -n _hse_smap="${_hse_as}_DECL_SLOT"
+    ((${#_hse_objs[@]} > 0)) || {
+        printf -v "$_hse_out_status" '%s' EVACUATED
+        return 0
+    }
+
+    local -a _hse_candidates=("$@")
+    local -A _hse_shadow_cpu=() _hse_shadow_mem=()
+    local -A _hse_plan_machine=() _hse_plan_sched=()
+    local _hse_candidate _hse_machine="" _hse_sched=""
+    local _hse_cpu_total_var _hse_cpu_reserved_var _hse_mem_total_var _hse_mem_reserved_var
+    local _hse_avail_cpu _hse_avail_mem
+
+    # Seed a read-only shadow ledger from each distinct remote scheduler.
+    for _hse_candidate in "${_hse_candidates[@]}"; do
+        placement_candidate_parse "$_hse_candidate" _hse_machine _hse_sched || return $?
+        [[ "$_hse_machine" != "$_hse_local_machine" ]] || continue
+        [[ -v "_hse_shadow_cpu[$_hse_sched]" ]] && continue
+        declare -F "${_hse_sched}_scheduler_can_fit" >/dev/null 2>&1 || return 66
+        _hse_cpu_total_var="${_hse_sched}_CPU_TOTAL"
+        _hse_cpu_reserved_var="${_hse_sched}_CPU_RESERVED"
+        _hse_mem_total_var="${_hse_sched}_MEMORY_TOTAL"
+        _hse_mem_reserved_var="${_hse_sched}_MEMORY_RESERVED"
+        _hse_avail_cpu=$(( ${!_hse_cpu_total_var:-0} - ${!_hse_cpu_reserved_var:-0} ))
+        _hse_avail_mem=$(( ${!_hse_mem_total_var:-0} - ${!_hse_mem_reserved_var:-0} ))
+        _hse_shadow_cpu["$_hse_sched"]="$_hse_avail_cpu"
+        _hse_shadow_mem["$_hse_sched"]="$_hse_avail_mem"
+    done
+
+    # PREFLIGHT: migration policy + aggregate remote capacity.
+    local _hse_obj _hse_ns _hse_policy_plan="" _hse_policy_rc=0 _hse_found=0
+    for _hse_obj in "${_hse_objs[@]}"; do
+        _hse_ns="${_hse_smap[$_hse_obj]}"
+        _hse_policy_plan=""
+        _hse_policy_rc=0
+        migration_policy_plan _hse_policy_plan "$_hse_ns" || _hse_policy_rc=$?
+        if (( _hse_policy_rc != 0 )); then
+            if (( _hse_policy_rc == 88 )); then
+                printf -v "$_hse_out_status" 'EVACUATION_BLOCKED object=%s reason=POLICY %s' \
+                    "$_hse_obj" "$_hse_policy_plan"
+            fi
+            return "$_hse_policy_rc"
+        fi
+
+        _hse_found=0
+        for _hse_candidate in "${_hse_candidates[@]}"; do
+            placement_candidate_parse "$_hse_candidate" _hse_machine _hse_sched || return $?
+            [[ "$_hse_machine" != "$_hse_local_machine" ]] || continue
+            if (( ${_hse_shadow_cpu[$_hse_sched]:-0} >= _hse_cpu &&
+                  ${_hse_shadow_mem[$_hse_sched]:-0} >= _hse_memory )); then
+                _hse_plan_machine["$_hse_obj"]="$_hse_machine"
+                _hse_plan_sched["$_hse_obj"]="$_hse_sched"
+                _hse_shadow_cpu["$_hse_sched"]=$(( ${_hse_shadow_cpu[$_hse_sched]} - _hse_cpu ))
+                _hse_shadow_mem["$_hse_sched"]=$(( ${_hse_shadow_mem[$_hse_sched]} - _hse_memory ))
+                _hse_found=1
+                break
+            fi
+        done
+        if (( !_hse_found )); then
+            printf -v "$_hse_out_status" 'EVACUATION_BLOCKED object=%s reason=NO_CAPACITY' "$_hse_obj"
+            return 89
+        fi
+    done
+
+    # EXECUTE: the complete preflight succeeded. Follow the frozen plan.
+    mkdir -p "$_hse_bundle_root" || return
+    local _hse_dest_ns="" _hse_dest_obj_id="" _hse_bundle
+    for _hse_obj in "${_hse_objs[@]}"; do
+        _hse_sched="${_hse_plan_sched[$_hse_obj]}"
+        _hse_bundle="$_hse_bundle_root/$_hse_obj"
+        _hse_dest_ns=""
+        _hse_dest_obj_id=""
+        migration_cutover_with_worker _hse_dest_ns _hse_dest_obj_id \
+            "$_hse_as" "$_hse_obj" "$_hse_sched" "$_hse_cpu" "$_hse_memory" \
+            "$_hse_bundle" || {
+                local _hse_rc=$?
+                printf -v "$_hse_out_status" 'EVACUATION_FAILED object=%s machine=%s scheduler=%s rc=%s' \
+                    "$_hse_obj" "${_hse_plan_machine[$_hse_obj]}" "$_hse_sched" "$_hse_rc"
+                return "$_hse_rc"
+            }
+    done
+
+    printf -v "$_hse_out_status" '%s' EVACUATED
 }
