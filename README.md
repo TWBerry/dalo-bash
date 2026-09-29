@@ -16,9 +16,9 @@ DALO compiler
 async_script.bash
 ```
 
-`.dalo` is the human-readable PROJECT source format. JSON descriptors define compile-time object, worker, and feature ABIs. The compiler lowers a PROJECT into a standalone Bash MACHINE.
+`.dalo` is the human-readable PROJECT source format. JSON descriptors define compile-time object, worker, feature, and INIT ABIs. The compiler resolves their dependency closures and lowers a PROJECT into a standalone Bash MACHINE.
 
-The current development snapshot contains Object Definition ABI v1 and the first formal object descriptors: ORIGIN, PIPE, ENDPOINT, T, Y, and BIFURCATOR.
+The current development snapshot includes declarative OBJECT/WORKER/FEATURE definitions, Declarative INIT ABI v1, standalone runtime dependency/artifact linking, BRIDGE transport, migration support, and dynamic MACHINE discovery.
 
 ## Repository layout
 
@@ -27,6 +27,7 @@ The current development snapshot contains Object Definition ABI v1 and the first
 - `definitions/objects/` — Object Definition ABI descriptors
 - `definitions/workers/` — Worker Definition ABI descriptors
 - `definitions/features/` — Feature Definition ABI descriptors
+- `definitions/init/` — INIT descriptors and `artifacts/` containing INIT Bash implementations
 - `examples/` — `.dalo` PROJECT examples
 - `tests/` — validation/runtime tests
 - `docs/` — architecture documentation

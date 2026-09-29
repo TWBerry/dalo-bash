@@ -77,7 +77,35 @@ The current version syntax is:
 The PROJECT header is metadata for the complete logical program. It is
 not an OBJECT.
 
-## 3. OBJECT declarations
+## 3. PROJECT INIT declarations
+
+A PROJECT may request one or more declarative startup initializers with
+repeatable `INIT` lines:
+
+``` text
+PROJECT
+<TAB>NAME example
+<TAB>VERSION 1.0
+<TAB>INIT cluster_init
+```
+
+`INIT <name>` references `definitions/init/<name>.json`; it is not a raw
+Bash function name. INIT descriptors select an artifact/entry point and
+may declare `requires` and `runtime_requires`. Dependencies are inserted
+automatically, deduplicated, and executed dependency-first. For example,
+current cluster startup resolves conceptually as:
+
+``` text
+cluster_init
+    └── discovery
+          └── python
+
+execution: python → discovery → cluster_init
+```
+
+INIT execution occurs before worker lifecycle `start`.
+
+## 4. OBJECT declarations
 
 An object is declared by name:
 
@@ -110,7 +138,7 @@ This is a deliberate design rule:
 
 > Syntax recognizes fields; descriptors define object semantics.
 
-## 4. Instance fields
+## 5. Instance fields
 
 Object descriptors may declare `instance_fields`.
 
@@ -134,7 +162,7 @@ constraints. Current semantics include:
 The compiler validates the values against the descriptor rather than
 embedding COLUMN-specific field rules in the parser.
 
-## 5. Ports
+## 6. Ports
 
 Fixed object types may declare explicit ports in their descriptor.
 
@@ -175,7 +203,7 @@ but must reject an out-of-range port such as `col1.in3` or `col1.out4`.
 
 Port validation is compiler-side.
 
-## 6. Every OBJECT has worker capability
+## 7. Every OBJECT has worker capability
 
 The current architecture treats worker capability as a property of every
 object type, including structural objects.
@@ -192,7 +220,7 @@ with worker requirements expressed by the descriptor.
 The compiler must not infer worker capability from hard-coded type
 names.
 
-## 7. Nested WORKER block
+## 8. Nested WORKER block
 
 A PROJECT can attach worker implementation information to an object:
 
@@ -269,7 +297,7 @@ TYPE       = linkage
 EXECUTION  = runtime execution mode
 ```
 
-## 8. Execution semantics
+## 9. Execution semantics
 
 ### INLINE
 
@@ -296,7 +324,7 @@ control                           per-OBJECT FIFO
 
 The object FIFO is not a parent→child DATA queue.
 
-## 9. DATA vectors
+## 10. DATA vectors
 
 The canonical port-aware DATA representation is:
 
@@ -316,7 +344,7 @@ object_summon_worker input_port DATA...
 
 Port identity must not be discarded by aliases or scalar shortcuts.
 
-## 10. CONNECT
+## 11. CONNECT
 
 A logical edge connects an output port to an input port.
 
@@ -333,7 +361,7 @@ The compiler lowers logical connection syntax into canonical EDGE
 records. The generated MACHINE does not need to retain the original
 source spelling.
 
-## 11. `VIA`
+## 12. `VIA`
 
 `VIA` expresses an intermediate object/port while preserving a
 human-readable topology description.
@@ -384,7 +412,7 @@ Chained VIA expressions are an intended language capability, but
 implementations must validate actual parser/lowering support before
 relying on arbitrarily long adjacent VIA chains.
 
-## 12. COLUMN
+## 13. COLUMN
 
 COLUMN is the generalized N-input/M-output worker object.
 
@@ -418,7 +446,7 @@ destination_summon_worker inK DATA
 T, Y, and BIFURCATOR remain useful semantic/convenience object types
 even where a sufficiently general COLUMN could reproduce their shape.
 
-## 13. PROJECT quiescence
+## 14. PROJECT quiescence
 
 A compiled MACHINE provides PROJECT-level waiting semantics in addition
 to object-local job-pool waits.
@@ -446,7 +474,7 @@ sink_wait
 Such manual ordering is incorrect when upstream completion can create
 downstream work after a downstream object was previously observed idle.
 
-## 14. Feature resolution
+## 15. Feature resolution
 
 Object descriptors declare features. Feature descriptors declare
 dependencies.
@@ -466,7 +494,7 @@ hard-code rules such as "T implies worker."
 This allows descriptor changes to change required feature closure
 without parser changes.
 
-## 15. Resource declarations: architectural PROJECT syntax
+## 16. Resource declarations: architectural PROJECT syntax
 
 The following forms are part of the current architectural direction for
 the resource/distributed stages and should be treated as reserved until
@@ -510,7 +538,7 @@ ALLOW_REMOTE_ANTS       remote → local
 ALLOW_ANTS_REMOTE_EXEC  local → remote
 ```
 
-## 16. ORCHESTRATOR and SCHEDULER roles
+## 17. ORCHESTRATOR and SCHEDULER roles
 
 The architecture distinguishes two control authorities.
 
@@ -544,7 +572,7 @@ Exact `.dalo` declaration syntax for these system objects should be
 finalized with their compiler descriptors rather than guessed by the
 parser.
 
-## 17. Complete current-style example
+## 18. Complete current-style example
 
 ``` text
 PROJECT
@@ -604,7 +632,7 @@ The generated MACHINE embeds the linked worker code and required runtime
 implementation so that the standalone artifact does not need compiler
 JSON descriptors or `jq` at runtime.
 
-## 18. Format design rules
+## 19. Format design rules
 
 The format follows several long-term rules:
 
@@ -621,3 +649,37 @@ The format follows several long-term rules:
     silently approximated.
 8.  Distributed/resource syntax must preserve the ORCHESTRATOR/SCHEDULER
     authority split.
+
+
+## 20. BRIDGE transport identity and discovery
+
+A BRIDGE uses stable globally unique TCP port numbers as MACHINE transport
+identities. Persistent IP addresses are deliberately not part of PROJECT
+identity because a MACHINE may move between addresses. Current BRIDGE
+instance fields therefore use:
+
+``` text
+PORT <local-stable-port>
+PEER_PORT <remote-stable-port>
+```
+
+`HOST`, persistent IP addresses, and a separate `MACHINE_ID` are not part
+of this ABI. The stable port itself is the MACHINE transport identity.
+`PORT`/`PEER_PORT` are transport metadata and must not be confused with
+OBJECT DATA input/output ports.
+
+The `cluster_init` INIT gathers local `PORT` values and remote `PEER_PORT`
+values from generated PROJECT metadata. Its `discovery` dependency obtains
+the active local IPv4 `/24`. Discovery scans the 256 addresses in that
+range against unresolved remote ports. Once a remote port is found and
+validated, it is removed from the remaining scan and the runtime registry
+records:
+
+``` text
+stable PORT → current IPv4 address
+```
+
+Local BRIDGE ports are excluded from the pre-start scan because BRIDGE
+listeners are started only after the INIT chain completes.
+
+## 21. Current semantic rules

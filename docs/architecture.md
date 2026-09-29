@@ -719,18 +719,34 @@ is not a telemetry database.
 Runtime resource/telemetry values are queried when decisions are made
 rather than continuously embedded into structural identity.
 
-## 20. Bridge and remote control boundary
+## 20. Bridge, MACHINE identity, and discovery
 
-Different MACHINEs communicate through a bridge/network layer.
+Different MACHINEs communicate through declarative BRIDGE objects. DATA
+and CONTROL remain distinct, and BRIDGE is an ordinary descriptor-driven
+OBJECT/WORKER rather than a compiler special case.
 
-DATA and CONTROL remain distinct.
+A MACHINE's stable transport identity is its globally unique BRIDGE TCP
+port. IP addresses are dynamic runtime locations and are not persistent
+identity. BRIDGE instances therefore carry `PORT` for the local stable
+identity and `PEER_PORT` for the remote stable identity; `HOST`, a separate
+`MACHINE_ID`, and persistent peer IP configuration are intentionally absent.
 
-Remote CONTROL must pass a capability/authority boundary before reaching
-a local object's FIFO dispatcher. Local FIFO framing does not itself
-provide cryptographic authentication.
+Before BRIDGE worker lifecycle start, Declarative INIT resolves startup
+dependencies. The current cluster chain is:
 
-Sender identity, target identity, capability, and requested operation
-belong to the remote control model.
+``` text
+python → discovery → cluster_init → worker lifecycle start
+```
+
+Discovery determines the active local IPv4 `/24`, scans its 256 addresses
+for unresolved remote stable ports, removes each successfully discovered
+port from subsequent probes, and builds a runtime `PORT → current IP`
+registry. Local BRIDGE ports are excluded because their listeners do not
+start until the INIT chain completes.
+
+Remote CONTROL must still pass a capability/authority boundary before
+reaching a local object's FIFO dispatcher. Local FIFO framing does not
+itself provide cryptographic authentication.
 
 ## 21. Compiler architecture
 
@@ -744,6 +760,8 @@ parser
 IR
   ↓
 definition validation
+  ↓
+INIT dependency closure + artifact/runtime dependency resolution
   ↓
 CONNECT/VIA lowering
   ↓
@@ -770,6 +788,7 @@ Current mandatory metadata:
 PROJECT
     NAME example
     VERSION 1.0
+    INIT cluster_init
 ```
 
 Objects are nested declarations:
@@ -826,6 +845,8 @@ The following major pieces are already established or runtime-validated:
 -   canonical generated-code storage/metafunction model;
 -   Object Definition ABI v1;
 -   Feature Definition ABI v1 with JSON-driven closure;
+-   Declarative INIT ABI v1 with automatic dependency closure;
+-   stable-port MACHINE identity and dynamic `/24` discovery;
 -   compiler/runtime module separation;
 -   canonical compiler IR;
 -   CONNECT/VIA lowering checkpoint;

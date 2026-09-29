@@ -157,6 +157,7 @@ Loads and validates JSON descriptors from:
 definitions/features/*.json
 definitions/objects/*.json
 definitions/workers/*.json
+definitions/init/*.json
 ```
 
 Current ABI constants include:
@@ -165,6 +166,7 @@ Current ABI constants include:
 DALO_OBJECT_DEFINITION_ABI=1
 DALO_FEATURE_DEFINITION_ABI=1
 DALO_WORKER_DEFINITION_ABI=1
+DALO_INIT_DEFINITION_ABI=1
 ```
 
 The loader must tolerate an empty descriptor class correctly: unmatched
@@ -226,6 +228,7 @@ The linker is responsible for:
 
 -   namespace/object materialization;
 -   worker source linkage;
+-   INIT dependency closure, artifact linkage, and ordered startup;
 -   execution-mode selection;
 -   canonical edge routing;
 -   embedding required runtime/helper code;
@@ -278,6 +281,36 @@ execution mode.
 
 Worker source validation occurs at compile time. A standalone MACHINE
 must not need the source tree after successful inline linkage.
+
+### 5.4 Declarative INIT ABI v1
+
+PROJECT startup extensions are defined under `definitions/init/`. An INIT
+descriptor names its Bash artifact and entry point and may declare both
+INIT dependencies and runtime-library requirements. A typical descriptor
+contains:
+
+``` json
+{
+  "abi": 1,
+  "name": "cluster_init",
+  "artifact": "artifacts/cluster_init.bash",
+  "entry": "cluster_init",
+  "requires": ["discovery"],
+  "runtime_requires": []
+}
+```
+
+The linker computes the transitive INIT dependency closure, deduplicates
+entries, detects dependency cycles, and emits dependencies before their
+consumers while preserving declared order between independent INITs. INIT
+artifacts and their runtime requirements are linked into the standalone
+MACHINE generically; the compiler does not contain discovery-, Python-,
+or BRIDGE-specific branches.
+
+Generated INIT entry points run after standard MACHINE construction and
+routing materialization but before worker lifecycle `start`. This allows
+network/discovery initialization to prepare runtime state before a BRIDGE
+opens its listener or connects to a peer.
 
 ## 6. Worker linkage
 

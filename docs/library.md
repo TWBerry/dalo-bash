@@ -246,6 +246,20 @@ include compression
 
 The application does not need to include transitive dependencies itself.
 
+### Optional library initialization and artifacts
+
+A library may declare an optional `DALO_LIBRARY_INIT` entry point. The
+loader invokes it only after dependencies have loaded successfully and
+marks the library loaded only after successful initialization. This keeps
+initialization dependency-first and once-per-library.
+
+Libraries that require non-Bash companion files may declare them through
+`DALO_LIBRARY_ARTIFACTS`. Standalone linking materializes declared artifacts
+into the MACHINE private runtime area. Code should resolve them through the
+generic runtime artifact lookup API rather than assuming they remain beside
+`BASH_SOURCE`. The persistent Python runtime uses this mechanism for its
+supervisor artifact.
+
 ## Compiler use
 
 The DALO compiler follows the same loading discipline. The compiler
