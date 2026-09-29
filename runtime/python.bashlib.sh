@@ -4,6 +4,7 @@ DALO_LIBRARY_NAME="python"
 DALO_LIBRARY_VERSION="1.1.0"
 DALO_LIBRARY_REQUIRES=""
 DALO_LIBRARY_INIT="python_init"
+DALO_LIBRARY_FINI="python_shutdown"
 DALO_LIBRARY_ARTIFACTS="python_supervisor.py"
 [ "${DALO_PYTHON_INCLUDE:-0}" -eq 0 ] || return 0
 DALO_PYTHON_INCLUDE=1
@@ -31,6 +32,46 @@ python_init(){
  exec {DALO_PY_INFD}<>"$DALO_PY_SESSION/in"; exec {DALO_PY_OUTFD}<>"$DALO_PY_SESSION/out"
  # REGISTER is deliberately the only shared-FIFO record and remains far below PIPE_BUF.
  printf 'REGISTER|%s|%s|%s\n' "$BASHPID" "$DALO_PY_SESSION/in" "$DALO_PY_SESSION/out" >"$DALO_PY_ROOT/request.fifo"
+}
+
+python_shutdown(){
+ [ -n "${DALO_PY_ROOT:-}" ] || return 0
+ local instance reply supervisor_pid='' rc=0 i
+ if [ -r "$DALO_PY_ROOT/supervisor.pid" ];then IFS= read -r supervisor_pid <"$DALO_PY_ROOT/supervisor.pid" || supervisor_pid=''; fi
+ if [ -r "$DALO_PY_ROOT/ready" ] && [ -n "${DALO_PY_INFD:-}" ] && [ -n "${DALO_PY_OUTFD:-}" ];then
+  IFS= read -r instance <"$DALO_PY_ROOT/ready" || instance=''
+  if [ -n "$instance" ];then
+   reply=''; __python_request "SHUTDOWN|$instance"$'\n' reply || rc=$?
+   [[ "$reply" == OK\|SHUTDOWN\|* ]] || rc=1
+  fi
+ fi
+ if [ -n "${DALO_PY_INFD:-}" ];then eval "exec ${DALO_PY_INFD}>&-" 2>/dev/null || true; unset DALO_PY_INFD; fi
+ if [ -n "${DALO_PY_OUTFD:-}" ];then eval "exec ${DALO_PY_OUTFD}>&-" 2>/dev/null || true; unset DALO_PY_OUTFD; fi
+ # SHUTDOWN ACK means worker teardown completed, but the supervisor still has to
+ # leave its request loop and remove the runtime endpoint.  FINI must not return
+ # until that externally observable teardown is complete, including when this
+ # shell reused a supervisor and therefore has no DALO_PY_SUPERVISOR_PID.
+ for((i=0;i<500;i++));do
+  [ ! -e "$DALO_PY_ROOT/ready" ] && [ ! -e "$DALO_PY_ROOT/request.fifo" ] && break
+  sleep .01
+ done
+ if [ -e "$DALO_PY_ROOT/ready" ] || [ -e "$DALO_PY_ROOT/request.fifo" ];then
+  printf 'python_shutdown: supervisor teardown timed out: %s\n' "$DALO_PY_ROOT" >&2
+  rc=1
+ fi
+ # Endpoint removal precedes process exit by a few instructions.  Poll the PID
+ # captured before SHUTDOWN so FINI is a process-death barrier even for a reused
+ # supervisor that is not a child of this Bash process.
+ if [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]];then
+  for((i=0;i<500;i++));do kill -0 "$supervisor_pid" 2>/dev/null || break; sleep .01; done
+  if kill -0 "$supervisor_pid" 2>/dev/null;then
+   printf 'python_shutdown: supervisor process did not exit: pid=%s\n' "$supervisor_pid" >&2
+   rc=1
+  fi
+ fi
+ if [ -n "${DALO_PY_SUPERVISOR_PID:-}" ];then wait "$DALO_PY_SUPERVISOR_PID" 2>/dev/null || true; fi
+ unset DALO_PY_SESSION DALO_PY_SUPERVISOR_PID
+ return "$rc"
 }
 __python_request(){
  local payload="$1" outvar="${2:-}" rid="$(( (BASHPID << 32) ^ (RANDOM << 16) ^ RANDOM ))" delim marker h v typ rr plen response

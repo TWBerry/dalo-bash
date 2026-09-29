@@ -7,9 +7,11 @@ worker_start() {
     [[ "${!init_var:-0}" == 1 ]] && return 0
     declare -F init_python_thread >/dev/null 2>&1 || { printf 'BRIDGE[%s]: python runtime is not loaded\n' "$ns" >&2; return 69; }
     define_comm_api "$ns" || return
+    define_fifo_api "$ns" || return
     define_tcp_capability_gate "$ns" || return
     local mode_var="${ns}_FIELD_MODE" port_var="${ns}_FIELD_PORT" peer_var="${ns}_FIELD_PEER_PORT"
-    local mode="${!mode_var:-}" port="${!port_var:-}" peer="${!peer_var:-}" host endpoint
+    local mode="${!mode_var:-}" port="${!port_var:-}" peer="${!peer_var:-}" host endpoint local_port
+    local_port="$port"
     [[ -n "$mode" && -n "$port" ]] || { printf 'BRIDGE[%s]: incomplete descriptor fields\n' "$ns" >&2; return 64; }
     case "$mode" in
         listen)
@@ -22,7 +24,7 @@ worker_start() {
             ;;
         *) return 64;;
     esac
-    "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" "$peer" || return
+    "${ns}_tcp_init" "$mode" "$host" "$port" "$local_port" "$peer" || return
     printf -v "$init_var" '%s' 1
 }
 worker_poll() {

@@ -4163,7 +4163,7 @@ __NS___tcp_init() {
     __NS___bridge_python_quote qmode "$mode" || return
     __NS___bridge_python_quote qlocal "$local_id" || return
     __NS___bridge_python_quote qpeer "$peer_id" || return
-    code="import socket, struct
+    code="import socket, struct, time
 _dalo_bridge_mode=$qmode
 _dalo_bridge_local_id=$qlocal
 _dalo_bridge_peer_id=$qpeer
@@ -4171,29 +4171,64 @@ _dalo_bridge_server=None
 _dalo_bridge_sock=None
 _dalo_bridge_host=$qhost
 _dalo_bridge_port=int($port)
+def _dalo_rxline(_s,_limit=256):
+    _b=b''
+    while len(_b)<_limit:
+        _c=_s.recv(1)
+        if not _c: raise EOFError('bridge peer closed during handshake')
+        if _c==b'\n': return _b.decode('ascii')
+        _b+=_c
+    raise ValueError('bridge handshake too long')
+def _dalo_bridge_connect():
+    global _dalo_bridge_sock
+    _s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    _last=None
+    for _i in range(100):
+        try:
+            _s.connect((_dalo_bridge_host,_dalo_bridge_port)); _last=None; break
+        except OSError as _e:
+            _last=_e; time.sleep(0.01)
+    if _last is not None:
+        _s.close(); raise _last
+    _src=str(_dalo_bridge_local_id); _dst=str(_dalo_bridge_peer_id)
+    _s.sendall(('DALO-BRIDGE|1|OPEN|%s|%s\n'%(_src,_dst)).encode('ascii'))
+    _dalo_bridge_sock=_s
+    return _s
 if _dalo_bridge_mode == 'listen':
     _dalo_bridge_server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     _dalo_bridge_server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
     _dalo_bridge_server.bind((_dalo_bridge_host,_dalo_bridge_port))
-    _dalo_bridge_server.listen(1)
+    _dalo_bridge_server.listen(8)
 def _dalo_bridge_ensure(_timeout=0):
     global _dalo_bridge_sock
     if _dalo_bridge_sock is not None: return _dalo_bridge_sock
-    if _dalo_bridge_mode == 'listen':
-        _dalo_bridge_server.settimeout(None if float(_timeout)==0 else float(_timeout))
-        _dalo_bridge_sock,_=_dalo_bridge_server.accept()
-    else:
-        _dalo_bridge_sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-        _last=None
-        for _i in range(100):
-            try:
-                _dalo_bridge_sock.connect((_dalo_bridge_host,_dalo_bridge_port)); _last=None; break
-            except OSError as _e:
-                _last=_e; time.sleep(0.01)
-        if _last is not None: raise _last
-    return _dalo_bridge_sock
+    if _dalo_bridge_mode != 'listen': return _dalo_bridge_connect()
+    _dalo_bridge_server.settimeout(None if float(_timeout)==0 else float(_timeout))
+    _s,_addr=_dalo_bridge_server.accept()
+    try:
+        _hello=_dalo_rxline(_s)
+        _parts=_hello.split('|')
+        if len(_parts)==4 and _parts[:3]==['DALO-DISCOVERY','1','PROBE']:
+            _requested=_parts[3]
+            if str(_requested)==str(_dalo_bridge_local_id):
+                _s.sendall(('DALO-DISCOVERY|1|HERE|%s\n'%_dalo_bridge_local_id).encode('ascii'))
+            _s.close()
+            return None
+        if len(_parts)!=5 or _parts[:3]!=['DALO-BRIDGE','1','OPEN']:
+            raise ValueError('invalid bridge handshake')
+        _src,_dst=_parts[3],_parts[4]
+        if str(_dst)!=str(_dalo_bridge_local_id):
+            raise PermissionError('bridge destination mismatch')
+        _dalo_bridge_sock=_s
+        return _s
+    except Exception:
+        if _dalo_bridge_sock is not _s:
+            try: _s.close()
+            except Exception: pass
+        raise
 def _dalo_bridge_recv(_timeout=0):
     _s=_dalo_bridge_ensure(_timeout)
+    if _s is None: return '__DALO_DISCOVERY_HANDLED__'
     _s.settimeout(None if float(_timeout)==0 else float(_timeout))
     def _rxn(_n):
         _b=b''
@@ -4221,17 +4256,7 @@ __NS___tcp_send() {
     __NS___bridge_python_quote qraw "$raw" || return
     code="import socket, struct, time
 if _dalo_bridge_sock is None:
-    if _dalo_bridge_mode == 'listen':
-        _dalo_bridge_sock,_ = _dalo_bridge_server.accept()
-    else:
-        _dalo_bridge_sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-        _last=None
-        for _i in range(100):
-            try:
-                _dalo_bridge_sock.connect((_dalo_bridge_host,_dalo_bridge_port)); _last=None; break
-            except OSError as _e:
-                _last=_e; time.sleep(0.01)
-        if _last is not None: raise _last
+    _dalo_bridge_ensure(0)
 _b=$qraw.encode('utf-8')
 _dalo_bridge_sock.sendall(struct.pack('!Q',len(_b))+_b)
 "
@@ -4424,7 +4449,7 @@ machine_discovery_detect_base24() {
     DALO_DISCOVERY_BASE24="${ip%.*}"
     printf '%s\n' "$DALO_DISCOVERY_BASE24"
 }
-# Scan exactly BASE.0..BASE.255. PORT identities already resolved are omitted;
+# Scan usable /24 host addresses BASE.1..BASE.254. PORT identities already resolved are omitted;
 # once a port is found it is removed from the remainder of this scan.
 machine_discovery_scan24() {
     [ $# -le 1 ] || return 2
@@ -4442,11 +4467,11 @@ machine_discovery_scan24() {
     declare -F init_python_thread >/dev/null 2>&1 || return 69
     local py_handle rc=0
     py_handle="$(init_python_thread)" || return 69
-    for ((octet=0; octet<256 && ${#pending[@]}>0; octet++)); do
+    for ((octet=1; octet<=254 && ${#pending[@]}>0; octet++)); do
         ip="$base.$octet"
         for port in "${!pending[@]}"; do
-            result="$(inline_python -t "$py_handle" "__import__('socket').create_connection(('$ip',$port),0.03).close() is None" 2>/dev/null)" || continue
-            [[ "$result" == True ]] || continue
+            result="$(inline_python -t "$py_handle" "(lambda s: (s.sendall(b'DALO-DISCOVERY|1|PROBE|$port\\n'), s.settimeout(0.10), s.recv(128), s.close()))(__import__('socket').create_connection(('$ip',$port),0.03))" 2>/dev/null)" || continue
+            [[ "$result" == *"DALO-DISCOVERY|1|HERE|$port\\n"* ]] || continue
             DALO_MACHINE_IP["$port"]="$ip"
             unset 'pending['"$port"']'
         done
@@ -5130,7 +5155,7 @@ __asyncmachine_link() {
     # runtime directory by their standard DALO_LIBRARY_* metadata.
     local runtime_dir; runtime_dir="$(cd -- "$(dirname -- "$library_source")" && pwd)" || return
     local -a embedded_lib_order=()
-    local -A embedded_lib_seen=() embedded_lib_file=() embedded_lib_init=() embedded_lib_artifacts=()
+    local -A embedded_lib_seen=() embedded_lib_file=() embedded_lib_init=() embedded_lib_fini=() embedded_lib_artifacts=()
     __asyncmachine_embedded_meta() {
         local f="$1" key="$2" out="$3" line value
         line="$(grep -m1 "^${key}=" "$f")" || { printf -v "$out" '%s' ""; return 0; }
@@ -5138,16 +5163,17 @@ __asyncmachine_link() {
         printf -v "$out" '%s' "$value"
     }
     __asyncmachine_resolve_embedded_lib() {
-        local lib="$1" f req dep init arts
+        local lib="$1" f req dep init fini arts
         [[ -z "${embedded_lib_seen[$lib]:-}" ]] || return 0
         embedded_lib_seen["$lib"]=1
         f="$runtime_dir/$lib.bashlib.sh"
         [[ -r "$f" ]] || { printf 'missing runtime library: %s\n' "$lib" >&2; return 71; }
         __asyncmachine_embedded_meta "$f" DALO_LIBRARY_REQUIRES req || return
         __asyncmachine_embedded_meta "$f" DALO_LIBRARY_INIT init || return
+        __asyncmachine_embedded_meta "$f" DALO_LIBRARY_FINI fini || return
         __asyncmachine_embedded_meta "$f" DALO_LIBRARY_ARTIFACTS arts || return
         for dep in $req; do __asyncmachine_resolve_embedded_lib "$dep" || return; done
-        embedded_lib_file["$lib"]="$f"; embedded_lib_init["$lib"]="$init"; embedded_lib_artifacts["$lib"]="$arts"
+        embedded_lib_file["$lib"]="$f"; embedded_lib_init["$lib"]="$init"; embedded_lib_fini["$lib"]="$fini"; embedded_lib_artifacts["$lib"]="$arts"
         embedded_lib_order+=("$lib")
     }
     local req_lib
@@ -5196,7 +5222,7 @@ __asyncmachine_link() {
         if ((${#embedded_lib_order[@]})); then
             printf '\n# Generic embedded runtime libraries and artifacts.\n'
             printf 'DALO_MACHINE_RUNTIME_DIR="${DALO_MACHINE_RUNTIME_DIR:-${TMPDIR:-/tmp}/dalo-machine-${BASHPID}}"\nmkdir -p "$DALO_MACHINE_RUNTIME_DIR" || exit $?\nchmod 700 "$DALO_MACHINE_RUNTIME_DIR" || exit $?\ndeclare -gA DALO_LIBRARY_ARTIFACT_PATH=()\n'
-            local lib f art delim init
+            local lib f art delim init fini
             for lib in "${embedded_lib_order[@]}"; do
                 f="${embedded_lib_file[$lib]}"; delim="__DALO_LIB_${lib//[^A-Za-z0-9]/_}_${project_hash:0:12}__"
                 printf '%s\n' "cat >\"\$DALO_MACHINE_RUNTIME_DIR/$lib.bashlib.sh\" <<'$delim'"
@@ -5214,6 +5240,17 @@ __asyncmachine_link() {
                 init="${embedded_lib_init[$lib]}"
                 [[ -z "$init" ]] || printf '%s || exit $?\n' "$init"
             done
+            printf 'declare -ga DALO_MACHINE_LIBRARY_FINI_ORDER=('
+            for lib in "${embedded_lib_order[@]}"; do printf ' %q' "$lib"; done
+            printf ' )\ndeclare -gA DALO_MACHINE_LIBRARY_FINI=()\n'
+            for lib in "${embedded_lib_order[@]}"; do
+                fini="${embedded_lib_fini[$lib]}"
+                printf 'DALO_MACHINE_LIBRARY_FINI[%q]=%q\n' "$lib" "$fini"
+            done
+            printf 'DALO_MACHINE_LIBRARY_FINI_DONE=0\n'
+            printf 'async_machine_library_fini_all() { [[ "$DALO_MACHINE_LIBRARY_FINI_DONE" -eq 0 ]] || return 0; DALO_MACHINE_LIBRARY_FINI_DONE=1; local i lib fini rc=0 one_rc; for ((i=${#DALO_MACHINE_LIBRARY_FINI_ORDER[@]}-1;i>=0;i--)); do lib="${DALO_MACHINE_LIBRARY_FINI_ORDER[i]}"; fini="${DALO_MACHINE_LIBRARY_FINI[$lib]:-}"; [[ -n "$fini" ]] || continue; one_rc=0; "$fini" || one_rc=$?; ((one_rc==0)) || rc=$one_rc; done; return "$rc"; }\n'
+        else
+            printf 'async_machine_library_fini_all() { return 0; }\n'
         fi
         printf '\n# ============================================================================\n# GENERATED MACHINE IMAGE\n# ============================================================================\n'
         printf 'ASYNC_MACHINE_ABI=2\nASYNC_MACHINE_PROJECT_SHA256=%q\nASYNC_MACHINE_NAME=%q\n' "$project_hash" "$project"
@@ -5533,7 +5570,9 @@ __asyncmachine_link() {
     done
     {
         printf '  return "$__rc"; }\n'
-        printf 'trap async_machine_worker_stop_all EXIT INT TERM\n'
+        printf 'ASYNC_MACHINE_DESTROYED=0\n'
+        printf 'async_machine_destroy() { [[ "$ASYNC_MACHINE_DESTROYED" -eq 0 ]] || return 0; ASYNC_MACHINE_DESTROYED=1; local __rc=0 __x=0; async_machine_worker_stop_all || __rc=$?; async_machine_library_fini_all || { __x=$?; ((__rc==0)) && __rc=$__x; }; return "$__rc"; }\n'
+        printf 'trap async_machine_destroy EXIT INT TERM\n'
         printf 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then async_machine_main "$@"; fi\n'
     } >>"$out"
     chmod +x "$out"

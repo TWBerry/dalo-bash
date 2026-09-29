@@ -12,6 +12,8 @@ DALO_LIBRARY_PATH="${DALO_LIBRARY_PATH:-.}"
 declare -gA DALO_LIBRARY_LOADED=()
 declare -gA DALO_LIBRARY_LOADED_FILE=()
 declare -ga DALO_LIBRARY_LOAD_ORDER=()
+declare -gA DALO_LIBRARY_FINI=()
+declare -g DALO_LIBRARY_FINI_DONE=0
 
 __dalo_loader_error() { printf 'library.sh: %s\n' "$*" >&2; }
 
@@ -45,8 +47,8 @@ __dalo_metadata() {
 # Resolve and validate one dependency closure. Nothing is sourced here.
 __dalo_resolve() {
     local name="$1" chain="${2:-}" file declared abi requires dep state
-    local state_name="$3" file_name="$4" order_name="$5" init_name="$6"
-    local -n _state="$state_name" _file="$file_name" _order="$order_name" _init="$init_name"
+    local state_name="$3" file_name="$4" order_name="$5" init_name="$6" fini_name="$7"
+    local -n _state="$state_name" _file="$file_name" _order="$order_name" _init="$init_name" _fini="$fini_name"
 
     # Already loaded in this shell: dependency is satisfied immediately.
     if [ "${DALO_LIBRARY_LOADED[$name]:-0}" -eq 1 ]; then
@@ -90,9 +92,10 @@ __dalo_resolve() {
 
     requires="$(__dalo_metadata "$file" DALO_LIBRARY_REQUIRES)" || requires=''
     _init["$name"]="$(__dalo_metadata "$file" DALO_LIBRARY_INIT)" || _init["$name"]=''
+    _fini["$name"]="$(__dalo_metadata "$file" DALO_LIBRARY_FINI)" || _fini["$name"]=''
     _file["$name"]="$file"
     for dep in $requires; do
-        __dalo_resolve "$dep" "${chain}${name} -> " "$state_name" "$file_name" "$order_name" "$init_name" || return
+        __dalo_resolve "$dep" "${chain}${name} -> " "$state_name" "$file_name" "$order_name" "$init_name" "$fini_name" || return
     done
 
     _state["$name"]=2
@@ -122,7 +125,7 @@ include() {
         return 2
     }
 
-    local name="$1" lib file init_func
+    local name="$1" lib file init_func fini_func
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || {
         __dalo_loader_error "invalid library name: $name"
         return 2
@@ -138,9 +141,10 @@ include() {
     local -A resolve_state=()
     local -A resolve_file=()
     local -A resolve_init=()
+    local -A resolve_fini=()
     local -a resolve_order=()
 
-    __dalo_resolve "$name" '' resolve_state resolve_file resolve_order resolve_init || return
+    __dalo_resolve "$name" '' resolve_state resolve_file resolve_order resolve_init resolve_fini || return
 
     for lib in "${resolve_order[@]}"; do
         [ "${DALO_LIBRARY_LOADED[$lib]:-0}" -eq 1 ] && continue
@@ -166,8 +170,37 @@ include() {
             }
         fi
 
+        fini_func="${resolve_fini[$lib]:-}"
+        if [ -n "$fini_func" ]; then
+            [[ "$fini_func" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+                __dalo_loader_error "invalid DALO_LIBRARY_FINI '$fini_func': $file"
+                return 1
+            }
+            declare -F "$fini_func" >/dev/null || {
+                __dalo_loader_error "fini function not found: $fini_func ($file)"
+                return 1
+            }
+        fi
+
+        DALO_LIBRARY_FINI["$lib"]="$fini_func"
         DALO_LIBRARY_LOADED["$lib"]=1
         DALO_LIBRARY_LOADED_FILE["$lib"]="$file"
         DALO_LIBRARY_LOAD_ORDER+=("$lib")
     done
+}
+
+
+# Library FINI Hook ABI v1. Idempotent; reverse dependency/load order.
+dalo_library_fini_all() {
+    [ "$DALO_LIBRARY_FINI_DONE" -eq 0 ] || return 0
+    DALO_LIBRARY_FINI_DONE=1
+    local i lib fini rc=0 one_rc
+    for ((i=${#DALO_LIBRARY_LOAD_ORDER[@]}-1; i>=0; i--)); do
+        lib="${DALO_LIBRARY_LOAD_ORDER[i]}"
+        fini="${DALO_LIBRARY_FINI[$lib]:-}"
+        [ -n "$fini" ] || continue
+        one_rc=0; "$fini" || one_rc=$?
+        ((one_rc == 0)) || rc=$one_rc
+    done
+    return "$rc"
 }

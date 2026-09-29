@@ -77,7 +77,25 @@ class Slot:
 
 class Sup:
  def __init__(self,n):
-  self.instance=secrets.token_hex(16); self.slots=[Slot(i) for i in range(n)]; self.lock=threading.RLock(); self.jobs={}
+  self.instance=secrets.token_hex(16); self.slots=[Slot(i) for i in range(n)]; self.lock=threading.RLock(); self.jobs={}; self.shutting_down=threading.Event()
+ def shutdown(self):
+  with self.lock:
+   if self.shutting_down.is_set(): return
+   self.shutting_down.set()
+   for j in self.jobs.values():
+    if j['state'] in ('QUEUED','RUNNING'):
+     j['state']='CANCELLED'; j['result']=b'FAILED|CANCELLED|SHUTDOWN\n'; j['updated']=time.time()
+  for s in self.slots:
+   with s.lock:
+    s.state='STOPPING'; s.running=None; s.lease=None
+    try:
+     if s.p.is_alive(): s.p.terminate(); s.p.join(.20)
+     if s.p.is_alive(): s.p.kill(); s.p.join()
+    finally:
+     try:s.c.close()
+     except Exception:pass
+    s.state='FREE'
+ def accepting(self): return not self.shutting_down.is_set()
  def lookup(self,a):
   if len(a)<5 or a[1]!=self.instance:return None,'STALE_INSTANCE'
   try:s=self.slots[int(a[2])]; g=int(a[3])
@@ -148,6 +166,10 @@ class Sup:
   return f'ACCEPTED|{jobid}|{self.instance}|{s.i}|{gen}\n'.encode()
  def handle(self,p,rid):
   line,_,data=p.partition(b'\n'); a=line.decode().split('|'); op=a[0]
+  if op=='SHUTDOWN':
+   if len(a)!=2 or a[1]!=self.instance:return b'FAILED|STALE_INSTANCE\n'
+   self.shutdown(); return f'OK|SHUTDOWN|{self.instance}\n'.encode()
+  if not self.accepting():return b'DENIED|SHUTTING_DOWN\n'
   if op=='PING':return f'OK|{self.instance}|{len(self.slots)}\n'.encode()
   if op=='RESERVE':return self.reserve()
   if op=='STATUS':
@@ -188,12 +210,18 @@ class Sup:
    return self.start_async(s,op,code,jobid)
   return self.execute_sync(s,op,code,jobid)
 
-def session(sup,inf,outf):
+def session(sup,inf,outf,req):
  fdin=os.open(inf,os.O_RDWR); fdout=os.open(outf,os.O_RDWR)
  with os.fdopen(fdin,'rb',0) as fi,os.fdopen(fdout,'wb',0) as fo:
   reader=RequestReader(fi)
   while True:
-   try:rid,p=reader.read_frame(); write_frame(fo,rid,sup.handle(p,rid))
+   try:
+    rid,p=reader.read_frame(); response=sup.handle(p,rid); write_frame(fo,rid,response)
+    if sup.shutting_down.is_set():
+     try:
+      with open(req,'w') as wake:wake.write('__SHUTDOWN__\n')
+     except Exception:pass
+     return
    except EOFError:return
    except Exception as e:
     try:write_frame(fo,0,('FAILED|TRANSPORT|'+str(e)+'\n').encode())
@@ -206,9 +234,22 @@ def main():
  except FileExistsError:pass
  sup=Sup(z.workers)
  with open(z.root+'/ready','w') as f:f.write(sup.instance+'\n')
+ with open(z.root+'/supervisor.pid','w') as f:f.write(str(os.getpid())+'\n')
  fd=os.open(req,os.O_RDWR)
  with os.fdopen(fd,'r') as f:
   for line in f:
    q=line.rstrip('\n').split('|')
-   if len(q)==4 and q[0]=='REGISTER':threading.Thread(target=session,args=(sup,q[2],q[3]),daemon=True).start()
+   if line.rstrip('\n')=='__SHUTDOWN__':break
+   if len(q)==4 and q[0]=='REGISTER' and sup.accepting():threading.Thread(target=session,args=(sup,q[2],q[3],req),daemon=True).start()
+ sup.shutdown()
+ for name in os.listdir(z.root):
+  path=os.path.join(z.root,name)
+  try:
+   if os.path.isdir(path):
+    for child in os.listdir(path):
+     try:os.unlink(os.path.join(path,child))
+     except OSError:pass
+    os.rmdir(path)
+   else:os.unlink(path)
+  except OSError:pass
 if __name__=='__main__':main()
