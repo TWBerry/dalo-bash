@@ -1,0 +1,8 @@
+{
+  "abi": 1,
+  "name": "discovery",
+  "artifact": "artifacts/discovery.bash",
+  "entry": "dalo_init_discovery",
+  "requires": ["python"],
+  "runtime_requires": []
+}

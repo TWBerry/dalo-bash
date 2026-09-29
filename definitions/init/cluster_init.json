@@ -1,0 +1,8 @@
+{
+  "abi": 1,
+  "name": "cluster_init",
+  "artifact": "artifacts/cluster_init.bash",
+  "entry": "dalo_init_cluster",
+  "requires": ["discovery"],
+  "runtime_requires": []
+}

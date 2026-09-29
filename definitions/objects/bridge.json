@@ -11,9 +11,15 @@
         "connect"
       ]
     },
-    "PEER_MACHINE_ID": {
-      "type": "string",
-      "required": true
+    "PORT": {
+      "type": "uint",
+      "required": true,
+      "min": 1
+    },
+    "PEER_PORT": {
+      "type": "uint",
+      "required": false,
+      "min": 1
     }
   },
   "ports": {

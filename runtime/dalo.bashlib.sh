@@ -4378,78 +4378,95 @@ ant_endpoint_constructor() {
     "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" ""
 }
 
-# MACHINE Transport Endpoint ABI v1 + MACHINE Discovery ABI v1.
-# Stable identity/port is configuration; current IP is discovered runtime state.
-declare -gA DALO_MACHINE_PORT=() DALO_MACHINE_BY_PORT=() DALO_MACHINE_IP=()
-declare -g DALO_LOCAL_MACHINE_ID=""
+# MACHINE Transport Endpoint ABI v2 + MACHINE Discovery ABI v1.
+# A globally unique stable BRIDGE port is the MACHINE transport identity.
+# IP addresses are dynamic discovery state and are never persistent identity.
+declare -gA DALO_MACHINE_IP=() DALO_LOCAL_PORTS=()
+declare -g DALO_DISCOVERY_BASE24=""
 
 machine_endpoint_register() {
-    [ $# -eq 2 ] || return 2
-    local id="$1" port="$2" prior
-    [[ "$id" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 64
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
-    prior="${DALO_MACHINE_BY_PORT[$port]:-}"
-    [[ -z "$prior" || "$prior" == "$id" ]] || { printf 'DALO: MACHINE port %s already belongs to %s\n' "$port" "$prior" >&2; return 65; }
-    if [[ -n "${DALO_MACHINE_PORT[$id]:-}" && "${DALO_MACHINE_PORT[$id]}" != "$port" ]]; then
-        unset 'DALO_MACHINE_BY_PORT['"${DALO_MACHINE_PORT[$id]}"']'
-    fi
-    DALO_MACHINE_PORT["$id"]="$port"; DALO_MACHINE_BY_PORT["$port"]="$id"
-}
-machine_endpoint_set_local() {
     [ $# -eq 1 ] || return 2
-    [[ -n "${DALO_MACHINE_PORT[$1]:-}" ]] || return 66
-    DALO_LOCAL_MACHINE_ID="$1"
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    # Registration is intentionally idempotent: PORT itself is the identity.
+    : "${DALO_MACHINE_IP[$port]:-}"
 }
 machine_endpoint_set_ip() {
     [ $# -eq 2 ] || return 2
-    [[ -n "${DALO_MACHINE_PORT[$1]:-}" && -n "$2" ]] || return 66
-    DALO_MACHINE_IP["$1"]="$2"
-}
-machine_endpoint_local_port() {
-    [[ -n "$DALO_LOCAL_MACHINE_ID" ]] || return 66
-    local port="${DALO_MACHINE_PORT[$DALO_LOCAL_MACHINE_ID]:-}"
-    [[ -n "$port" ]] || return 66
-    printf '%s\n' "$port"
+    local port="$1" ip="$2"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 64
+    DALO_MACHINE_IP["$port"]="$ip"
 }
 machine_endpoint_resolve() {
     [ $# -eq 1 ] || return 2
-    local id="$1" ip="${DALO_MACHINE_IP[$1]:-}" port="${DALO_MACHINE_PORT[$1]:-}"
-    [[ -n "$ip" && -n "$port" ]] || return 67
+    local port="$1" ip="${DALO_MACHINE_IP[$1]:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    [[ -n "$ip" ]] || return 67
     printf '%s\t%s\n' "$ip" "$port"
 }
-# Scan exactly 256 addresses BASE.0..BASE.255. Only globally registered,
-# unresolved remote MACHINE ports are tried. Once a port is found, it is
-# removed from the pending set for the remainder of this scan.
+# Detect the active IPv4 /24 without persistent HOST configuration. Prefer the
+# interface carrying the default route; fall back to the first non-loopback
+# IPv4 interface. The Python worker is persistent and supplied by INIT python.
+machine_discovery_detect_base24() {
+    [ $# -eq 0 ] || return 2
+    declare -F init_python_thread >/dev/null 2>&1 || return 69
+    declare -F inline_python >/dev/null 2>&1 || return 69
+    local h ip rc=0
+    h="$(init_python_thread)" || return 69
+    inline_python -t "$h" -x $'import socket, struct, fcntl\niface = None\ntry:\n    for line in open("/proc/net/route").read().splitlines()[1:]:\n        cols = line.split()\n        if len(cols) > 1 and cols[1] == "00000000":\n            iface = cols[0]; break\nexcept Exception:\n    pass\ndef _dalo_ipv4(name):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    try:\n        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))[20:24])\n    finally:\n        s.close()\nip = None\nif iface:\n    try: ip = _dalo_ipv4(iface)\n    except OSError: pass\nif not ip:\n    for _, name in socket.if_nameindex():\n        if name == "lo": continue\n        try:\n            candidate = _dalo_ipv4(name)\n            if not candidate.startswith("127."):\n                ip = candidate; break\n        except OSError:\n            pass\n_dalo_discovery_ip = ip or ""' >/dev/null || rc=$?
+    if ((rc == 0)); then ip="$(inline_python -t "$h" '_dalo_discovery_ip')" || rc=$?; fi
+    release_python_thread "$h" >/dev/null 2>&1 || true
+    ((rc == 0)) || return "$rc"
+    # EVAL returns Python repr; IPv4 is safe to unquote before strict validation.
+    ip="${ip#\'}"; ip="${ip%\'}"; ip="${ip#\"}"; ip="${ip%\"}"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 68
+    DALO_DISCOVERY_BASE24="${ip%.*}"
+    printf '%s\n' "$DALO_DISCOVERY_BASE24"
+}
+# Scan exactly BASE.0..BASE.255. PORT identities already resolved are omitted;
+# once a port is found it is removed from the remainder of this scan.
 machine_discovery_scan24() {
-    [ $# -eq 1 ] || return 2
-    local base="$1" id port ip result found_id found_port octet
+    [ $# -le 1 ] || return 2
+    local base="${1:-$DALO_DISCOVERY_BASE24}" port ip result octet
     [[ "$base" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]] || return 64
     declare -A pending=()
-    for id in "${!DALO_MACHINE_PORT[@]}"; do
-        [[ "$id" != "$DALO_LOCAL_MACHINE_ID" && -z "${DALO_MACHINE_IP[$id]:-}" ]] || continue
-        pending["${DALO_MACHINE_PORT[$id]}"]="$id"
-    done
+    for port in "${!DALO_MACHINE_IP[@]}"; do :; done
+    # Registered-but-unresolved ports are represented separately because an
+    # associative array cannot retain a key with an unset value reliably.
+    if declare -p DALO_MACHINE_PORTS >/dev/null 2>&1; then
+        local -n __ports=DALO_MACHINE_PORTS
+        for port in "${!__ports[@]}"; do [[ -z "${DALO_LOCAL_PORTS[$port]:-}" && -z "${DALO_MACHINE_IP[$port]:-}" ]] && pending["$port"]=1; done
+    fi
     ((${#pending[@]})) || return 0
-    declare -F inline_python >/dev/null 2>&1 || return 69
     declare -F init_python_thread >/dev/null 2>&1 || return 69
     local py_handle rc=0
     py_handle="$(init_python_thread)" || return 69
     for ((octet=0; octet<256 && ${#pending[@]}>0; octet++)); do
         ip="$base.$octet"
         for port in "${!pending[@]}"; do
-            # Reuse one reserved interpreter for the entire scan; never consume a
-            # worker lease per probe. Success is provisional until mapped by the
-            # globally configured stable MACHINE port.
             result="$(inline_python -t "$py_handle" "__import__('socket').create_connection(('$ip',$port),0.03).close() is None" 2>/dev/null)" || continue
             [[ "$result" == True ]] || continue
-            found_id="${pending[$port]}"
-            DALO_MACHINE_IP["$found_id"]="$ip"
+            DALO_MACHINE_IP["$port"]="$ip"
             unset 'pending['"$port"']'
         done
     done
     ((${#pending[@]} == 0)) || rc=1
     release_python_thread "$py_handle" >/dev/null 2>&1 || true
     return "$rc"
+}
+# Stable set of globally known MACHINE/BRIDGE port identities for this PROJECT.
+declare -gA DALO_MACHINE_PORTS=()
+machine_endpoint_register() {
+    [ $# -eq 1 ] || return 2
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    DALO_MACHINE_PORTS["$port"]=1
+}
+machine_endpoint_register_local() {
+    [ $# -eq 1 ] || return 2
+    machine_endpoint_register "$1" || return
+    DALO_LOCAL_PORTS["$1"]=1
 }
 
 # BRIDGE OBJECT ABI v3.
