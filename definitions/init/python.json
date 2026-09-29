@@ -1,0 +1,8 @@
+{
+  "abi": 1,
+  "name": "python",
+  "artifact": "artifacts/python.bash",
+  "entry": "dalo_init_python",
+  "requires": [],
+  "runtime_requires": ["python"]
+}

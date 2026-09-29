@@ -9,7 +9,8 @@ DALO_COMPILER_DEFINITIONS_INCLUDE=1
 DALO_OBJECT_DEFINITION_ABI=1
 DALO_FEATURE_DEFINITION_ABI=1
 DALO_WORKER_DEFINITION_ABI=1
-declare -gA DALO_OBJECT_DEF_FILE=() DALO_FEATURE_DEF_FILE=() DALO_WORKER_DEF_FILE=()
+DALO_INIT_DEFINITION_ABI=1
+declare -gA DALO_OBJECT_DEF_FILE=() DALO_FEATURE_DEF_FILE=() DALO_WORKER_DEF_FILE=() DALO_INIT_DEF_FILE=()
 
 dalo_object_definition_register(){
  local f="$1" t; jq -e '.abi==1 and (.type|type=="string") and (.ports|type=="object") and ((.port_patterns//[])|type=="array") and ((.instance_fields//{})|type=="object") and ((.features//[])|type=="array")' "$f" >/dev/null || return 5
@@ -18,6 +19,11 @@ dalo_object_definition_register(){
 dalo_feature_definition_register(){
  local f="$1" n; jq -e '.abi==1 and (.name|type=="string") and ((.requires//[])|type=="array")' "$f" >/dev/null || return 5
  n="$(jq -r .name "$f")"; DALO_FEATURE_DEF_FILE["$n"]="$f"
+}
+dalo_init_definition_register(){
+ local f="$1" n
+ jq -e '.abi==1 and (.name|type=="string") and (.artifact|type=="string") and (.entry|type=="string") and ((.requires//[])|type=="array") and ((.runtime_requires//[])|type=="array")' "$f" >/dev/null || return 5
+ n="$(jq -r .name "$f")"; DALO_INIT_DEF_FILE["$n"]="$f"
 }
 dalo_worker_definition_register(){
  local f="$1" n; jq -e '.abi==1 and (.name|type=="string") and ((.features//[])|type=="array")' "$f" >/dev/null || return 5
@@ -29,6 +35,7 @@ dalo_definitions_load_tree(){
  for f in "$root"/definitions/features/*.json; do [[ -e "$f" ]] || continue; dalo_feature_definition_register "$f" || return; done
  for f in "$root"/definitions/objects/*.json; do [[ -e "$f" ]] || continue; dalo_object_definition_register "$f" || return; done
  for f in "$root"/definitions/workers/*.json; do [[ -e "$f" ]] || continue; dalo_worker_definition_register "$f" || return; done
+ for f in "$root"/definitions/init/*.json; do [[ -e "$f" ]] || continue; dalo_init_definition_register "$f" || return; done
 }
 dalo_definition_validate_ir(){
  local p="$1" o type file field field_type required min value enum_json
@@ -110,4 +117,33 @@ dalo_definition_validate_ir(){
        }
    fi
  done
+}
+
+
+dalo_definition_resolve_inits(){
+ local p="$1" name dep def artifact base entry runtime state
+ local -n requested="${p}_INIT_REQUESTS" order="${p}_INIT_ORDER"
+ eval "declare -g -A ${p}_INIT_ARTIFACT=() ${p}_INIT_ENTRY=() ${p}_INIT_RUNTIME_REQUIRES=()"
+ local -n artifacts="${p}_INIT_ARTIFACT" entries="${p}_INIT_ENTRY" runtimes="${p}_INIT_RUNTIME_REQUIRES"
+ local -A visit=()
+ order=()
+ __dalo_init_visit(){
+   local n="$1" d f a b e r
+   case "${visit[$n]:-}" in
+     done) return 0;;
+     visiting) printf 'daloc: cyclic INIT dependency at %s\n' "$n" >&2; return 41;;
+   esac
+   f="${DALO_INIT_DEF_FILE[$n]:-}"
+   [[ -n "$f" ]] || { printf 'daloc: undefined INIT %s\n' "$n" >&2; return 42; }
+   visit["$n"]=visiting
+   while IFS= read -r d; do [[ -n "$d" ]] || continue; __dalo_init_visit "$d" || return; done < <(jq -r '(.requires//[])[]' "$f")
+   a="$(jq -r .artifact "$f")"; e="$(jq -r .entry "$f")"; r="$(jq -r '(.runtime_requires//[])|join(" ")' "$f")"
+   [[ "$a" != /* ]] && { b="$(cd -- "$(dirname -- "$f")" && pwd)" || return; a="$b/$a"; }
+   [[ -r "$a" ]] || { printf 'daloc: INIT %s artifact not readable: %s\n' "$n" "$a" >&2; return 43; }
+   bash -n "$a" || return 44
+   [[ "$e" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { printf 'daloc: INIT %s invalid entry %s\n' "$n" "$e" >&2; return 45; }
+   artifacts["$n"]="$a"; entries["$n"]="$e"; runtimes["$n"]="$r"; order+=("$n"); visit["$n"]=done
+ }
+ for name in "${requested[@]}"; do __dalo_init_visit "$name" || return; done
+ unset -f __dalo_init_visit
 }

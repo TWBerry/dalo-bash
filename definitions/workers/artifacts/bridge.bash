@@ -8,9 +8,20 @@ worker_start() {
     declare -F init_python_thread >/dev/null 2>&1 || { printf 'BRIDGE[%s]: python runtime is not loaded\n' "$ns" >&2; return 69; }
     define_comm_api "$ns" || return
     define_tcp_capability_gate "$ns" || return
-    local mode_var="${ns}_FIELD_MODE" host_var="${ns}_FIELD_HOST" port_var="${ns}_FIELD_PORT" peer_var="${ns}_FIELD_PEER"
-    local mode="${!mode_var:-}" host="${!host_var:-}" port="${!port_var:-}" peer="${!peer_var:-}"
-    [[ -n "$mode" && -n "$host" && -n "$port" && -n "$peer" ]] || { printf 'BRIDGE[%s]: incomplete descriptor fields\n' "$ns" >&2; return 64; }
+    local mode_var="${ns}_FIELD_MODE" peer_var="${ns}_FIELD_PEER_MACHINE_ID"
+    local mode="${!mode_var:-}" peer="${!peer_var:-}" host port endpoint
+    [[ -n "$mode" && -n "$peer" ]] || { printf 'BRIDGE[%s]: incomplete descriptor fields\n' "$ns" >&2; return 64; }
+    case "$mode" in
+        listen)
+            host=0.0.0.0
+            port="$(machine_endpoint_local_port)" || { printf 'BRIDGE[%s]: local MACHINE endpoint is not initialized\n' "$ns" >&2; return 67; }
+            ;;
+        connect)
+            endpoint="$(machine_endpoint_resolve "$peer")" || { printf 'BRIDGE[%s]: peer MACHINE %s is unresolved\n' "$ns" "$peer" >&2; return 67; }
+            IFS=$'\t' read -r host port <<<"$endpoint"
+            ;;
+        *) return 64;;
+    esac
     "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" "$peer" || return
     printf -v "$init_var" '%s' 1
 }

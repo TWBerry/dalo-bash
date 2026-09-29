@@ -14,21 +14,27 @@ dalo_link_machine(){
     local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD"
     local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION" worker_start="${p}_WORKER_START" worker_poll="${p}_WORKER_POLL" worker_stop="${p}_WORKER_STOP" worker_keepalive="${p}_WORKER_KEEPALIVE" worker_requires="${p}_WORKER_RUNTIME_REQUIRES"
     local -n params="${p}_PARAM_ORDER" param_type="${p}_PARAM_TYPE" param_default="${p}_PARAM_DEFAULT" param_required="${p}_PARAM_REQUIRED"
+    dalo_definition_resolve_inits "$p" || return
+    local -n init_order="${p}_INIT_ORDER" init_artifact="${p}_INIT_ARTIFACT" init_entry="${p}_INIT_ENTRY" init_runtime="${p}_INIT_RUNTIME_REQUIRES"
 
     # Backend ABI expected by the established executable-machine linker.
     local backend="DALO_MACHINE_BUILD"
-    eval "declare -g -a ${backend}_DECL_OBJECTS=() ${backend}_EDGES=() ${backend}_PARAM_ORDER=()"
+    eval "declare -g -a ${backend}_DECL_OBJECTS=() ${backend}_EDGES=() ${backend}_PARAM_ORDER=() ${backend}_INIT_ORDER=()"
     eval "declare -g -A ${backend}_DECL_TYPE=() ${backend}_DECL_WORKER_FILE=() ${backend}_DECL_WORKERS=() ${backend}_DECL_FIELD=()"
     eval "declare -g -A ${backend}_DECL_RESOURCE_KIND=() ${backend}_DECL_RESOURCE_ARG=() ${backend}_EXEC_MODE=() ${backend}_WORKER_START=() ${backend}_WORKER_POLL=() ${backend}_WORKER_STOP=() ${backend}_WORKER_KEEPALIVE=() ${backend}_WORKER_RUNTIME_REQUIRES=()"
-    eval "declare -g -A ${backend}_PARAM_TYPE=() ${backend}_PARAM_DEFAULT=() ${backend}_PARAM_REQUIRED=()"
+    eval "declare -g -A ${backend}_PARAM_TYPE=() ${backend}_PARAM_DEFAULT=() ${backend}_PARAM_REQUIRED=() ${backend}_INIT_ARTIFACT=() ${backend}_INIT_ENTRY=() ${backend}_INIT_RUNTIME_REQUIRES=()"
     local -n b_objs="${backend}_DECL_OBJECTS" b_types="${backend}_DECL_TYPE"
     local -n b_wf="${backend}_DECL_WORKER_FILE" b_workers="${backend}_DECL_WORKERS" b_fields="${backend}_DECL_FIELD"
     local -n b_edges="${backend}_EDGES" b_exec="${backend}_EXEC_MODE" b_start="${backend}_WORKER_START" b_poll="${backend}_WORKER_POLL" b_stop="${backend}_WORKER_STOP" b_keepalive="${backend}_WORKER_KEEPALIVE" b_requires="${backend}_WORKER_RUNTIME_REQUIRES"
     local -n b_params="${backend}_PARAM_ORDER" b_ptype="${backend}_PARAM_TYPE" b_pdefault="${backend}_PARAM_DEFAULT" b_prequired="${backend}_PARAM_REQUIRED"
+    local -n b_init_order="${backend}_INIT_ORDER" b_init_artifact="${backend}_INIT_ARTIFACT" b_init_entry="${backend}_INIT_ENTRY" b_init_runtime="${backend}_INIT_RUNTIME_REQUIRES"
 
     b_objs=("${objs[@]}")
     b_edges=("${edges[@]}")
     b_params=("${params[@]}")
+    b_init_order=("${init_order[@]}")
+    local init_name
+    for init_name in "${init_order[@]}"; do b_init_artifact["$init_name"]="${init_artifact[$init_name]}"; b_init_entry["$init_name"]="${init_entry[$init_name]}"; b_init_runtime["$init_name"]="${init_runtime[$init_name]}"; done
     for obj in "${params[@]}"; do
         b_ptype["$obj"]="${param_type[$obj]}"
         b_pdefault["$obj"]="${param_default[$obj]:-}"

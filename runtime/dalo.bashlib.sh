@@ -4378,6 +4378,80 @@ ant_endpoint_constructor() {
     "${ns}_tcp_init" "$mode" "$host" "$port" "$ns" ""
 }
 
+# MACHINE Transport Endpoint ABI v1 + MACHINE Discovery ABI v1.
+# Stable identity/port is configuration; current IP is discovered runtime state.
+declare -gA DALO_MACHINE_PORT=() DALO_MACHINE_BY_PORT=() DALO_MACHINE_IP=()
+declare -g DALO_LOCAL_MACHINE_ID=""
+
+machine_endpoint_register() {
+    [ $# -eq 2 ] || return 2
+    local id="$1" port="$2" prior
+    [[ "$id" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 64
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    prior="${DALO_MACHINE_BY_PORT[$port]:-}"
+    [[ -z "$prior" || "$prior" == "$id" ]] || { printf 'DALO: MACHINE port %s already belongs to %s\n' "$port" "$prior" >&2; return 65; }
+    if [[ -n "${DALO_MACHINE_PORT[$id]:-}" && "${DALO_MACHINE_PORT[$id]}" != "$port" ]]; then
+        unset 'DALO_MACHINE_BY_PORT['"${DALO_MACHINE_PORT[$id]}"']'
+    fi
+    DALO_MACHINE_PORT["$id"]="$port"; DALO_MACHINE_BY_PORT["$port"]="$id"
+}
+machine_endpoint_set_local() {
+    [ $# -eq 1 ] || return 2
+    [[ -n "${DALO_MACHINE_PORT[$1]:-}" ]] || return 66
+    DALO_LOCAL_MACHINE_ID="$1"
+}
+machine_endpoint_set_ip() {
+    [ $# -eq 2 ] || return 2
+    [[ -n "${DALO_MACHINE_PORT[$1]:-}" && -n "$2" ]] || return 66
+    DALO_MACHINE_IP["$1"]="$2"
+}
+machine_endpoint_local_port() {
+    [[ -n "$DALO_LOCAL_MACHINE_ID" ]] || return 66
+    local port="${DALO_MACHINE_PORT[$DALO_LOCAL_MACHINE_ID]:-}"
+    [[ -n "$port" ]] || return 66
+    printf '%s\n' "$port"
+}
+machine_endpoint_resolve() {
+    [ $# -eq 1 ] || return 2
+    local id="$1" ip="${DALO_MACHINE_IP[$1]:-}" port="${DALO_MACHINE_PORT[$1]:-}"
+    [[ -n "$ip" && -n "$port" ]] || return 67
+    printf '%s\t%s\n' "$ip" "$port"
+}
+# Scan exactly 256 addresses BASE.0..BASE.255. Only globally registered,
+# unresolved remote MACHINE ports are tried. Once a port is found, it is
+# removed from the pending set for the remainder of this scan.
+machine_discovery_scan24() {
+    [ $# -eq 1 ] || return 2
+    local base="$1" id port ip result found_id found_port octet
+    [[ "$base" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]] || return 64
+    declare -A pending=()
+    for id in "${!DALO_MACHINE_PORT[@]}"; do
+        [[ "$id" != "$DALO_LOCAL_MACHINE_ID" && -z "${DALO_MACHINE_IP[$id]:-}" ]] || continue
+        pending["${DALO_MACHINE_PORT[$id]}"]="$id"
+    done
+    ((${#pending[@]})) || return 0
+    declare -F inline_python >/dev/null 2>&1 || return 69
+    declare -F init_python_thread >/dev/null 2>&1 || return 69
+    local py_handle rc=0
+    py_handle="$(init_python_thread)" || return 69
+    for ((octet=0; octet<256 && ${#pending[@]}>0; octet++)); do
+        ip="$base.$octet"
+        for port in "${!pending[@]}"; do
+            # Reuse one reserved interpreter for the entire scan; never consume a
+            # worker lease per probe. Success is provisional until mapped by the
+            # globally configured stable MACHINE port.
+            result="$(inline_python -t "$py_handle" "__import__('socket').create_connection(('$ip',$port),0.03).close() is None" 2>/dev/null)" || continue
+            [[ "$result" == True ]] || continue
+            found_id="${pending[$port]}"
+            DALO_MACHINE_IP["$found_id"]="$ip"
+            unset 'pending['"$port"']'
+        done
+    done
+    ((${#pending[@]} == 0)) || rc=1
+    release_python_thread "$py_handle" >/dev/null 2>&1 || true
+    return "$rc"
+}
+
 # BRIDGE OBJECT ABI v3.
 # Compatibility: the first five arguments retain the old constructor shape.
 # Optional arg6 is now declarative peer identity (not a helper executable).
@@ -5012,6 +5086,7 @@ dalo_library_artifact_path() {
         printf -v "$out" '%s' "${DALO_LIBRARY_ARTIFACT_PATH[$key]}"; return 0
     fi
     if declare -p DALO_LIBRARY_LOADED_FILE >/dev/null 2>&1; then file="${DALO_LIBRARY_LOADED_FILE[$lib]:-}"; fi
+    if [[ -z "${file:-}" ]] && declare -F __dalo_find_library >/dev/null 2>&1; then file="$(__dalo_find_library "$lib")" || file=""; fi
     if [[ -z "${file:-}" && "$lib" == "dalo" ]]; then file="${BASH_SOURCE[0]}"; fi
     [[ -n "${file:-}" ]] || return 1
     dir="$(cd -- "$(dirname -- "$file")" && pwd)" || return
@@ -5032,6 +5107,7 @@ __asyncmachine_link() {
     local -n rk="${project}_DECL_RESOURCE_KIND" ra="${project}_DECL_RESOURCE_ARG"
     local -n decl_fields="${project}_DECL_FIELD"
     local wstart_arr="${project}_WORKER_START" wpoll_arr="${project}_WORKER_POLL" wstop_arr="${project}_WORKER_STOP" wkeep_arr="${project}_WORKER_KEEPALIVE" wrequires_arr="${project}_WORKER_RUNTIME_REQUIRES"
+    local init_order_arr="${project}_INIT_ORDER" init_artifact_arr="${project}_INIT_ARTIFACT" init_entry_arr="${project}_INIT_ENTRY" init_runtime_arr="${project}_INIT_RUNTIME_REQUIRES"
 
     # Generic WORKER runtime dependency closure. Libraries are resolved from the
     # runtime directory by their standard DALO_LIBRARY_* metadata.
@@ -5062,6 +5138,14 @@ __asyncmachine_link() {
         __asyncmachine_meta_get req_lib "$wrequires_arr" "$obj" "" || return
         for req_lib in $req_lib; do __asyncmachine_resolve_embedded_lib "$req_lib" || return; done
     done
+    if declare -p "$init_order_arr" >/dev/null 2>&1; then
+        local -n __init_order="$init_order_arr"
+        local init_name init_req
+        for init_name in "${__init_order[@]}"; do
+            __asyncmachine_meta_get init_req "$init_runtime_arr" "$init_name" "" || return
+            for req_lib in $init_req; do __asyncmachine_resolve_embedded_lib "$req_lib" || return; done
+        done
+    fi
 
     eval "declare -g -A ${project}_COMPILE_NS=()"
     local -n machine_ns="${project}_COMPILE_NS"
@@ -5117,6 +5201,21 @@ __asyncmachine_link() {
         printf '\n# ============================================================================\n# GENERATED MACHINE IMAGE\n# ============================================================================\n'
         printf 'ASYNC_MACHINE_ABI=2\nASYNC_MACHINE_PROJECT_SHA256=%q\nASYNC_MACHINE_NAME=%q\n' "$project_hash" "$project"
     } >"$out" || return
+
+    # Generic declarative INIT artifacts. Dependency order was resolved by the
+    # compiler; the runtime only embeds code and invokes declared entrypoints.
+    if declare -p "$init_order_arr" >/dev/null 2>&1; then
+        local -n __init_order="$init_order_arr"
+        local init_name init_art init_entry
+        for init_name in "${__init_order[@]}"; do
+            __asyncmachine_meta_get init_art "$init_artifact_arr" "$init_name" "" || return
+            __asyncmachine_meta_get init_entry "$init_entry_arr" "$init_name" "" || return
+            [[ -r "$init_art" && "$init_entry" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 73
+            printf '\n# INIT %q\n' "$init_name" >>"$out"
+            cat "$init_art" >>"$out" || return
+            printf '\n' >>"$out"
+        done
+    fi
 
     # Materialize the ASYNC_SCRIPT runtime owner. It is separate from all
     # declared graph objects and owns their runtime identities.
@@ -5326,6 +5425,18 @@ __asyncmachine_link() {
             } >>"$out"
         fi
     done
+
+    # Ordered PROJECT INIT chain. Dependencies are already expanded and
+    # deduplicated by the generic compiler resolver. This runs after standard
+    # MACHINE/object construction and routing, before any worker lifecycle start.
+    if declare -p "$init_order_arr" >/dev/null 2>&1; then
+        local -n __init_order="$init_order_arr"
+        local init_name init_entry
+        for init_name in "${__init_order[@]}"; do
+            __asyncmachine_meta_get init_entry "$init_entry_arr" "$init_name" "" || return
+            printf '%s || exit $?\n' "$init_entry" >>"$out"
+        done
+    fi
 
     # Generic worker lifecycle start. No OBJECT type is inspected here.
     for obj in "${objs[@]}"; do

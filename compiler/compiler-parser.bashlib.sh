@@ -61,6 +61,7 @@ dalo_parse_project() {
                     case "$key" in
                         NAME) dalo_ir_set_project_name "$ir" "$value" ;;
                         VERSION) dalo_ir_set_project_version "$ir" "$value" ;;
+                        INIT) dalo_ir_add_init "$ir" "$value" ;;
                         *) printf 'daloc:%d: unknown PROJECT field %s\n' "$lineno" "$key" >&2; return 15 ;;
                     esac ;;
                 ARG)
