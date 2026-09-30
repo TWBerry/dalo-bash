@@ -381,10 +381,47 @@ __NS___control_send() {
     __NS___fifo_send Q 1 "$request_id" "$source" "$target" "${reply_target:--}" "$op" "$flags" "$@"
 }
 
+__NS___control_route_init() {
+    declare -p __NS___CONTROL_REMOTE_BRIDGE >/dev/null 2>&1 || declare -gA __NS___CONTROL_REMOTE_BRIDGE=()
+    declare -p __NS___CONTROL_REMOTE_SRC >/dev/null 2>&1 || declare -gA __NS___CONTROL_REMOTE_SRC=()
+    declare -p __NS___CONTROL_REMOTE_CAP >/dev/null 2>&1 || declare -gA __NS___CONTROL_REMOTE_CAP=()
+}
+
+# Bind a stable remote control identity to this MACHINE's local outbound BRIDGE.
+__NS___control_route_bind() {
+    [ $# -eq 4 ] || return 2
+    local remote_id="$1" bridge_ns="$2" local_id="$3" capability="$4"
+    [[ -n "$remote_id" && "$remote_id" != *'|'* ]] || return 71
+    [[ "$bridge_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ -n "$local_id" && "$local_id" != *'|'* && -n "$capability" && "$capability" != *'|'* ]] || return 71
+    declare -F "${bridge_ns}_forward_tcp_control" >/dev/null 2>&1 || return 66
+    __NS___control_route_init || return
+    __NS___CONTROL_REMOTE_BRIDGE["$remote_id"]="$bridge_ns"
+    __NS___CONTROL_REMOTE_SRC["$remote_id"]="$local_id"
+    __NS___CONTROL_REMOTE_CAP["$remote_id"]="$capability"
+}
+
+# Remote reply target syntax: remote|<stable-peer-id>|<local-control-target>.
+# The peer's Bash BRIDGE namespace is intentionally not part of the wire ABI.
 __NS___control_send_response() {
     [ $# -ge 3 ] || return 2
     local reply_target="$1" tag="$2" request_id="$3"; shift 3
     [[ "$reply_target" != '-' && -n "$reply_target" ]] || return 0
+    if [[ "$reply_target" == remote\|* ]]; then
+        local rest="${reply_target#remote|}" remote_id="" local_target="" bridge_ns="" local_id="" cap="" raw=""
+        remote_id="${rest%%|*}"
+        [[ "$rest" == *'|'* ]] || return 71
+        local_target="${rest#*|}"
+        [[ -n "$remote_id" && -n "$local_target" ]] || return 71
+        __NS___control_route_init || return
+        bridge_ns="${__NS___CONTROL_REMOTE_BRIDGE[$remote_id]:-}"
+        local_id="${__NS___CONTROL_REMOTE_SRC[$remote_id]:-}"
+        cap="${__NS___CONTROL_REMOTE_CAP[$remote_id]:-}"
+        [[ -n "$bridge_ns" && -n "$local_id" && -n "$cap" ]] || return 77
+        raw="$(__NS___fifo_frame_encode "$tag" "$request_id" "$@")" || return
+        "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$cap" "$raw"
+        return
+    fi
     __NS___control_send_frame_to "$reply_target" "$tag" "$request_id" "$@"
 }
 
@@ -603,6 +640,59 @@ __NS___drain_fifo() {
                                ((ctl_rc == 0)) && ctl_result=("$ctl_method")
                            fi
                        fi
+                       ;;
+                   SCHED_MIGRATION_OFFER)
+                       ((${#ctl_args[@]} == 5)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           declare -F "__NS___placement_migration_offer" >/dev/null 2>&1 || ctl_rc=67
+                       fi
+                       if ((ctl_rc == 0)); then
+                           local migration_offer='' migration_blank='' migration_rid=''
+                           __NS___placement_migration_offer migration_offer \
+                               "${ctl_args[0]}" "${ctl_args[1]}" "${ctl_args[2]}" "${ctl_args[3]}" "${ctl_args[4]}" || ctl_rc=$?
+                           if ((ctl_rc == 0)); then
+                               read -r migration_blank migration_rid <<<"$migration_offer"
+                               ctl_result=("${ctl_args[0]}" "$migration_blank" "$migration_rid")
+                           fi
+                       fi
+                       ;;
+                   SCHED_MIGRATION_COMMIT)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_migration_commit "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" COMMITTED)
+                       ;;
+                   SCHED_MIGRATION_ABORT)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_migration_abort "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" ABORTED)
+                       ;;
+                   SCHED_MIGRATION_QUERY)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local migration_state=''
+                           __NS___placement_migration_query migration_state "${ctl_args[0]}" || ctl_rc=$?
+                           ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" "$migration_state")
+                       fi
+                       ;;
+                   SCHED_MIGRATION_ROLLBACK_COMMITTED)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_migration_rollback_committed "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" ROLLED_BACK)
+                       ;;
+                   SCHED_TOPOLOGY_PREPARE)
+                       ((${#ctl_args[@]} == 5)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_topology_prepare "${ctl_args[@]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" PREPARED)
+                       ;;
+                   SCHED_TOPOLOGY_COMMIT)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_topology_commit "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" COMMITTED)
+                       ;;
+                   SCHED_TOPOLOGY_ROLLBACK)
+                       ((${#ctl_args[@]} == 1)) || ctl_rc=64
+                       ((ctl_rc != 0)) || __NS___placement_topology_rollback "${ctl_args[0]}" || ctl_rc=$?
+                       ((ctl_rc == 0)) && ctl_result=("${ctl_args[0]}" ROLLED_BACK)
                        ;;
                    SCHED_RESERVE)
                        ((${#ctl_args[@]} == 2)) || ctl_rc=64
@@ -2773,6 +2863,344 @@ async_pipeline_endpoint_constructor() {
 
 
 # ============================================================================
+# 8a. SCHEDULER PLACEMENT/CONTROL ABI v1
+# ============================================================================
+# The SCHEDULER OBJECT is the placement authority.  This API deliberately
+# delegates execution to the existing migration and ANT mechanisms; it does
+# not introduce another resource ledger or another ANT lease protocol.
+define_scheduler_placement_api() {
+    local ns="$1"
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    local body
+    body="$(cat <<'SCHED_PLACEMENT_EOF'
+__NS___placement_init() {
+    declare -p __NS___PLACEMENT_MIG_STATE >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_STATE=()
+    declare -p __NS___PLACEMENT_MIG_OBJECT >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_OBJECT=()
+    declare -p __NS___PLACEMENT_MIG_REASON >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_REASON=()
+    declare -p __NS___PLACEMENT_MIG_RESERVATION >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_RESERVATION=()
+    declare -p __NS___PLACEMENT_MIG_BLANK >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_BLANK=()
+    declare -p __NS___PLACEMENT_MIG_CPU >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_CPU=()
+    declare -p __NS___PLACEMENT_MIG_MEMORY >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_MEMORY=()
+}
+
+# Destination-side migration admission.  Source quiescence remains a source
+# SCHEDULER responsibility and is intentionally not performed here.
+__NS___placement_migration_admit() {
+    [ $# -eq 6 ] || return 64
+    local outvar="$1" tx_id="$2" object_id="$3" cpu="$4" memory="$5" reason="$6"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$tx_id" =~ ^[A-Za-z0-9_.:-]+$ && "$object_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$cpu" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || return 64
+    [[ "$reason" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 71
+    __NS___placement_init || return
+    [[ -z "${__NS___PLACEMENT_MIG_STATE[$tx_id]:-}" ]] || return 73
+
+    local rid='' _placement_blank='' owner="migration:${tx_id}"
+    __NS___scheduler_reserve rid "$owner" "$cpu" "$memory" || return $?
+    if ! create_random_blank_object _placement_blank; then
+        __NS___scheduler_release "$owner" "$rid" || true
+        return 67
+    fi
+
+    local -n _placement_owners=__NS___RES_OWNER
+    [[ "${_placement_owners[$rid]:-}" == "$owner" ]] || {
+        migration_discard_imported_object "$_placement_blank" || true
+        __NS___scheduler_release "$owner" "$rid" || true
+        return 83
+    }
+    _placement_owners["$rid"]="blank:${_placement_blank}"
+    __NS___PLACEMENT_MIG_STATE["$tx_id"]=PREPARED
+    __NS___PLACEMENT_MIG_OBJECT["$tx_id"]="$object_id"
+    __NS___PLACEMENT_MIG_REASON["$tx_id"]="$reason"
+    __NS___PLACEMENT_MIG_RESERVATION["$tx_id"]="$rid"
+    __NS___PLACEMENT_MIG_BLANK["$tx_id"]="$_placement_blank"
+    __NS___PLACEMENT_MIG_CPU["$tx_id"]="$cpu"
+    __NS___PLACEMENT_MIG_MEMORY["$tx_id"]="$memory"
+    printf -v "${_placement_blank}_MIGRATION_RESERVATION" '%s' "$rid"
+    printf -v "${_placement_blank}_MIGRATION_SCHEDULER" '%s' '__NS__'
+    printf -v "${_placement_blank}_MIGRATION_CPU" '%s' "$cpu"
+    printf -v "${_placement_blank}_MIGRATION_MEMORY" '%s' "$memory"
+    printf -v "$outvar" '%s' "$_placement_blank"
+}
+
+__NS___placement_migration_abort() {
+    [ $# -eq 1 ] || return 64
+    local tx_id="$1"
+    __NS___placement_init || return
+    [[ "${__NS___PLACEMENT_MIG_STATE[$tx_id]:-}" == PREPARED ||
+       "${__NS___PLACEMENT_MIG_STATE[$tx_id]:-}" == IMPORTED ]] || return 74
+    local rid="${__NS___PLACEMENT_MIG_RESERVATION[$tx_id]}" blank="${__NS___PLACEMENT_MIG_BLANK[$tx_id]}"
+    __NS___scheduler_release "blank:${blank}" "$rid" || return
+    unset "${blank}_MIGRATION_RESERVATION" "${blank}_MIGRATION_SCHEDULER" \
+          "${blank}_MIGRATION_CPU" "${blank}_MIGRATION_MEMORY"
+    migration_discard_imported_object "$blank" || true
+    __NS___PLACEMENT_MIG_STATE["$tx_id"]=ABORTED
+}
+
+__NS___placement_migration_query() {
+    [ $# -eq 2 ] || return 64
+    local outvar="$1" tx_id="$2"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    __NS___placement_init || return
+    local _placement_state="${__NS___PLACEMENT_MIG_STATE[$tx_id]:-UNKNOWN}"
+    printf -v "$outvar" '%s' "$_placement_state"
+}
+
+# ANT borrowing stays on ANT Resource Exchange ABI v2.  SCHEDULER only owns
+# placement/admission policy and delegates the actual lease to that endpoint.
+__NS___placement_ant_borrow() {
+    [ $# -eq 4 ] || return 64
+    local ant_ns="$1" wanted="$2" cpu_per_ant="$3" memory_per_ant="$4"
+    [[ "$ant_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    [[ "$wanted" =~ ^[1-9][0-9]*$ && "$cpu_per_ant" =~ ^[0-9]+$ && "$memory_per_ant" =~ ^[0-9]+$ ]] || return 64
+    [[ "${DALO_MACHINE_SCHEDULER_NS:-}" == '__NS__' ]] || return 83
+    declare -F "${ant_ns}_ant_handle_lease_request" >/dev/null 2>&1 || return 66
+    "${ant_ns}_ant_handle_lease_request" "$wanted" "$cpu_per_ant" "$memory_per_ant"
+}
+
+# Scheduler Migration Negotiation ABI v1 candidate.  The destination performs
+# admission only; source quiescence and transfer remain source-side transaction work.
+__NS___placement_migration_offer() {
+    [ $# -eq 6 ] || return 64
+    local outvar="$1" tx_id="$2" object_id="$3" cpu="$4" memory="$5" reason="$6" blank=''
+    __NS___placement_migration_admit blank "$tx_id" "$object_id" "$cpu" "$memory" "$reason" || return
+    local rid="${__NS___PLACEMENT_MIG_RESERVATION[$tx_id]:-}"
+    printf -v "$outvar" '%s' "$blank $rid"
+}
+
+__NS___placement_migration_commit() {
+    [ $# -ge 1 ] && [ $# -le 2 ] || return 64
+    local tx_id="$1" destination_ns="${2:-${__NS___PLACEMENT_MIG_BLANK[$1]:-}}"
+    __NS___placement_init || return
+    [[ "${__NS___PLACEMENT_MIG_STATE[$tx_id]:-}" == IMPORTED ]] || return 74
+    [[ "$destination_ns" == "${__NS___PLACEMENT_MIG_BLANK[$tx_id]:-}" ]] || return 76
+    local rid="${__NS___PLACEMENT_MIG_RESERVATION[$tx_id]}" blank="${__NS___PLACEMENT_MIG_BLANK[$tx_id]}"
+    local -n _placement_owners=__NS___RES_OWNER
+    [[ "${_placement_owners[$rid]:-}" == "blank:${blank}" ]] || return 83
+    _placement_owners["$rid"]="ns:${destination_ns}"
+    printf -v "${destination_ns}_MACHINE_RESERVATION" '%s' "$rid"
+    printf -v "${destination_ns}_MACHINE_SCHEDULER" '%s' '__NS__'
+    printf -v "${destination_ns}_MACHINE_CPU" '%s' "${__NS___PLACEMENT_MIG_CPU[$tx_id]}"
+    printf -v "${destination_ns}_MACHINE_MEMORY" '%s' "${__NS___PLACEMENT_MIG_MEMORY[$tx_id]}"
+    unset "${destination_ns}_MIGRATION_RESERVATION" "${destination_ns}_MIGRATION_SCHEDULER" \
+          "${destination_ns}_MIGRATION_CPU" "${destination_ns}_MIGRATION_MEMORY"
+    __NS___PLACEMENT_MIG_STATE["$tx_id"]=COMMITTED
+}
+
+# Send a prepared migration bundle over BRIDGE Authorized Bulk ABI v1.
+# The bundle is split into semantic sections so destination paths are rebuilt
+# locally and no source filesystem path crosses the MACHINE boundary.
+__NS___placement_remote_migration_send_bundle() {
+    [ $# -eq 7 ] || return 64
+    local bridge_ns="$1" remote_id="$2" local_id="$3" capability="$4" tx_id="$5" bundle_dir="$6" source_ns="$7"
+    [[ "$bridge_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$source_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    declare -F "${bridge_ns}_bridge_send_bulk" >/dev/null 2>&1 || return 66
+    local uuid_var="${source_ns}_OBJECT_UUID" id_var="${source_ns}_OBJECT_ID" payload='' object_type='' expected=''
+    [[ -n "${!uuid_var:-}" && -n "${!id_var:-}" ]] || return 75
+    [[ -r "$bundle_dir/raw.snapshot" && -r "$bundle_dir/object.type" && -r "$bundle_dir/worker.bash" && -r "$bundle_dir/worker.sha256" ]] || return 3
+    IFS= read -r object_type <"$bundle_dir/object.type" || return
+    IFS= read -r expected <"$bundle_dir/worker.sha256" || return
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" META \
+        "${!uuid_var}"$'\t'"${!id_var}"$'\t'BLANK || return
+    IFS= read -r -d '' payload <"$bundle_dir/raw.snapshot" || true
+    local chunk
+    while [[ -n "$payload" ]]; do
+        chunk="${payload:0:8192}"; payload="${payload:8192}"
+        "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" RAW_SNAPSHOT "$chunk" || return
+    done
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" OBJECT_TYPE "$object_type" || return
+    IFS= read -r -d '' payload <"$bundle_dir/worker.bash" || true
+    while [[ -n "$payload" ]]; do
+        chunk="${payload:0:8192}"; payload="${payload:8192}"
+        "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" WORKER "$chunk" || return
+    done
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" WORKER_SHA256 "$expected" || return
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" END ''
+}
+
+__NS___placement_migration_bulk_init() {
+    declare -p __NS___PLACEMENT_BULK_DIR >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_BULK_DIR=()
+    declare -p __NS___PLACEMENT_BULK_SEEN >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_BULK_SEEN=()
+}
+
+# Application handler for BRIDGE Authorized Bulk ABI v1.  It accepts migration
+# material only for an already admitted PREPARED transaction.
+__NS___placement_migration_bulk_receive() {
+    [ $# -eq 5 ] || return 64
+    local src="$1" dst="$2" tx_id="$3" section="$4" payload="$5"
+    __NS___placement_init || return; __NS___placement_migration_bulk_init || return
+    [[ "${__NS___PLACEMENT_MIG_STATE[$tx_id]:-}" == PREPARED ]] || return 74
+    local dir="${__NS___PLACEMENT_BULK_DIR[$tx_id]:-}"
+    if [[ -z "$dir" ]]; then
+        dir="${TMPDIR:-/tmp}/dalo-migration-${BASHPID}-${tx_id//[^A-Za-z0-9_.-]/_}"
+        mkdir -p "$dir" || return
+        chmod 700 "$dir" || return
+        __NS___PLACEMENT_BULK_DIR["$tx_id"]="$dir"
+    fi
+    case "$section" in
+        META) printf '%s\n' "$payload" >"$dir/meta" || return ;;
+        RAW_SNAPSHOT)
+            [[ -v "__NS___PLACEMENT_BULK_SEEN[$tx_id:RAW_SNAPSHOT]" ]] || : >"$dir/raw.snapshot"
+            printf '%s' "$payload" >>"$dir/raw.snapshot" || return ;;
+        OBJECT_TYPE) printf '%s\n' "$payload" >"$dir/object.type" || return ;;
+        WORKER)
+            [[ -v "__NS___PLACEMENT_BULK_SEEN[$tx_id:WORKER]" ]] || : >"$dir/worker.bash"
+            printf '%s' "$payload" >>"$dir/worker.bash" || return ;;
+        WORKER_SHA256) printf '%s\n' "$payload" >"$dir/worker.sha256" || return ;;
+        END)
+            local uuid='' source_obj_id='' object_type='' expected='' actual='' blank _bulk_imported_ns='' _bulk_imported_obj_id=''
+            [[ -r "$dir/meta" && -r "$dir/raw.snapshot" && -r "$dir/object.type" && -r "$dir/worker.bash" && -r "$dir/worker.sha256" ]] || return 75
+            IFS=$'\t' read -r uuid source_obj_id object_type <"$dir/meta" || return
+            [[ -n "$uuid" && -n "$source_obj_id" && "$object_type" == BLANK ]] || return 76
+            IFS= read -r expected <"$dir/worker.sha256" || return
+            actual="$(__dalo_sha256_file "$dir/worker.bash")" || return
+            [[ "$actual" == "$expected" ]] || return 77
+            blank="${__NS___PLACEMENT_MIG_BLANK[$tx_id]}"
+            { printf 'ASYNC_OBJECT_MIGRATION\t1\n'; printf 'UUID\t%q\n' "$uuid"; printf 'SOURCE_OBJ_ID\t%q\n' "$source_obj_id"; printf 'OBJECT_TYPE\t%q\n' BLANK; printf 'SNAPSHOT\t%q\n' "$dir/raw.snapshot"; printf 'END\n'; } >"$dir/object.snapshot" || return
+            migration_flood_prepared_blank "$blank" "$dir" _bulk_imported_ns _bulk_imported_obj_id || return
+            [[ "$_bulk_imported_ns" == "$blank" ]] || return 78
+            __NS___PLACEMENT_MIG_STATE["$tx_id"]=IMPORTED
+            ;;
+        *) return 79 ;;
+    esac
+    __NS___PLACEMENT_BULK_SEEN["$tx_id:$section"]=1
+}
+
+# Distributed Topology Cutover ABI v1.  Each MACHINE owns and mutates only
+# its local route namespace.  PREPARE snapshots the exact old edge, COMMIT
+# installs the new edge, and ROLLBACK restores it.
+__NS___placement_topology_init() {
+    declare -p __NS___TOPOLOGY_STATE >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_STATE=()
+    declare -p __NS___TOPOLOGY_ROUTE_NS >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_ROUTE_NS=()
+    declare -p __NS___TOPOLOGY_SRC_PORT >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_SRC_PORT=()
+    declare -p __NS___TOPOLOGY_OLD_DST_NS >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_OLD_DST_NS=()
+    declare -p __NS___TOPOLOGY_OLD_DST_PORT >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_OLD_DST_PORT=()
+    declare -p __NS___TOPOLOGY_NEW_DST_NS >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_NEW_DST_NS=()
+    declare -p __NS___TOPOLOGY_NEW_DST_PORT >/dev/null 2>&1 || declare -gA __NS___TOPOLOGY_NEW_DST_PORT=()
+}
+
+__NS___placement_topology_prepare() {
+    [ $# -eq 5 ] || return 64
+    local tx="$1" route_ns="$2" src_port="$3" dst_ns="$4" dst_port="$5"
+    __NS___placement_topology_init
+    [[ "$tx" =~ ^[A-Za-z0-9_.:-]+$ && "$route_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$src_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ && "$dst_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+       "$dst_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 71
+    [[ -z "${__NS___TOPOLOGY_STATE[$tx]:-}" ]] || return 74
+    local nsvar="${route_ns}_ROUTE_DST_NS" portvar="${route_ns}_ROUTE_DST_PORT"
+    declare -p "$nsvar" >/dev/null 2>&1 && declare -p "$portvar" >/dev/null 2>&1 || return 66
+    local -n rns="$nsvar" rport="$portvar"
+    [[ -v "rns[$src_port]" && -v "rport[$src_port]" ]] || return 75
+    declare -F "${dst_ns}_summon_worker" >/dev/null 2>&1 || return 66
+    __NS___TOPOLOGY_ROUTE_NS["$tx"]="$route_ns"; __NS___TOPOLOGY_SRC_PORT["$tx"]="$src_port"
+    __NS___TOPOLOGY_OLD_DST_NS["$tx"]="${rns[$src_port]}"; __NS___TOPOLOGY_OLD_DST_PORT["$tx"]="${rport[$src_port]}"
+    __NS___TOPOLOGY_NEW_DST_NS["$tx"]="$dst_ns"; __NS___TOPOLOGY_NEW_DST_PORT["$tx"]="$dst_port"
+    __NS___TOPOLOGY_STATE["$tx"]=PREPARED
+}
+
+__NS___placement_topology_commit() {
+    [ $# -eq 1 ] || return 64
+    local tx="$1"; __NS___placement_topology_init
+    [[ "${__NS___TOPOLOGY_STATE[$tx]:-}" == PREPARED ]] || return 74
+    local route_ns="${__NS___TOPOLOGY_ROUTE_NS[$tx]}" src_port="${__NS___TOPOLOGY_SRC_PORT[$tx]}"
+    local nsvar="${route_ns}_ROUTE_DST_NS" portvar="${route_ns}_ROUTE_DST_PORT"
+    local -n rns="$nsvar" rport="$portvar"
+    rns["$src_port"]="${__NS___TOPOLOGY_NEW_DST_NS[$tx]}"; rport["$src_port"]="${__NS___TOPOLOGY_NEW_DST_PORT[$tx]}"
+    __NS___TOPOLOGY_STATE["$tx"]=COMMITTED
+}
+
+__NS___placement_topology_rollback() {
+    [ $# -eq 1 ] || return 64
+    local tx="$1"; __NS___placement_topology_init
+    case "${__NS___TOPOLOGY_STATE[$tx]:-}" in
+        PREPARED) __NS___TOPOLOGY_STATE["$tx"]=ROLLED_BACK; return 0 ;;
+        COMMITTED) ;;
+        ROLLED_BACK) return 0 ;;
+        *) return 74 ;;
+    esac
+    local route_ns="${__NS___TOPOLOGY_ROUTE_NS[$tx]}" src_port="${__NS___TOPOLOGY_SRC_PORT[$tx]}"
+    local nsvar="${route_ns}_ROUTE_DST_NS" portvar="${route_ns}_ROUTE_DST_PORT"
+    local -n rns="$nsvar" rport="$portvar"
+    rns["$src_port"]="${__NS___TOPOLOGY_OLD_DST_NS[$tx]}"; rport["$src_port"]="${__NS___TOPOLOGY_OLD_DST_PORT[$tx]}"
+    __NS___TOPOLOGY_STATE["$tx"]=ROLLED_BACK
+}
+
+__NS___placement_migration_rollback_committed() {
+    [ $# -eq 1 ] || return 64
+    local tx="$1"; __NS___placement_init || return
+    [[ "${__NS___PLACEMENT_MIG_STATE[$tx]:-}" == COMMITTED ]] || return 74
+    local ns="${__NS___PLACEMENT_MIG_BLANK[$tx]:-}"
+    [[ -n "$ns" ]] || return 75
+    migration_discard_imported_object "$ns" || return
+    __NS___PLACEMENT_MIG_STATE["$tx"]=ROLLED_BACK
+}
+
+# Generic remote transaction command.  Arguments after OP are encoded in the
+# existing Control ABI and capability-gated by exact Q:<operation>.
+__NS___placement_remote_command() {
+    [ $# -ge 7 ] || return 64
+    local outvar="$1" bridge_ns="$2" remote_id="$3" local_id="$4" capability="$5" remote_target="$6" op="$7"; shift 7
+    local request_id raw reply_target="remote|${local_id}|ns:__NS__"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$bridge_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    declare -F "${bridge_ns}_forward_tcp_control" >/dev/null 2>&1 || return 66
+    __NS___control_next_request_id request_id || return
+    __NS___ORCH_PENDING["$request_id"]=1; __NS___ORCH_STATUS["$request_id"]=PENDING
+    __NS___ORCH_OPERATION["$request_id"]="$op"; __NS___ORCH_RESULT["$request_id"]=''; __NS___ORCH_ERROR["$request_id"]=''
+    raw="$(__NS___fifo_frame_encode Q 1 "$request_id" "remote:${local_id}" "$remote_target" "$reply_target" "$op" 0 "$@")" || return
+    if ! "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$capability" "$raw"; then
+        local rc=$?; unset '__NS___ORCH_PENDING['"$request_id"']'
+        __NS___ORCH_STATUS["$request_id"]=SEND_ERROR; __NS___ORCH_ERROR["$request_id"]="$rc"; return "$rc"
+    fi
+    printf -v "$outvar" '%s' "$request_id"
+}
+
+# Issue a migration offer through an already-connected local BRIDGE.
+__NS___placement_remote_migration_command() {
+    [ $# -eq 8 ] || return 64
+    local outvar="$1" bridge_ns="$2" remote_id="$3" local_id="$4" capability="$5" remote_target="$6" op="$7" tx_id="$8"
+    [[ "$op" == SCHED_MIGRATION_COMMIT || "$op" == SCHED_MIGRATION_ABORT || "$op" == SCHED_MIGRATION_QUERY ||
+       "$op" == SCHED_MIGRATION_ROLLBACK_COMMITTED || "$op" == SCHED_TOPOLOGY_COMMIT ||
+       "$op" == SCHED_TOPOLOGY_ROLLBACK ]] || return 71
+    local request_id raw reply_target="remote|${local_id}|ns:__NS__"
+    __NS___control_next_request_id request_id || return
+    __NS___ORCH_PENDING["$request_id"]=1; __NS___ORCH_STATUS["$request_id"]=PENDING
+    __NS___ORCH_OPERATION["$request_id"]="$op"; __NS___ORCH_RESULT["$request_id"]=''; __NS___ORCH_ERROR["$request_id"]=''
+    raw="$(__NS___fifo_frame_encode Q 1 "$request_id" "remote:${local_id}" "$remote_target" "$reply_target" "$op" 0 "$tx_id")" || return
+    "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$capability" "$raw" || return
+    printf -v "$outvar" '%s' "$request_id"
+}
+
+__NS___placement_remote_migration_offer() {
+    [ $# -eq 11 ] || return 64
+    local outvar="$1" bridge_ns="$2" remote_id="$3" local_id="$4" capability="$5" remote_target="$6"
+    local tx_id="$7" object_id="$8" cpu="$9"; shift 9
+    local memory="$1" reason="$2" request_id raw reply_target="remote|${local_id}|ns:__NS__"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$bridge_ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    declare -F "${bridge_ns}_forward_tcp_control" >/dev/null 2>&1 || return 66
+    __NS___control_next_request_id request_id || return
+    __NS___ORCH_PENDING["$request_id"]=1
+    __NS___ORCH_STATUS["$request_id"]=PENDING
+    __NS___ORCH_OPERATION["$request_id"]=SCHED_MIGRATION_OFFER
+    __NS___ORCH_RESULT["$request_id"]=
+    __NS___ORCH_ERROR["$request_id"]=
+    raw="$(__NS___fifo_frame_encode Q 1 "$request_id" "remote:${local_id}" "$remote_target" "$reply_target" \
+        SCHED_MIGRATION_OFFER 0 "$tx_id" "$object_id" "$cpu" "$memory" "$reason")" || return
+    if ! "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$capability" "$raw"; then
+        local rc=$?
+        unset '__NS___ORCH_PENDING['"$request_id"']'
+        __NS___ORCH_STATUS["$request_id"]=SEND_ERROR
+        __NS___ORCH_ERROR["$request_id"]="$rc"
+        return "$rc"
+    fi
+    printf -v "$outvar" '%s' "$request_id"
+}
+SCHED_PLACEMENT_EOF
+)"
+    body="${body//__NS__/$ns}"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
+# ============================================================================
 # 8b. MIGRATION RESOURCE ADMISSION ABI v1
 # ============================================================================
 # This layer coordinates source quiescence with destination MACHINE capacity.
@@ -3771,14 +4199,10 @@ migration_import() {
 }
 
 # Flood an already-prepared destination BLANK.  No new OBJECT is allocated.
-migration_flood_blank_with_worker() {
+migration_flood_prepared_blank() {
     [ $# -eq 4 ] || return 64
-    local tx_id="$1" bundle_dir="$2" out_ns="$3" out_obj_id="$4"
-    __dalo_migration_resource_init
-    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == PREPARED ]] || return 74
-    local blank="${DALO_MIGRATION_TX_DEST_BLANK[$tx_id]:-}"
+    local blank="$1" bundle_dir="$2" out_ns="$3" out_obj_id="$4"
     [[ -n "$blank" ]] || return 75
-
     local expected actual
     [[ -r "$bundle_dir/object.snapshot" && -r "$bundle_dir/worker.bash" &&
        -r "$bundle_dir/worker.sha256" ]] || return 3
@@ -3810,6 +4234,16 @@ migration_flood_blank_with_worker() {
     declare -g "$out_ns" "$out_obj_id"
     printf -v "$out_ns" '%s' "$blank"
     printf -v "$out_obj_id" '%s' "$imported_obj_id"
+}
+
+migration_flood_blank_with_worker() {
+    [ $# -eq 4 ] || return 64
+    local tx_id="$1" bundle_dir="$2" out_ns="$3" out_obj_id="$4"
+    __dalo_migration_resource_init
+    [[ "${DALO_MIGRATION_TX_STATE[$tx_id]:-}" == PREPARED ]] || return 74
+    local blank="${DALO_MIGRATION_TX_DEST_BLANK[$tx_id]:-}"
+    [[ -n "$blank" ]] || return 75
+    migration_flood_prepared_blank "$blank" "$bundle_dir" "$out_ns" "$out_obj_id"
 }
 
 migration_import_with_worker() {
@@ -4229,7 +4663,15 @@ def _dalo_bridge_ensure(_timeout=0):
 def _dalo_bridge_recv(_timeout=0):
     _s=_dalo_bridge_ensure(_timeout)
     if _s is None: return '__DALO_DISCOVERY_HANDLED__'
-    _s.settimeout(None if float(_timeout)==0 else float(_timeout))
+    # Timeout governs waiting for the *start* of a frame only.  Once the
+    # socket is readable, consume the complete length-prefixed frame without a
+    # per-chunk timeout; otherwise a timeout after the 8-byte header would lose
+    # framing and permanently desynchronize the stream for large payloads.
+    if float(_timeout) != 0:
+        import select
+        if not select.select([_s],[],[],float(_timeout))[0]:
+            raise TimeoutError('bridge receive timeout')
+    _s.settimeout(None)
     def _rxn(_n):
         _b=b''
         while len(_b)<_n:
@@ -4340,6 +4782,56 @@ __NS___bridge_send_data() {
     __NS___tcp_send "$frame"
 }
 
+# BRIDGE Authorized Bulk ABI v1.  BULK is a transport primitive: BRIDGE
+# authenticates the exact kind and dispatches it, but does not interpret its
+# application payload (migration is only one possible consumer).
+__NS___bridge_bulk_bind_handler() {
+    [ $# -eq 2 ] || return 2
+    local kind="$1" handler="$2"
+    [[ "$kind" =~ ^[A-Z][A-Z0-9_]*$ && "$handler" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 71
+    declare -F "$handler" >/dev/null 2>&1 || return 66
+    declare -p __NS___BRIDGE_BULK_HANDLER >/dev/null 2>&1 || declare -gA __NS___BRIDGE_BULK_HANDLER=()
+    __NS___BRIDGE_BULK_HANDLER["$kind"]="$handler"
+}
+
+__NS___bridge_bulk_grant() {
+    [ $# -eq 4 ] || return 2
+    local src="$1" dst="$2" capability="$3" kind="$4"
+    [[ "$kind" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 71
+    __NS___tcp_cap_grant "$src" "$dst" "$capability" "BULK:$kind"
+}
+
+__NS___bridge_send_bulk() {
+    [ $# -eq 7 ] || return 2
+    local src="$1" dst="$2" capability="$3" kind="$4" tx="$5" section="$6" payload="$7"
+    local qsrc qdst qcap qkind qtx qsection qpayload frame
+    [[ "$kind" =~ ^[A-Z][A-Z0-9_]*$ && "$section" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 71
+    printf -v qsrc '%q' "$src"; printf -v qdst '%q' "$dst"; printf -v qcap '%q' "$capability"
+    printf -v qkind '%q' "$kind"; printf -v qtx '%q' "$tx"; printf -v qsection '%q' "$section"; printf -v qpayload '%q' "$payload"
+    printf -v frame 'BULK\t1\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+        "$qsrc" "$qdst" "$qcap" "$qkind" "$qtx" "$qsection" "$qpayload"
+    __NS___tcp_send "$frame"
+}
+
+__NS___bridge_receive_bulk() {
+    [ $# -eq 1 ] || return 2
+    local line="$1" tag ver esrc edst ecap ekind etx esection epayload src dst cap kind tx section payload key handler
+    IFS=$'\t' read -r tag ver esrc edst ecap ekind etx esection epayload <<<"$line"
+    [[ "$tag" == BULK && "$ver" == 1 && -n "$epayload" ]] || return 81
+    __asyncobj_decode_q "$esrc" src || return 81; __asyncobj_decode_q "$edst" dst || return 81
+    __asyncobj_decode_q "$ecap" cap || return 81; __asyncobj_decode_q "$ekind" kind || return 81
+    __asyncobj_decode_q "$etx" tx || return 81; __asyncobj_decode_q "$esection" section || return 81
+    __asyncobj_decode_q "$epayload" payload || return 81
+    [[ "$kind" =~ ^[A-Z][A-Z0-9_]*$ && "$section" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 78
+    if [[ -n "${__NS___TCP_EXPECT_DST:-}" && "$dst" != "${__NS___TCP_EXPECT_DST}" ]]; then return 82; fi
+    __NS___tcp_cap_key key "$src" "$dst" "$cap:BULK:$kind" || return
+    [[ -n "${__NS___TCP_CAPS[$key]:-}" ]] || return 83
+    declare -p __NS___BRIDGE_BULK_HANDLER >/dev/null 2>&1 || return 84
+    handler="${__NS___BRIDGE_BULK_HANDLER[$kind]:-}"
+    [[ -n "$handler" ]] || return 84
+    "$handler" "$src" "$dst" "$tx" "$section" "$payload"
+}
+
 __NS___bridge_receive_once() {
     local line payload target
     __NS___tcp_receive line "${1:-1}" || return
@@ -4353,6 +4845,9 @@ __NS___bridge_receive_once() {
         CTRL$'\t'*)
             __NS___tcp_capability_gate "$line" || return
             __NS___bridge_forward_control_local "$__NS___TCP_GATE_RAW"
+            ;;
+        BULK$'\t'1$'\t'*)
+            __NS___bridge_receive_bulk "$line"
             ;;
         *) return 5 ;;
     esac
@@ -4391,6 +4886,282 @@ COMM_EOF
     body="${body//__NS__/$ns}"
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
+
+__ant_frame_encode() {
+    [ $# -ge 2 ] || return 2
+    local out="$1" type="$2"; shift 2
+    [[ "$type" =~ ^[A-Z_]+$ ]] || return 2
+    local _ant_encoded="" arg q
+    printf -v _ant_encoded 'ANT\t1\t%s\t%d' "$type" "$#"
+    for arg in "$@"; do
+        [[ "$arg" != *$'\n'* && "$arg" != *$'\r'* ]] || return 3
+        printf -v q '%q' "$arg"
+        _ant_encoded+=$'\t'"$q"
+    done
+    printf -v "$out" '%s' "$_ant_encoded"
+}
+
+__ant_decode_q() {
+    [ $# -eq 2 ] || return 2
+    local out="$1" encoded="$2" value
+    # %q is produced locally/by a cooperating MACHINE. Reject obvious command
+    # substitutions before eval; this is framing, not an authorization layer.
+    [[ "$encoded" != *'$('* && "$encoded" != *'`'* ]] || return 3
+    eval "value=$encoded" || return
+    printf -v "$out" '%s' "$value"
+}
+
+__ant_frame_decode() {
+    [ $# -eq 3 ] || return 2
+    local _ant_raw="$1" _ant_type_out="$2" _ant_argv_out="$3"
+    local _ant_tag _ant_ver _ant_type _ant_argc _ant_value
+    local -a _ant_fields=()
+    IFS=$'\t' read -r -a _ant_fields <<<"$_ant_raw"
+    ((${#_ant_fields[@]} >= 4)) || return 3
+    _ant_tag="${_ant_fields[0]}"; _ant_ver="${_ant_fields[1]}"
+    _ant_type="${_ant_fields[2]}"; _ant_argc="${_ant_fields[3]}"
+    [[ "$_ant_tag" == ANT && "$_ant_ver" == 1 && "$_ant_type" =~ ^[A-Z_]+$ && "$_ant_argc" =~ ^[0-9]+$ ]] || return 3
+    ((${#_ant_fields[@]} == 4 + _ant_argc)) || return 3
+    local -a _ant_decoded=()
+    local _ant_i
+    for ((_ant_i=0; _ant_i<_ant_argc; _ant_i++)); do
+        __ant_decode_q _ant_value "${_ant_fields[4+_ant_i]}" || return
+        _ant_decoded+=("$_ant_value")
+    done
+    printf -v "$_ant_type_out" '%s' "$_ant_type"
+    local -n _ant_argv_ref="$_ant_argv_out"
+    _ant_argv_ref=("${_ant_decoded[@]}")
+}
+
+define_ant_exchange_api() {
+    local ns="$1" body
+    body=$(cat <<'ANT_EOF'
+__NS___ant_init() {
+    eval "declare -g -A __NS___ANT_LEASE_LIMIT=()"
+    eval "declare -g -A __NS___ANT_LEASE_BUSY=()"
+    eval "declare -g -A __NS___ANT_LEASE_OWNER=()"
+    eval "declare -g -A __NS___ANT_JOB_LEASE=()"
+    eval "declare -g -A __NS___ANT_JOB_PID=()"
+    eval "declare -g -A __NS___ANT_JOB_RESULT_FILE=()"
+    eval "declare -g -A __NS___ANT_JOB_DIR=()"
+    eval "declare -g -A __NS___ANT_JOB_RESULT_FILE=()"
+    eval "declare -g -A __NS___ANT_RESULT_RC=()"
+    eval "declare -g -A __NS___ANT_RESULT_DATA=()"
+    eval "declare -g -A __NS___ANT_LEASE_RESERVATION=()"
+    eval "declare -g -A __NS___ANT_LEASE_CPU_PER_ANT=()"
+    eval "declare -g -A __NS___ANT_LEASE_MEMORY_PER_ANT=()"
+    printf -v "__NS___ANT_LEASE_SEQ" '%s' 0
+    printf -v "__NS___ANT_JOB_SEQ" '%s' 0
+}
+
+__NS___ant_available() {
+    __NS___resource_refresh_workers || return
+    local free="${__NS___RESOURCE[workers.free]:-0}" lease occupied=0
+    for lease in "${!__NS___ANT_LEASE_LIMIT[@]}"; do
+        occupied=$((occupied + ${__NS___ANT_LEASE_LIMIT[$lease]:-0}))
+    done
+    free=$((free - occupied)); ((free < 0)) && free=0
+    printf '%s\n' "$free"
+}
+
+__NS___ant_send() {
+    [ $# -ge 1 ] || return 2
+    local frame
+    __ant_frame_encode frame "$@" || return
+    __NS___tcp_send "$frame"
+}
+
+__NS___ant_request_resources() {
+    __NS___ant_send RESOURCE_QUERY
+}
+
+__NS___ant_request_lease() {
+    [ $# -eq 3 ] || return 2
+    [[ "$1" =~ ^[1-9][0-9]*$ && "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9]+$ ]] || return 2
+    __NS___ant_send LEASE_REQUEST "$1" "$2" "$3"
+}
+
+__NS___ant_release_lease() {
+    [ $# -eq 1 ] || return 2
+    __NS___ant_send LEASE_RELEASE "$1"
+}
+
+__NS___ant_submit() {
+    [ $# -ge 3 ] || return 2
+    local lease="$1" artifact="$2"; shift 2
+    [[ -r "$artifact" ]] || return 3
+    local code hash job_id
+    code="$(base64 <"$artifact" | tr -d '\n')" || return
+    hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
+    printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
+    job_id="${__NS___ANT_JOB_SEQ}"
+    __NS___ant_send JOB "$lease" "$job_id" "$hash" "$code" "$@"
+    printf '%s\n' "$job_id"
+}
+
+__NS___ant_handle_resource_query() {
+    local total free offered
+    __NS___resource_refresh_workers || return
+    total="${__NS___RESOURCE[workers.total]:-0}"
+    free="$(__NS___ant_available)" || return
+    offered="$free"
+    __NS___ant_send RESOURCE_REPLY "$total" "$free" "$offered"
+}
+
+__NS___ant_handle_lease_request() {
+    [ $# -eq 3 ] || return 2
+    local wanted="$1" cpu_per_ant="$2" memory_per_ant="$3" available grant lease
+    local scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid owner total_cpu total_memory reserve_rc
+    [[ "$wanted" =~ ^[1-9][0-9]*$ && "$cpu_per_ant" =~ ^[0-9]+$ && "$memory_per_ant" =~ ^[0-9]+$ ]] || return 2
+    [[ -n "$scheduler_ns" ]] || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
+    declare -F "${scheduler_ns}_scheduler_can_fit" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
+    declare -F "${scheduler_ns}_scheduler_reserve" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
+    available="$(__NS___ant_available)" || return
+    grant="$wanted"; ((grant > available)) && grant="$available"
+    while ((grant > 0)); do
+        total_cpu=$((grant * cpu_per_ant)); total_memory=$((grant * memory_per_ant))
+        "${scheduler_ns}_scheduler_can_fit" "$total_cpu" "$total_memory" && break
+        grant=$((grant - 1))
+    done
+    if ((grant == 0)); then
+        __NS___ant_send LEASE_DENY no_capacity
+        return
+    fi
+    printf -v "__NS___ANT_LEASE_SEQ" '%s' "$(( ${__NS___ANT_LEASE_SEQ:-0} + 1 ))"
+    lease="lease_${__NS___ANT_LEASE_SEQ}"
+    owner="ant:__NS__:${lease}"
+    total_cpu=$((grant * cpu_per_ant)); total_memory=$((grant * memory_per_ant))
+    reserve_rc=0
+    "${scheduler_ns}_scheduler_reserve" rid "$owner" "$total_cpu" "$total_memory" || reserve_rc=$?
+    if ((reserve_rc != 0)); then
+        __NS___ant_send LEASE_DENY reserve_failed "$reserve_rc"
+        return "$reserve_rc"
+    fi
+    __NS___ANT_LEASE_LIMIT["$lease"]="$grant"
+    __NS___ANT_LEASE_BUSY["$lease"]=0
+    __NS___ANT_LEASE_OWNER["$lease"]="$owner"
+    __NS___ANT_LEASE_RESERVATION["$lease"]="$rid"
+    __NS___ANT_LEASE_CPU_PER_ANT["$lease"]="$cpu_per_ant"
+    __NS___ANT_LEASE_MEMORY_PER_ANT["$lease"]="$memory_per_ant"
+    __NS___ant_send LEASE_GRANT "$lease" "$grant"
+}
+
+__NS___ant_handle_lease_release() {
+    local lease="$1" busy scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid owner
+    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send ERROR unknown_lease; return 1; }
+    busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
+    ((busy == 0)) || { __NS___ant_send ERROR lease_busy "$lease" "$busy"; return 1; }
+    rid="${__NS___ANT_LEASE_RESERVATION[$lease]:-}"; owner="${__NS___ANT_LEASE_OWNER[$lease]:-}"
+    [[ -n "$scheduler_ns" && -n "$rid" && -n "$owner" ]] || { __NS___ant_send ERROR lease_accounting_missing "$lease"; return 1; }
+    declare -F "${scheduler_ns}_scheduler_release" >/dev/null 2>&1 || { __NS___ant_send ERROR scheduler_unavailable; return 1; }
+    "${scheduler_ns}_scheduler_release" "$owner" "$rid" || { __NS___ant_send ERROR release_failed "$lease"; return 1; }
+    unset '__NS___ANT_LEASE_LIMIT[$lease]' '__NS___ANT_LEASE_BUSY[$lease]' '__NS___ANT_LEASE_OWNER[$lease]'
+    unset '__NS___ANT_LEASE_RESERVATION[$lease]' '__NS___ANT_LEASE_CPU_PER_ANT[$lease]' '__NS___ANT_LEASE_MEMORY_PER_ANT[$lease]'
+    __NS___ant_send LEASE_RELEASED "$lease"
+}
+
+__NS___ant_handle_job() {
+    [ $# -ge 4 ] || return 2
+    local lease="$1" job_id="$2" expected_hash="$3" code64="$4"; shift 4
+    local limit busy dir artifact actual_hash pid result_file
+    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send RESULT "$job_id" 125 unknown_lease; return 1; }
+    limit="${__NS___ANT_LEASE_LIMIT[$lease]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
+    ((busy < limit)) || { __NS___ant_send RESULT "$job_id" 126 lease_full; return 1; }
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/__NS__.ant.${job_id}.XXXXXX")" || return
+    artifact="$dir/worker.bash"; result_file="$dir/result.frame"
+    printf '%s' "$code64" | base64 -d >"$artifact" || { rm -rf "$dir"; return; }
+    actual_hash="$(sha256sum "$artifact" | awk '{print $1}')" || { rm -rf "$dir"; return; }
+    [[ "$actual_hash" == "$expected_hash" ]] || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 127 hash_mismatch; return 1; }
+    bash -n "$artifact" || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 128 syntax_error; return 1; }
+    __NS___ANT_LEASE_BUSY["$lease"]=$((busy + 1))
+    # Child owns only execution. It returns one local frame through an atomic
+    # rename; only the canonical HOST parent owns and writes the TCP endpoint.
+    (
+        set +e; source "$artifact"
+        if declare -F worker >/dev/null; then result="$(worker "$dir" 0 "$@" 2>&1)"; rc=$?; else result=missing_worker_function; rc=129; fi
+        frame=""; __ant_frame_encode frame CHILD_RESULT "$job_id" "$rc" "$result" || exit 130
+        printf '%s\n' "$frame" >"${result_file}.tmp" && mv -f "${result_file}.tmp" "$result_file"
+    ) &
+    pid=$!
+    __NS___ANT_JOB_LEASE["$job_id"]="$lease"; __NS___ANT_JOB_PID["$job_id"]="$pid"
+    __NS___ANT_JOB_RESULT_FILE["$job_id"]="$result_file"; __NS___ANT_JOB_DIR["$job_id"]="$dir"
+}
+
+__NS___ant_reap() {
+    local job pid lease busy file raw type dir
+    local -a argv=()
+    for job in "${!__NS___ANT_JOB_PID[@]}"; do
+        pid="${__NS___ANT_JOB_PID[$job]}"; file="${__NS___ANT_JOB_RESULT_FILE[$job]}"
+        if [[ -s "$file" ]]; then
+            IFS= read -r raw <"$file" || continue; argv=(); __ant_frame_decode "$raw" type argv || continue
+            [[ "$type" == CHILD_RESULT && "${argv[0]}" == "$job" ]] || continue
+            __NS___ant_send RESULT "$job" "${argv[1]}" "${argv[2]-}" || return
+            wait "$pid" 2>/dev/null || true
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true; __NS___ant_send RESULT "$job" 131 child_lost || return
+        else
+            continue
+        fi
+        lease="${__NS___ANT_JOB_LEASE[$job]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-1}"
+        ((busy > 0)) && __NS___ANT_LEASE_BUSY["$lease"]=$((busy - 1))
+        dir="${__NS___ANT_JOB_DIR[$job]:-}"; [[ -n "$dir" ]] && rm -rf "$dir"
+        unset '__NS___ANT_JOB_PID[$job]' '__NS___ANT_JOB_LEASE[$job]' '__NS___ANT_JOB_RESULT_FILE[$job]' '__NS___ANT_JOB_DIR[$job]'
+    done
+}
+
+__NS___ant_receive_once() {
+    local raw type
+    local -a argv=()
+    __NS___ant_reap || return
+    __NS___tcp_receive raw "${1:-1}" || { __NS___ant_reap || true; return 1; }
+    __ant_frame_decode "$raw" type argv || return
+    case "$type" in
+        RESOURCE_QUERY) __NS___ant_handle_resource_query ;;
+        RESOURCE_REPLY)
+            __NS___PEER_RESOURCE["explicit|workers.total"]="${argv[0]}"
+            __NS___PEER_RESOURCE["explicit|workers.free"]="${argv[1]}"
+            __NS___PEER_RESOURCE["explicit|workers.offered"]="${argv[2]}"
+            ;;
+        LEASE_REQUEST) __NS___ant_handle_lease_request "${argv[0]}" "${argv[1]}" "${argv[2]}" ;;
+        LEASE_GRANT)
+            printf -v "__NS___ANT_REMOTE_LEASE" '%s' "${argv[0]}"
+            printf -v "__NS___ANT_REMOTE_GRANTED" '%s' "${argv[1]}"
+            ;;
+        LEASE_DENY) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
+        LEASE_RELEASE) __NS___ant_handle_lease_release "${argv[0]}" ;;
+        LEASE_RELEASED)
+            [[ "${__NS___ANT_REMOTE_LEASE:-}" == "${argv[0]}" ]] && {
+                unset __NS___ANT_REMOTE_LEASE __NS___ANT_REMOTE_GRANTED
+            }
+            ;;
+        JOB) __NS___ant_handle_job "${argv[@]}" ;;
+        RESULT)
+            __NS___ANT_RESULT_RC["${argv[0]}"]="${argv[1]}"
+            __NS___ANT_RESULT_DATA["${argv[0]}"]="${argv[2]-}"
+            ;;
+        ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
+        *) return 4 ;;
+    esac
+    __NS___ant_reap
+}
+
+__NS___ant_wait_result() {
+    [ $# -ge 1 ] && [ $# -le 2 ] || return 2
+    local job="$1" timeout="${2:-30}" deadline
+    deadline=$((SECONDS + timeout))
+    while [[ ! -v __NS___ANT_RESULT_RC["$job"] ]]; do
+        __NS___ant_receive_once 1 || true
+        ((SECONDS < deadline)) || return 124
+    done
+    printf '%s\n' "${__NS___ANT_RESULT_DATA[$job]}"
+    return "${__NS___ANT_RESULT_RC[$job]}"
+}
+ANT_EOF
+)
+    body="${body//__NS__/$ns}"
+    __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
+}
+
 
 ant_endpoint_constructor() {
     [ $# -ge 4 ] && [ $# -le 5 ] || return 2
@@ -4648,6 +5419,20 @@ __NS___tcp_cap_operation() {
             [[ "$argc" =~ ^[0-9]+$ && "$argc" -ge 1 && -n "$encoded_func" ]] || return 78
             __asyncobj_decode_q "$encoded_func" func || return 78
             printf -v "$out" 'C:%s' "$func"
+            ;;
+        Q|K|E)
+            local decoded_tag=''
+            local -a decoded_argv=()
+            __NS___fifo_frame_decode "$raw" decoded_tag decoded_argv || return 78
+            if [[ "$tag" == Q ]]; then
+                ((${#decoded_argv[@]} >= 6)) || return 78
+                func="${decoded_argv[5]}"
+            else
+                ((${#decoded_argv[@]} >= 2)) || return 78
+                func="${decoded_argv[1]}"
+            fi
+            [[ "$func" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 78
+            printf -v "$out" '%s:%s' "$tag" "$func"
             ;;
         X)
             printf -v "$out" '%s' X

@@ -1,0 +1,22 @@
+{
+  "abi": 1,
+  "name": "scheduler",
+  "language": "bash",
+  "entry": "worker",
+  "artifact": "artifacts/scheduler.bash",
+  "object_types": [
+    "SCHEDULER"
+  ],
+  "inputs": {},
+  "outputs": {},
+  "features": [],
+  "execution": "INLINE",
+  "sha256": "197c648ff8900d64fdaa8f509fc7e3eabc1420ec04d4ff4c9fabbd650fd64711",
+  "runtime_requires": [],
+  "lifecycle": {
+    "start": "worker_start",
+    "poll": "worker_poll",
+    "stop": "worker_stop",
+    "keepalive": true
+  }
+}
