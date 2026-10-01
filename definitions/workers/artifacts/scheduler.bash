@@ -16,6 +16,7 @@ worker_start() {
     "${ns}_orchestrator_init" || return
     "${ns}_control_route_init" || return
     "${ns}_placement_init" || return
+    "${ns}_cluster_init" || return
     "${ns}_scheduler_init" "$cpu_total" "$memory_total" || return
     printf -v "$init_var" '%s' 1
 }
@@ -24,7 +25,8 @@ worker_poll() {
     local ns="${ASYNC_WORKER_NS:?missing ASYNC_WORKER_NS}"
     local init_var="${ns}_SCHEDULER_WORKER_INITIALIZED"
     [[ "${!init_var:-0}" == 1 ]] || return 69
-    "${ns}_scheduler_diagnose"
+    "${ns}_scheduler_diagnose" || return
+    "${ns}_cluster_poll"
 }
 
 worker_stop() {

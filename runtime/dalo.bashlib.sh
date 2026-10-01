@@ -341,6 +341,7 @@ __NS___control_local_ns_from_target() {
     [ $# -eq 2 ] || return 2
     local target="$1" out="$2" resolved
     case "$target" in
+        ns:scheduler) resolved="${DALO_MACHINE_SCHEDULER_NS:-}" ;;
         ns:*) resolved="${target#ns:}" ;;
         -|'') return 1 ;;
         *) resolved="$target" ;; # compatibility with pre-v1 local callers
@@ -639,6 +640,15 @@ __NS___drain_fifo() {
                                "$ctl_func" "${ctl_args[@]:1}" || ctl_rc=$?
                                ((ctl_rc == 0)) && ctl_result=("$ctl_method")
                            fi
+                       fi
+                       ;;
+                   SCHED_CLUSTER_HELLO)
+                       ((${#ctl_args[@]} == 2)) || ctl_rc=64
+                       if ((ctl_rc == 0)); then
+                           local cluster_peer_port="${ctl_args[0]}" cluster_expected_port="${ctl_args[1]}"
+                           [[ "$cluster_peer_port" =~ ^[0-9]+$ && "$cluster_expected_port" =~ ^[0-9]+$ ]] || ctl_rc=71
+                           [[ -n "${DALO_LOCAL_PORTS[$cluster_expected_port]:-}" ]] || ctl_rc=76
+                           ((ctl_rc == 0)) && ctl_result=("$cluster_expected_port")
                        fi
                        ;;
                    SCHED_MIGRATION_OFFER)
@@ -2684,6 +2694,22 @@ __NS___scheduler_release() {
     unset '__NS___RES_CPU['"$rid"']' '__NS___RES_MEMORY['"$rid"']' '__NS___RES_OWNER['"$rid"']' '__NS___BLANK_CLASS['"$rid"']'
 }
 
+__NS___scheduler_reclassify() {
+    [ $# -eq 4 ] || return 64
+    local rid="$1" expected_owner="$2" new_owner="$3" new_class="$4"
+    [[ -v "__NS___RES_OWNER[$rid]" ]] || return 82
+    [[ "${__NS___RES_OWNER[$rid]}" == "$expected_owner" ]] || return 83
+    [[ "$new_owner" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 71
+    [[ -z "$new_class" || "$new_class" == HEADROOM || "$new_class" == ANT_CACHE ]] || return 64
+    if [[ -n "$new_class" ]]; then
+        [[ "$new_owner" == "blank:$new_class" ]] || return 83
+        __NS___BLANK_CLASS["$rid"]="$new_class"
+    else
+        unset '__NS___BLANK_CLASS['"$rid"']'
+    fi
+    __NS___RES_OWNER["$rid"]="$new_owner"
+}
+
 __NS___scheduler_diagnose() {
     (( __NS___CPU_RESERVED >= 0 && __NS___CPU_RESERVED <= __NS___CPU_TOTAL )) || return 84
     (( __NS___MEMORY_RESERVED >= 0 && __NS___MEMORY_RESERVED <= __NS___MEMORY_TOTAL )) || return 84
@@ -2882,6 +2908,90 @@ __NS___placement_init() {
     declare -p __NS___PLACEMENT_MIG_CPU >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_CPU=()
     declare -p __NS___PLACEMENT_MIG_MEMORY >/dev/null 2>&1 || declare -gA __NS___PLACEMENT_MIG_MEMORY=()
 }
+
+# Dynamic Cluster Membership ABI v1.  PORT is the stable MACHINE identity;
+# discovery/IP and BRIDGE connectivity are reachability only.  A peer becomes
+# ACTIVE only after a correlated scheduler HELLO/WELCOME exchange.
+__NS___cluster_init() {
+    declare -p __NS___CLUSTER_STATE >/dev/null 2>&1 || declare -gA __NS___CLUSTER_STATE=()
+    declare -p __NS___CLUSTER_GENERATION >/dev/null 2>&1 || declare -gA __NS___CLUSTER_GENERATION=()
+    declare -p __NS___CLUSTER_BRIDGE >/dev/null 2>&1 || declare -gA __NS___CLUSTER_BRIDGE=()
+    declare -p __NS___CLUSTER_REQUEST >/dev/null 2>&1 || declare -gA __NS___CLUSTER_REQUEST=()
+    declare -p __NS___CLUSTER_REQUEST_PEER >/dev/null 2>&1 || declare -gA __NS___CLUSTER_REQUEST_PEER=()
+}
+
+__NS___cluster_peer_state() {
+    [ $# -eq 2 ] || return 64
+    local out="$1" peer="$2"
+    __NS___cluster_init || return
+    printf -v "$out" '%s' "${__NS___CLUSTER_STATE[$peer]:-UNRESOLVED}"
+}
+
+__NS___cluster_peer_active() {
+    [ $# -eq 1 ] || return 64
+    __NS___cluster_init || return
+    [[ "${__NS___CLUSTER_STATE[$1]:-UNRESOLVED}" == ACTIVE ]]
+}
+
+__NS___cluster_mark_unresolved() {
+    [ $# -eq 1 ] || return 64
+    local peer="$1" req="${__NS___CLUSTER_REQUEST[$1]:-}"
+    __NS___cluster_init || return
+    [[ -z "$req" ]] || unset '__NS___CLUSTER_REQUEST_PEER['"$req"']'
+    unset '__NS___CLUSTER_REQUEST['"$peer"']' '__NS___CLUSTER_BRIDGE['"$peer"']'
+    __NS___CLUSTER_STATE["$peer"]=UNRESOLVED
+}
+
+__NS___cluster_poll() {
+    __NS___cluster_init || return
+    local var bns modev peerv portv peer local_port initv req status result
+    while IFS= read -r var; do
+        [[ "$var" == m_*_OBJECT_TYPE && "${!var:-}" == BRIDGE ]] || continue
+        bns="${var%_OBJECT_TYPE}"
+        modev="${bns}_FIELD_MODE"; peerv="${bns}_FIELD_PEER_PORT"; portv="${bns}_FIELD_PORT"
+        [[ "${!modev:-}" == connect && "${!peerv:-}" =~ ^[0-9]+$ && "${!portv:-}" =~ ^[0-9]+$ ]] || continue
+        peer="${!peerv}"; local_port="${!portv}"; initv="${bns}_BRIDGE_WORKER_INITIALIZED"
+        if [[ "${!initv:-0}" != 1 ]]; then
+            if [[ -n "${DALO_MACHINE_IP[$peer]:-}" ]]; then __NS___CLUSTER_STATE["$peer"]=DISCOVERED
+            else __NS___CLUSTER_STATE["$peer"]=UNRESOLVED; fi
+            req="${__NS___CLUSTER_REQUEST[$peer]:-}"
+            [[ -z "$req" ]] || { unset '__NS___CLUSTER_REQUEST_PEER['"$req"']'; unset '__NS___CLUSTER_REQUEST['"$peer"']'; }
+            continue
+        fi
+        __NS___CLUSTER_BRIDGE["$peer"]="$bns"
+        __NS___control_route_bind "$peer" "$bns" "$local_port" CLUSTER || return
+        req="${__NS___CLUSTER_REQUEST[$peer]:-}"
+        if [[ -n "$req" ]]; then
+            status="${__NS___ORCH_STATUS[$req]:-}"
+            case "$status" in
+                ACK)
+                    result="${__NS___ORCH_RESULT[$req]:-}"
+                    if [[ "$result" == "$peer" ]]; then
+                        [[ "${__NS___CLUSTER_STATE[$peer]:-}" == ACTIVE ]] || ((__NS___CLUSTER_GENERATION["$peer"]=${__NS___CLUSTER_GENERATION["$peer"]:-0}+1))
+                        __NS___CLUSTER_STATE["$peer"]=ACTIVE
+                    else
+                        __NS___CLUSTER_STATE["$peer"]=SUSPECT
+                    fi
+                    unset '__NS___CLUSTER_REQUEST_PEER['"$req"']' '__NS___CLUSTER_REQUEST['"$peer"']'
+                    ;;
+                ERROR|SEND_ERROR)
+                    __NS___CLUSTER_STATE["$peer"]=SUSPECT
+                    unset '__NS___CLUSTER_REQUEST_PEER['"$req"']' '__NS___CLUSTER_REQUEST['"$peer"']'
+                    ;;
+            esac
+            continue
+        fi
+        [[ "${__NS___CLUSTER_STATE[$peer]:-}" == ACTIVE ]] && continue
+        __NS___CLUSTER_STATE["$peer"]=DISCOVERED
+        __NS___placement_remote_command req "$bns" "$peer" "$local_port" CLUSTER ns:scheduler SCHED_CLUSTER_HELLO "$local_port" "$peer" || {
+            __NS___CLUSTER_STATE["$peer"]=SUSPECT
+            continue
+        }
+        __NS___CLUSTER_REQUEST["$peer"]="$req"
+        __NS___CLUSTER_REQUEST_PEER["$req"]="$peer"
+    done < <(compgen -A variable 'm_')
+}
+
 
 # Destination-side migration admission.  Source quiescence remains a source
 # SCHEDULER responsibility and is intentionally not performed here.
@@ -4947,11 +5057,25 @@ __NS___ant_init() {
     eval "declare -g -A __NS___ANT_JOB_RESULT_FILE=()"
     eval "declare -g -A __NS___ANT_RESULT_RC=()"
     eval "declare -g -A __NS___ANT_RESULT_DATA=()"
+    eval "declare -g -A __NS___ANT_REMOTE_REQ_STATE=()"
+    eval "declare -g -A __NS___ANT_REMOTE_REQ_LEASE=()"
+    eval "declare -g -A __NS___ANT_REMOTE_REQ_GRANTED=()"
+    eval "declare -g -A __NS___ANT_REMOTE_REQ_RESERVATION=()"
+    eval "declare -g -A __NS___ANT_REMOTE_REQ_ERROR=()"
+    eval "declare -g -A __NS___ANT_REMOTE_JOB_REQ=()"
+    eval "declare -g -A __NS___ANT_REMOTE_RELEASE_REQ=()"
     eval "declare -g -A __NS___ANT_LEASE_RESERVATION=()"
     eval "declare -g -A __NS___ANT_LEASE_CPU_PER_ANT=()"
     eval "declare -g -A __NS___ANT_LEASE_MEMORY_PER_ANT=()"
+    eval "declare -g -A __NS___ANT_CACHE_RESERVATION=()"
+    eval "declare -g -A __NS___ANT_CACHE_LIMIT=()"
+    eval "declare -g -A __NS___ANT_CACHE_CPU_PER_ANT=()"
+    eval "declare -g -A __NS___ANT_CACHE_MEMORY_PER_ANT=()"
+    eval "declare -g -A __NS___ANT_REMOTE_CACHE_REQ=()"
     printf -v "__NS___ANT_LEASE_SEQ" '%s' 0
     printf -v "__NS___ANT_JOB_SEQ" '%s' 0
+    printf -v "__NS___ANT_REQUEST_SEQ" '%s' 0
+    printf -v "__NS___ANT_CACHE_SEQ" '%s' 0
 }
 
 __NS___ant_available() {
@@ -4975,27 +5099,68 @@ __NS___ant_request_resources() {
     __NS___ant_send RESOURCE_QUERY
 }
 
+__NS___ant_next_request_id() {
+    [ $# -eq 1 ] || return 2
+    local outvar="$1"
+    [[ "$outvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    printf -v "__NS___ANT_REQUEST_SEQ" '%s' "$(( ${__NS___ANT_REQUEST_SEQ:-0} + 1 ))"
+    printf -v "$outvar" '%s' "req_${__NS___ANT_REQUEST_SEQ}"
+}
+
 __NS___ant_request_lease() {
-    [ $# -eq 3 ] || return 2
-    [[ "$1" =~ ^[1-9][0-9]*$ && "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9]+$ ]] || return 2
-    __NS___ant_send LEASE_REQUEST "$1" "$2" "$3"
+    [ $# -eq 4 ] || return 2
+    local request_id="$1"
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && "$2" =~ ^[1-9][0-9]*$ && "$3" =~ ^[0-9]+$ && "$4" =~ ^[0-9]+$ ]] || return 2
+    __NS___ANT_REMOTE_REQ_STATE["$request_id"]=PENDING
+    __NS___ant_send LEASE_REQUEST "$request_id" "$2" "$3" "$4"
 }
 
 __NS___ant_release_lease() {
-    [ $# -eq 1 ] || return 2
-    __NS___ant_send LEASE_RELEASE "$1"
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" lease="$2"
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && -n "$lease" ]] || return 2
+    __NS___ANT_REMOTE_REQ_STATE["$request_id"]=PENDING
+    __NS___ANT_REMOTE_RELEASE_REQ["$request_id"]="$lease"
+    __NS___ant_send LEASE_RELEASE "$request_id" "$lease"
+}
+
+__NS___ant_cache_lease() {
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" lease="$2"
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && -n "$lease" ]] || return 2
+    __NS___ANT_REMOTE_REQ_STATE["$request_id"]=PENDING
+    __NS___ant_send LEASE_CACHE "$request_id" "$lease"
+}
+
+__NS___ant_claim_cache() {
+    [ $# -eq 5 ] || return 2
+    local request_id="$1" cache_id="$2" wanted="$3" cpu="$4" memory="$5"
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && "$cache_id" =~ ^cache_[1-9][0-9]*$ ]] || return 2
+    [[ "$wanted" =~ ^[1-9][0-9]*$ && "$cpu" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || return 2
+    __NS___ANT_REMOTE_REQ_STATE["$request_id"]=PENDING
+    __NS___ant_send CACHE_CLAIM "$request_id" "$cache_id" "$wanted" "$cpu" "$memory"
+}
+
+__NS___ant_evict_cache() {
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" cache_id="$2"
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && "$cache_id" =~ ^cache_[1-9][0-9]*$ ]] || return 2
+    __NS___ANT_REMOTE_REQ_STATE["$request_id"]=PENDING
+    __NS___ANT_REMOTE_CACHE_REQ["$request_id"]="$cache_id"
+    __NS___ant_send CACHE_EVICT "$request_id" "$cache_id"
 }
 
 __NS___ant_submit() {
-    [ $# -ge 3 ] || return 2
-    local lease="$1" artifact="$2"; shift 2
-    [[ -r "$artifact" ]] || return 3
+    [ $# -ge 4 ] || return 2
+    local request_id="$1" lease="$2" artifact="$3"; shift 3
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && -r "$artifact" ]] || return 3
     local code hash job_id
     code="$(base64 <"$artifact" | tr -d '\n')" || return
     hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
     printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
     job_id="${__NS___ANT_JOB_SEQ}"
-    __NS___ant_send JOB "$lease" "$job_id" "$hash" "$code" "$@"
+    __NS___ANT_REMOTE_JOB_REQ["$job_id"]="$request_id"
+    __NS___ant_send JOB "$request_id" "$lease" "$job_id" "$hash" "$code" "$@"
     printf '%s\n' "$job_id"
 }
 
@@ -5009,13 +5174,14 @@ __NS___ant_handle_resource_query() {
 }
 
 __NS___ant_handle_lease_request() {
-    [ $# -eq 3 ] || return 2
-    local wanted="$1" cpu_per_ant="$2" memory_per_ant="$3" available grant lease
+    [ $# -eq 4 ] || return 2
+    local request_id="$1" wanted="$2" cpu_per_ant="$3" memory_per_ant="$4" available grant lease
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 2
     local scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid owner total_cpu total_memory reserve_rc
     [[ "$wanted" =~ ^[1-9][0-9]*$ && "$cpu_per_ant" =~ ^[0-9]+$ && "$memory_per_ant" =~ ^[0-9]+$ ]] || return 2
-    [[ -n "$scheduler_ns" ]] || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
-    declare -F "${scheduler_ns}_scheduler_can_fit" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
-    declare -F "${scheduler_ns}_scheduler_reserve" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY scheduler_unavailable; return 1; }
+    [[ -n "$scheduler_ns" ]] || { __NS___ant_send LEASE_DENY "$request_id" scheduler_unavailable; return 1; }
+    declare -F "${scheduler_ns}_scheduler_can_fit" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY "$request_id" scheduler_unavailable; return 1; }
+    declare -F "${scheduler_ns}_scheduler_reserve" >/dev/null 2>&1 || { __NS___ant_send LEASE_DENY "$request_id" scheduler_unavailable; return 1; }
     available="$(__NS___ant_available)" || return
     grant="$wanted"; ((grant > available)) && grant="$available"
     while ((grant > 0)); do
@@ -5024,7 +5190,7 @@ __NS___ant_handle_lease_request() {
         grant=$((grant - 1))
     done
     if ((grant == 0)); then
-        __NS___ant_send LEASE_DENY no_capacity
+        __NS___ant_send LEASE_DENY "$request_id" no_capacity
         return
     fi
     printf -v "__NS___ANT_LEASE_SEQ" '%s' "$(( ${__NS___ANT_LEASE_SEQ:-0} + 1 ))"
@@ -5034,7 +5200,7 @@ __NS___ant_handle_lease_request() {
     reserve_rc=0
     "${scheduler_ns}_scheduler_reserve" rid "$owner" "$total_cpu" "$total_memory" || reserve_rc=$?
     if ((reserve_rc != 0)); then
-        __NS___ant_send LEASE_DENY reserve_failed "$reserve_rc"
+        __NS___ant_send LEASE_DENY "$request_id" reserve_failed "$reserve_rc"
         return "$reserve_rc"
     fi
     __NS___ANT_LEASE_LIMIT["$lease"]="$grant"
@@ -5043,36 +5209,89 @@ __NS___ant_handle_lease_request() {
     __NS___ANT_LEASE_RESERVATION["$lease"]="$rid"
     __NS___ANT_LEASE_CPU_PER_ANT["$lease"]="$cpu_per_ant"
     __NS___ANT_LEASE_MEMORY_PER_ANT["$lease"]="$memory_per_ant"
-    __NS___ant_send LEASE_GRANT "$lease" "$grant"
+    __NS___ant_send LEASE_GRANT "$request_id" "$lease" "$grant"
 }
 
 __NS___ant_handle_lease_release() {
-    local lease="$1" busy scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid owner
-    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send ERROR unknown_lease; return 1; }
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" lease="$2" busy scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid owner
+    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send ERROR "$request_id" unknown_lease; return 1; }
     busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
-    ((busy == 0)) || { __NS___ant_send ERROR lease_busy "$lease" "$busy"; return 1; }
+    ((busy == 0)) || { __NS___ant_send ERROR "$request_id" lease_busy "$lease" "$busy"; return 1; }
     rid="${__NS___ANT_LEASE_RESERVATION[$lease]:-}"; owner="${__NS___ANT_LEASE_OWNER[$lease]:-}"
-    [[ -n "$scheduler_ns" && -n "$rid" && -n "$owner" ]] || { __NS___ant_send ERROR lease_accounting_missing "$lease"; return 1; }
-    declare -F "${scheduler_ns}_scheduler_release" >/dev/null 2>&1 || { __NS___ant_send ERROR scheduler_unavailable; return 1; }
-    "${scheduler_ns}_scheduler_release" "$owner" "$rid" || { __NS___ant_send ERROR release_failed "$lease"; return 1; }
+    [[ -n "$scheduler_ns" && -n "$rid" && -n "$owner" ]] || { __NS___ant_send ERROR "$request_id" lease_accounting_missing "$lease"; return 1; }
+    declare -F "${scheduler_ns}_scheduler_release" >/dev/null 2>&1 || { __NS___ant_send ERROR "$request_id" scheduler_unavailable; return 1; }
+    "${scheduler_ns}_scheduler_release" "$owner" "$rid" || { __NS___ant_send ERROR "$request_id" release_failed "$lease"; return 1; }
     unset '__NS___ANT_LEASE_LIMIT[$lease]' '__NS___ANT_LEASE_BUSY[$lease]' '__NS___ANT_LEASE_OWNER[$lease]'
     unset '__NS___ANT_LEASE_RESERVATION[$lease]' '__NS___ANT_LEASE_CPU_PER_ANT[$lease]' '__NS___ANT_LEASE_MEMORY_PER_ANT[$lease]'
-    __NS___ant_send LEASE_RELEASED "$lease"
+    __NS___ant_send LEASE_RELEASED "$request_id" "$lease"
+}
+
+__NS___ant_handle_lease_cache() {
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" lease="$2" scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" busy rid owner cache_id
+    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send ERROR "$request_id" unknown_lease; return 1; }
+    busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
+    ((busy == 0)) || { __NS___ant_send ERROR "$request_id" lease_busy "$lease" "$busy"; return 1; }
+    rid="${__NS___ANT_LEASE_RESERVATION[$lease]:-}"; owner="${__NS___ANT_LEASE_OWNER[$lease]:-}"
+    [[ -n "$scheduler_ns" && -n "$rid" && -n "$owner" ]] || { __NS___ant_send ERROR "$request_id" lease_accounting_missing "$lease"; return 1; }
+    declare -F "${scheduler_ns}_scheduler_reclassify" >/dev/null 2>&1 || { __NS___ant_send ERROR "$request_id" scheduler_unavailable; return 1; }
+    printf -v "__NS___ANT_CACHE_SEQ" '%s' "$(( ${__NS___ANT_CACHE_SEQ:-0} + 1 ))"
+    cache_id="cache_${__NS___ANT_CACHE_SEQ}"
+    "${scheduler_ns}_scheduler_reclassify" "$rid" "$owner" "blank:ANT_CACHE" ANT_CACHE || { __NS___ant_send ERROR "$request_id" cache_handoff_failed "$lease"; return 1; }
+    __NS___ANT_CACHE_RESERVATION["$cache_id"]="$rid"
+    __NS___ANT_CACHE_LIMIT["$cache_id"]="${__NS___ANT_LEASE_LIMIT[$lease]}"
+    __NS___ANT_CACHE_CPU_PER_ANT["$cache_id"]="${__NS___ANT_LEASE_CPU_PER_ANT[$lease]}"
+    __NS___ANT_CACHE_MEMORY_PER_ANT["$cache_id"]="${__NS___ANT_LEASE_MEMORY_PER_ANT[$lease]}"
+    unset '__NS___ANT_LEASE_LIMIT[$lease]' '__NS___ANT_LEASE_BUSY[$lease]' '__NS___ANT_LEASE_OWNER[$lease]'
+    unset '__NS___ANT_LEASE_RESERVATION[$lease]' '__NS___ANT_LEASE_CPU_PER_ANT[$lease]' '__NS___ANT_LEASE_MEMORY_PER_ANT[$lease]'
+    __NS___ant_send LEASE_CACHED "$request_id" "$cache_id" "$rid"
+}
+
+__NS___ant_handle_cache_claim() {
+    [ $# -eq 5 ] || return 2
+    local request_id="$1" cache_id="$2" wanted="$3" cpu="$4" memory="$5" scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}"
+    local rid limit lease owner
+    [[ -v __NS___ANT_CACHE_RESERVATION["$cache_id"] ]] || { __NS___ant_send CACHE_DENY "$request_id" unknown_cache; return 1; }
+    limit="${__NS___ANT_CACHE_LIMIT[$cache_id]}"
+    [[ "$wanted" == "$limit" && "$cpu" == "${__NS___ANT_CACHE_CPU_PER_ANT[$cache_id]}" && "$memory" == "${__NS___ANT_CACHE_MEMORY_PER_ANT[$cache_id]}" ]] || { __NS___ant_send CACHE_DENY "$request_id" incompatible_shape; return 1; }
+    rid="${__NS___ANT_CACHE_RESERVATION[$cache_id]}"
+    printf -v "__NS___ANT_LEASE_SEQ" '%s' "$(( ${__NS___ANT_LEASE_SEQ:-0} + 1 ))"
+    lease="lease_${__NS___ANT_LEASE_SEQ}"; owner="ant:__NS__:${lease}"
+    declare -F "${scheduler_ns}_scheduler_reclassify" >/dev/null 2>&1 || { __NS___ant_send CACHE_DENY "$request_id" scheduler_unavailable; return 1; }
+    "${scheduler_ns}_scheduler_reclassify" "$rid" "blank:ANT_CACHE" "$owner" '' || { __NS___ant_send CACHE_DENY "$request_id" claim_handoff_failed; return 1; }
+    __NS___ANT_LEASE_LIMIT["$lease"]="$limit"; __NS___ANT_LEASE_BUSY["$lease"]=0
+    __NS___ANT_LEASE_OWNER["$lease"]="$owner"; __NS___ANT_LEASE_RESERVATION["$lease"]="$rid"
+    __NS___ANT_LEASE_CPU_PER_ANT["$lease"]="$cpu"; __NS___ANT_LEASE_MEMORY_PER_ANT["$lease"]="$memory"
+    unset '__NS___ANT_CACHE_RESERVATION[$cache_id]' '__NS___ANT_CACHE_LIMIT[$cache_id]' '__NS___ANT_CACHE_CPU_PER_ANT[$cache_id]' '__NS___ANT_CACHE_MEMORY_PER_ANT[$cache_id]'
+    __NS___ant_send LEASE_GRANT "$request_id" "$lease" "$limit" "$rid"
+}
+
+__NS___ant_handle_cache_evict() {
+    [ $# -eq 2 ] || return 2
+    local request_id="$1" cache_id="$2" scheduler_ns="${DALO_MACHINE_SCHEDULER_NS:-}" rid
+    [[ -v __NS___ANT_CACHE_RESERVATION["$cache_id"] ]] || { __NS___ant_send ERROR "$request_id" unknown_cache; return 1; }
+    rid="${__NS___ANT_CACHE_RESERVATION[$cache_id]}"
+    declare -F "${scheduler_ns}_blank_release" >/dev/null 2>&1 || { __NS___ant_send ERROR "$request_id" scheduler_unavailable; return 1; }
+    "${scheduler_ns}_blank_release" ANT_CACHE "$rid" || { __NS___ant_send ERROR "$request_id" cache_evict_failed; return 1; }
+    unset '__NS___ANT_CACHE_RESERVATION[$cache_id]' '__NS___ANT_CACHE_LIMIT[$cache_id]' '__NS___ANT_CACHE_CPU_PER_ANT[$cache_id]' '__NS___ANT_CACHE_MEMORY_PER_ANT[$cache_id]'
+    __NS___ant_send CACHE_EVICTED "$request_id" "$cache_id"
 }
 
 __NS___ant_handle_job() {
-    [ $# -ge 4 ] || return 2
-    local lease="$1" job_id="$2" expected_hash="$3" code64="$4"; shift 4
+    [ $# -ge 5 ] || return 2
+    local request_id="$1" lease="$2" job_id="$3" expected_hash="$4" code64="$5"; shift 5
+    [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 2
     local limit busy dir artifact actual_hash pid result_file
-    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send RESULT "$job_id" 125 unknown_lease; return 1; }
+    [[ -v __NS___ANT_LEASE_LIMIT["$lease"] ]] || { __NS___ant_send RESULT "$request_id" "$job_id" 125 unknown_lease; return 1; }
     limit="${__NS___ANT_LEASE_LIMIT[$lease]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-0}"
-    ((busy < limit)) || { __NS___ant_send RESULT "$job_id" 126 lease_full; return 1; }
+    ((busy < limit)) || { __NS___ant_send RESULT "$request_id" "$job_id" 126 lease_full; return 1; }
     dir="$(mktemp -d "${TMPDIR:-/tmp}/__NS__.ant.${job_id}.XXXXXX")" || return
     artifact="$dir/worker.bash"; result_file="$dir/result.frame"
     printf '%s' "$code64" | base64 -d >"$artifact" || { rm -rf "$dir"; return; }
     actual_hash="$(sha256sum "$artifact" | awk '{print $1}')" || { rm -rf "$dir"; return; }
-    [[ "$actual_hash" == "$expected_hash" ]] || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 127 hash_mismatch; return 1; }
-    bash -n "$artifact" || { rm -rf "$dir"; __NS___ant_send RESULT "$job_id" 128 syntax_error; return 1; }
+    [[ "$actual_hash" == "$expected_hash" ]] || { rm -rf "$dir"; __NS___ant_send RESULT "$request_id" "$job_id" 127 hash_mismatch; return 1; }
+    bash -n "$artifact" || { rm -rf "$dir"; __NS___ant_send RESULT "$request_id" "$job_id" 128 syntax_error; return 1; }
     __NS___ANT_LEASE_BUSY["$lease"]=$((busy + 1))
     # Child owns only execution. It returns one local frame through an atomic
     # rename; only the canonical HOST parent owns and writes the TCP endpoint.
@@ -5083,7 +5302,7 @@ __NS___ant_handle_job() {
         printf '%s\n' "$frame" >"${result_file}.tmp" && mv -f "${result_file}.tmp" "$result_file"
     ) &
     pid=$!
-    __NS___ANT_JOB_LEASE["$job_id"]="$lease"; __NS___ANT_JOB_PID["$job_id"]="$pid"
+    __NS___ANT_JOB_LEASE["$job_id"]="$lease"; __NS___ANT_REMOTE_JOB_REQ["$job_id"]="$request_id"; __NS___ANT_JOB_PID["$job_id"]="$pid"
     __NS___ANT_JOB_RESULT_FILE["$job_id"]="$result_file"; __NS___ANT_JOB_DIR["$job_id"]="$dir"
 }
 
@@ -5095,17 +5314,17 @@ __NS___ant_reap() {
         if [[ -s "$file" ]]; then
             IFS= read -r raw <"$file" || continue; argv=(); __ant_frame_decode "$raw" type argv || continue
             [[ "$type" == CHILD_RESULT && "${argv[0]}" == "$job" ]] || continue
-            __NS___ant_send RESULT "$job" "${argv[1]}" "${argv[2]-}" || return
+            __NS___ant_send RESULT "${__NS___ANT_REMOTE_JOB_REQ[$job]}" "$job" "${argv[1]}" "${argv[2]-}" || return
             wait "$pid" 2>/dev/null || true
         elif ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true; __NS___ant_send RESULT "$job" 131 child_lost || return
+            wait "$pid" 2>/dev/null || true; __NS___ant_send RESULT "${__NS___ANT_REMOTE_JOB_REQ[$job]}" "$job" 131 child_lost || return
         else
             continue
         fi
         lease="${__NS___ANT_JOB_LEASE[$job]}"; busy="${__NS___ANT_LEASE_BUSY[$lease]:-1}"
         ((busy > 0)) && __NS___ANT_LEASE_BUSY["$lease"]=$((busy - 1))
         dir="${__NS___ANT_JOB_DIR[$job]:-}"; [[ -n "$dir" ]] && rm -rf "$dir"
-        unset '__NS___ANT_JOB_PID[$job]' '__NS___ANT_JOB_LEASE[$job]' '__NS___ANT_JOB_RESULT_FILE[$job]' '__NS___ANT_JOB_DIR[$job]'
+        unset '__NS___ANT_JOB_PID[$job]' '__NS___ANT_JOB_LEASE[$job]' '__NS___ANT_JOB_RESULT_FILE[$job]' '__NS___ANT_JOB_DIR[$job]' '__NS___ANT_REMOTE_JOB_REQ[$job]'
     done
 }
 
@@ -5122,27 +5341,201 @@ __NS___ant_receive_once() {
             __NS___PEER_RESOURCE["explicit|workers.free"]="${argv[1]}"
             __NS___PEER_RESOURCE["explicit|workers.offered"]="${argv[2]}"
             ;;
-        LEASE_REQUEST) __NS___ant_handle_lease_request "${argv[0]}" "${argv[1]}" "${argv[2]}" ;;
+        LEASE_REQUEST) __NS___ant_handle_lease_request "${argv[0]}" "${argv[1]}" "${argv[2]}" "${argv[3]}" ;;
         LEASE_GRANT)
-            printf -v "__NS___ANT_REMOTE_LEASE" '%s' "${argv[0]}"
-            printf -v "__NS___ANT_REMOTE_GRANTED" '%s' "${argv[1]}"
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING ]]; then
+                __NS___ANT_REMOTE_REQ_LEASE["$_req"]="${argv[1]}"
+                __NS___ANT_REMOTE_REQ_GRANTED["$_req"]="${argv[2]}"
+                [[ -n "${argv[3]-}" ]] && __NS___ANT_REMOTE_REQ_RESERVATION["$_req"]="${argv[3]}"
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=GRANTED
+            fi
             ;;
-        LEASE_DENY) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
-        LEASE_RELEASE) __NS___ant_handle_lease_release "${argv[0]}" ;;
+        LEASE_DENY)
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING ]]; then
+                __NS___ANT_REMOTE_REQ_ERROR["$_req"]="${argv[*]:1}"
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=DENIED
+            fi
+            ;;
+        LEASE_RELEASE) __NS___ant_handle_lease_release "${argv[0]}" "${argv[1]}" ;;
         LEASE_RELEASED)
-            [[ "${__NS___ANT_REMOTE_LEASE:-}" == "${argv[0]}" ]] && {
-                unset __NS___ANT_REMOTE_LEASE __NS___ANT_REMOTE_GRANTED
-            }
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING &&
+                  "${__NS___ANT_REMOTE_RELEASE_REQ[$_req]:-}" == "${argv[1]}" ]]; then
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=RELEASED
+            fi
+            ;;
+        LEASE_CACHE) __NS___ant_handle_lease_cache "${argv[0]}" "${argv[1]}" ;;
+        LEASE_CACHED)
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING ]]; then
+                __NS___ANT_REMOTE_CACHE_REQ["$_req"]="${argv[1]}"
+                __NS___ANT_REMOTE_REQ_LEASE["$_req"]="${argv[2]}"
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=CACHED
+            fi
+            ;;
+        CACHE_CLAIM) __NS___ant_handle_cache_claim "${argv[0]}" "${argv[1]}" "${argv[2]}" "${argv[3]}" "${argv[4]}" ;;
+        CACHE_DENY)
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING ]]; then
+                __NS___ANT_REMOTE_REQ_ERROR["$_req"]="${argv[*]:1}"
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=DENIED
+            fi
+            ;;
+        CACHE_EVICT) __NS___ant_handle_cache_evict "${argv[0]}" "${argv[1]}" ;;
+        CACHE_EVICTED)
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING && "${__NS___ANT_REMOTE_CACHE_REQ[$_req]:-}" == "${argv[1]}" ]]; then
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=EVICTED
+            fi
             ;;
         JOB) __NS___ant_handle_job "${argv[@]}" ;;
         RESULT)
-            __NS___ANT_RESULT_RC["${argv[0]}"]="${argv[1]}"
-            __NS___ANT_RESULT_DATA["${argv[0]}"]="${argv[2]-}"
+            local _req="${argv[0]}" _job="${argv[1]}"
+            if [[ "${__NS___ANT_REMOTE_JOB_REQ[$_job]:-}" == "$_req" ]]; then
+                __NS___ANT_RESULT_RC["$_job"]="${argv[2]}"
+                __NS___ANT_RESULT_DATA["$_job"]="${argv[3]-}"
+            fi
             ;;
-        ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${argv[*]}" ;;
+        ERROR)
+            local _req="${argv[0]}"
+            if [[ "${__NS___ANT_REMOTE_REQ_STATE[$_req]:-}" == PENDING ]]; then
+                __NS___ANT_REMOTE_REQ_ERROR["$_req"]="${argv[*]:1}"
+                __NS___ANT_REMOTE_REQ_STATE["$_req"]=ERROR
+            fi
+            ;;
         *) return 4 ;;
     esac
     __NS___ant_reap
+}
+
+__NS___ant_remote_borrow() {
+    [ $# -ge 5 ] && [ $# -le 6 ] || return 2
+    local out_lease="$1" out_granted="$2" wanted="$3" cpu="$4" memory="$5" timeout="${6:-30}"
+    [[ "$out_lease" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$out_granted" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    local req deadline state
+    __NS___ant_next_request_id req || return
+    __NS___ant_request_lease "$req" "$wanted" "$cpu" "$memory" || return
+    deadline=$((SECONDS + timeout))
+    while :; do
+        state="${__NS___ANT_REMOTE_REQ_STATE[$req]:-}"
+        case "$state" in
+            GRANTED)
+                printf -v "$out_lease" '%s' "${__NS___ANT_REMOTE_REQ_LEASE[$req]}"
+                printf -v "$out_granted" '%s' "${__NS___ANT_REMOTE_REQ_GRANTED[$req]}"
+                return 0 ;;
+            DENIED) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-denied}"; return 75 ;;
+            ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-error}"; return 76 ;;
+        esac
+        if ((SECONDS >= deadline)); then __NS___ANT_REMOTE_REQ_STATE["$req"]=TIMED_OUT; return 124; fi
+        __NS___ant_receive_once 1 || true
+    done
+}
+
+__NS___ant_remote_cache() {
+    [ $# -ge 2 ] && [ $# -le 3 ] || return 2
+    local out_cache="$1" lease="$2" timeout="${3:-30}" req deadline state
+    [[ "$out_cache" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    __NS___ant_next_request_id req || return
+    __NS___ant_cache_lease "$req" "$lease" || return
+    deadline=$((SECONDS + timeout))
+    while :; do
+        state="${__NS___ANT_REMOTE_REQ_STATE[$req]:-}"
+        case "$state" in
+            CACHED) printf -v "$out_cache" '%s' "${__NS___ANT_REMOTE_CACHE_REQ[$req]}"; return 0 ;;
+            ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-error}"; return 76 ;;
+        esac
+        if ((SECONDS >= deadline)); then __NS___ANT_REMOTE_REQ_STATE["$req"]=TIMED_OUT; return 124; fi
+        __NS___ant_receive_once 1 || true
+    done
+}
+
+__NS___ant_remote_claim() {
+    [ $# -ge 6 ] && [ $# -le 7 ] || return 2
+    local out_lease="$1" out_granted="$2" cache_id="$3" wanted="$4" cpu="$5" memory="$6" timeout="${7:-30}" req deadline state
+    [[ "$out_lease" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$out_granted" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    __NS___ant_next_request_id req || return
+    __NS___ant_claim_cache "$req" "$cache_id" "$wanted" "$cpu" "$memory" || return
+    deadline=$((SECONDS + timeout))
+    while :; do
+        state="${__NS___ANT_REMOTE_REQ_STATE[$req]:-}"
+        case "$state" in
+            GRANTED) printf -v "$out_lease" '%s' "${__NS___ANT_REMOTE_REQ_LEASE[$req]}"; printf -v "$out_granted" '%s' "${__NS___ANT_REMOTE_REQ_GRANTED[$req]}"; return 0 ;;
+            DENIED) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-denied}"; return 75 ;;
+            ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-error}"; return 76 ;;
+        esac
+        if ((SECONDS >= deadline)); then __NS___ANT_REMOTE_REQ_STATE["$req"]=TIMED_OUT; return 124; fi
+        __NS___ant_receive_once 1 || true
+    done
+}
+
+__NS___ant_remote_evict() {
+    [ $# -ge 1 ] && [ $# -le 2 ] || return 2
+    local cache_id="$1" timeout="${2:-30}" req deadline state
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    __NS___ant_next_request_id req || return
+    __NS___ant_evict_cache "$req" "$cache_id" || return
+    deadline=$((SECONDS + timeout))
+    while :; do
+        state="${__NS___ANT_REMOTE_REQ_STATE[$req]:-}"
+        case "$state" in
+            EVICTED) return 0 ;;
+            ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-error}"; return 76 ;;
+        esac
+        if ((SECONDS >= deadline)); then __NS___ANT_REMOTE_REQ_STATE["$req"]=TIMED_OUT; return 124; fi
+        __NS___ant_receive_once 1 || true
+    done
+}
+
+__NS___ant_remote_submit() {
+    [ $# -ge 3 ] || return 2
+    local out_job="$1" lease="$2" artifact="$3"; shift 3
+    [[ "$out_job" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 2
+    local _ant_req _ant_job _ant_code _ant_hash
+    __NS___ant_next_request_id _ant_req || return
+    _ant_code="$(base64 <"$artifact" | tr -d '\n')" || return
+    _ant_hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
+    printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
+    _ant_job="${__NS___ANT_JOB_SEQ}"
+    __NS___ANT_REMOTE_JOB_REQ["$_ant_job"]="$_ant_req"
+    __NS___ant_send JOB "$_ant_req" "$lease" "$_ant_job" "$_ant_hash" "$_ant_code" "$@" || {
+        unset '__NS___ANT_REMOTE_JOB_REQ[$_ant_job]'
+        return
+    }
+    printf -v "$out_job" '%s' "$_ant_job"
+}
+
+__NS___ant_remote_wait() {
+    [ $# -ge 2 ] && [ $# -le 3 ] || return 2
+    local out_result="$1" job="$2" timeout="${3:-30}" deadline
+    [[ "$out_result" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    deadline=$((SECONDS + timeout))
+    while [[ ! -v __NS___ANT_RESULT_RC["$job"] ]]; do
+        __NS___ant_receive_once 1 || true
+        ((SECONDS < deadline)) || return 124
+    done
+    printf -v "$out_result" '%s' "${__NS___ANT_RESULT_DATA[$job]}"
+    return "${__NS___ANT_RESULT_RC[$job]}"
+}
+
+__NS___ant_remote_release() {
+    [ $# -ge 1 ] && [ $# -le 2 ] || return 2
+    local lease="$1" timeout="${2:-30}" req deadline state
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || return 2
+    __NS___ant_next_request_id req || return
+    __NS___ant_release_lease "$req" "$lease" || return
+    deadline=$((SECONDS + timeout))
+    while :; do
+        state="${__NS___ANT_REMOTE_REQ_STATE[$req]:-}"
+        case "$state" in
+            RELEASED) return 0 ;;
+            ERROR) printf -v "__NS___ANT_LAST_ERROR" '%s' "${__NS___ANT_REMOTE_REQ_ERROR[$req]:-error}"; return 76 ;;
+        esac
+        if ((SECONDS >= deadline)); then __NS___ANT_REMOTE_REQ_STATE["$req"]=TIMED_OUT; return 124; fi
+        __NS___ant_receive_once 1 || true
+    done
 }
 
 __NS___ant_wait_result() {
@@ -5201,6 +5594,21 @@ machine_endpoint_resolve() {
     [[ -n "$ip" ]] || return 67
     printf '%s\t%s\n' "$ip" "$port"
 }
+machine_endpoint_invalidate() {
+    [ $# -eq 1 ] || return 2
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
+    unset 'DALO_MACHINE_IP['"$port"']'
+}
+machine_discovery_unresolved_count() {
+    [ $# -eq 0 ] || return 2
+    local port count=0
+    for port in "${!DALO_MACHINE_PORTS[@]}"; do
+        [[ -n "${DALO_LOCAL_PORTS[$port]:-}" ]] && continue
+        [[ -n "${DALO_MACHINE_IP[$port]:-}" ]] || ((count++))
+    done
+    printf '%s\n' "$count"
+}
 # Detect the active IPv4 /24 without persistent HOST configuration. Prefer the
 # interface carrying the default route; fall back to the first non-loopback
 # IPv4 interface. The Python worker is persistent and supplied by INIT python.
@@ -5210,7 +5618,7 @@ machine_discovery_detect_base24() {
     declare -F inline_python >/dev/null 2>&1 || return 69
     local h ip rc=0
     h="$(init_python_thread)" || return 69
-    inline_python -t "$h" -x $'import socket, struct, fcntl\niface = None\ntry:\n    for line in open("/proc/net/route").read().splitlines()[1:]:\n        cols = line.split()\n        if len(cols) > 1 and cols[1] == "00000000":\n            iface = cols[0]; break\nexcept Exception:\n    pass\ndef _dalo_ipv4(name):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    try:\n        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))[20:24])\n    finally:\n        s.close()\nip = None\nif iface:\n    try: ip = _dalo_ipv4(iface)\n    except OSError: pass\nif not ip:\n    for _, name in socket.if_nameindex():\n        if name == "lo": continue\n        try:\n            candidate = _dalo_ipv4(name)\n            if not candidate.startswith("127."):\n                ip = candidate; break\n        except OSError:\n            pass\n_dalo_discovery_ip = ip or ""' >/dev/null || rc=$?
+    inline_python -t "$h" -x $'import socket, struct, fcntl\niface = None\ntry:\n    for line in open("/proc/net/route").read().splitlines()[1:]:\n        cols = line.split()\n        if len(cols) > 1 and cols[1] == "00000000":\n            iface = cols[0]; break\nexcept Exception:\n    pass\ndef _dalo_ipv4(name):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    try:\n        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))[20:24])\n    finally:\n        s.close()\nip = None\nif iface:\n    try: ip = _dalo_ipv4(iface)\n    except OSError: pass\nif not ip:\n    _route_sock = None\n    try:\n        _route_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n        _route_sock.connect(("192.0.2.1", 9))\n        candidate = _route_sock.getsockname()[0]\n        if candidate and not candidate.startswith("127."):\n            ip = candidate\n    except OSError:\n        pass\n    finally:\n        if _route_sock is not None:\n            try: _route_sock.close()\n            except Exception: pass\nif not ip:\n    try:\n        _ifaces = socket.if_nameindex()\n    except (OSError, PermissionError):\n        _ifaces = []\n    for _, name in _ifaces:\n        if name == "lo": continue\n        try:\n            candidate = _dalo_ipv4(name)\n            if not candidate.startswith("127."):\n                ip = candidate; break\n        except OSError:\n            pass\n_dalo_discovery_ip = ip or ""' >/dev/null || rc=$?
     if ((rc == 0)); then ip="$(inline_python -t "$h" '_dalo_discovery_ip')" || rc=$?; fi
     release_python_thread "$h" >/dev/null 2>&1 || true
     ((rc == 0)) || return "$rc"
@@ -5224,33 +5632,67 @@ machine_discovery_detect_base24() {
 # once a port is found it is removed from the remainder of this scan.
 machine_discovery_scan24() {
     [ $# -le 1 ] || return 2
-    local base="${1:-$DALO_DISCOVERY_BASE24}" port ip result octet
+    local base="${1:-$DALO_DISCOVERY_BASE24}" port result item found_port found_ip
     [[ "$base" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]] || return 64
     declare -A pending=()
-    for port in "${!DALO_MACHINE_IP[@]}"; do :; done
-    # Registered-but-unresolved ports are represented separately because an
-    # associative array cannot retain a key with an unset value reliably.
     if declare -p DALO_MACHINE_PORTS >/dev/null 2>&1; then
         local -n __ports=DALO_MACHINE_PORTS
-        for port in "${!__ports[@]}"; do [[ -z "${DALO_LOCAL_PORTS[$port]:-}" && -z "${DALO_MACHINE_IP[$port]:-}" ]] && pending["$port"]=1; done
+        for port in "${!__ports[@]}"; do
+            [[ -z "${DALO_LOCAL_PORTS[$port]:-}" && -z "${DALO_MACHINE_IP[$port]:-}" ]] && pending["$port"]=1
+        done
     fi
     ((${#pending[@]})) || return 0
     declare -F init_python_thread >/dev/null 2>&1 || return 69
-    local py_handle rc=0
+    local py_handle rc=0 ports_csv="" code
     py_handle="$(init_python_thread)" || return 69
-    for ((octet=1; octet<=254 && ${#pending[@]}>0; octet++)); do
-        ip="$base.$octet"
-        for port in "${!pending[@]}"; do
-            result="$(inline_python -t "$py_handle" "(lambda s: (s.sendall(b'DALO-DISCOVERY|1|PROBE|$port\\n'), s.settimeout(0.10), s.recv(128), s.close()))(__import__('socket').create_connection(('$ip',$port),0.03))" 2>/dev/null)" || continue
-            [[ "$result" == *"DALO-DISCOVERY|1|HERE|$port\\n"* ]] || continue
-            DALO_MACHINE_IP["$port"]="$ip"
-            unset 'pending['"$port"']'
-        done
-    done
-    ((${#pending[@]} == 0)) || rc=1
+    for port in "${!pending[@]}"; do ports_csv+="${ports_csv:+,}$port"; done
+    code="import socket, concurrent.futures
+_base='$base'
+_ports=[$ports_csv]
+def _dalo_probe(_task):
+    _ip,_port=_task
+    _s=None
+    try:
+        _s=socket.create_connection((_ip,_port),0.03)
+        _s.settimeout(0.10)
+        _s.sendall(('DALO-DISCOVERY|1|PROBE|%d\\n'%_port).encode('ascii'))
+        _b=b''
+        while len(_b)<128 and not _b.endswith(b'\\n'):
+            _c=_s.recv(128-len(_b))
+            if not _c: break
+            _b+=_c
+        if _b==('DALO-DISCOVERY|1|HERE|%d\\n'%_port).encode('ascii'):
+            return '%d=%s'%(_port,_ip)
+    except (OSError,ValueError):
+        pass
+    finally:
+        if _s is not None:
+            try: _s.close()
+            except Exception: pass
+    return None
+_tasks=[('%s.%d'%(_base,_octet),_port) for _port in _ports for _octet in range(1,255)]
+_found={}
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(64,max(1,len(_tasks)))) as _ex:
+    for _r in _ex.map(_dalo_probe,_tasks):
+        if _r:
+            _p,_ip=_r.split('=',1); _found.setdefault(_p,_ip)
+_dalo_discovery_result=';'.join('%s=%s'%(_p,_ip) for _p,_ip in sorted(_found.items()))"
+    inline_python -t "$py_handle" -x "$code" >/dev/null || rc=$?
+    if ((rc == 0)); then result="$(inline_python -t "$py_handle" '_dalo_discovery_result')" || rc=$?; fi
     release_python_thread "$py_handle" >/dev/null 2>&1 || true
-    return "$rc"
+    ((rc == 0)) || return "$rc"
+    result="${result#\'}"; result="${result%\'}"; result="${result#\"}"; result="${result%\"}"
+    IFS=';' read -ra __found <<<"$result"
+    for item in "${__found[@]}"; do
+        [[ "$item" == *=* ]] || continue
+        found_port="${item%%=*}"; found_ip="${item#*=}"
+        [[ -n "${pending[$found_port]:-}" ]] || continue
+        machine_endpoint_set_ip "$found_port" "$found_ip" || continue
+        unset 'pending['"$found_port"']'
+    done
+    ((${#pending[@]} == 0))
 }
+
 # Stable set of globally known MACHINE/BRIDGE port identities for this PROJECT.
 declare -gA DALO_MACHINE_PORTS=()
 machine_endpoint_register() {
@@ -6631,9 +7073,17 @@ placement_select_first_fit() {
     (($# > 0)) || return 64
 
     local _psf_candidate _psf_machine="" _psf_sched="" _psf_probe="" _psf_rc=0
-    local _psf_saw_policy_block=0 _psf_saw_capacity=0
+    local _psf_saw_policy_block=0 _psf_saw_capacity=0 _psf_saw_unavailable=0
     for _psf_candidate in "$@"; do
         placement_candidate_parse "$_psf_candidate" _psf_machine _psf_sched || return $?
+        # Dynamic Cluster Membership is the reachability gate for remote
+        # placement. Discovery alone never makes a MACHINE eligible.
+        if [[ "$_psf_machine" != "$_psf_local_machine" ]] &&
+           declare -F "${_psf_source_ns}_cluster_peer_active" >/dev/null 2>&1 &&
+           ! "${_psf_source_ns}_cluster_peer_active" "$_psf_machine"; then
+            _psf_saw_unavailable=1
+            continue
+        fi
         _psf_probe=""
         if placement_probe_candidate _psf_probe "$_psf_source_ns" "$_psf_local_machine" "$_psf_candidate" "$_psf_cpu" "$_psf_memory"; then
             printf -v "$_psf_out_machine" '%s' "$_psf_machine"
@@ -6657,6 +7107,10 @@ placement_select_first_fit() {
     if (( _psf_saw_policy_block )); then
         printf -v "$_psf_out_plan" 'BLOCKED_POLICY'
         return 88
+    fi
+    if (( _psf_saw_unavailable )); then
+        printf -v "$_psf_out_plan" 'NO_ELIGIBLE_CANDIDATE'
+        return 89
     fi
     printf -v "$_psf_out_plan" 'NO_ELIGIBLE_CANDIDATE'
     return 89

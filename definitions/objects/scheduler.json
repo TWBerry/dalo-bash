@@ -1,0 +1,16 @@
+{
+  "abi": 1,
+  "type": "SCHEDULER",
+  "name": "Scheduler",
+  "instance_fields": {
+    "CPU_TOTAL": {"type": "uint", "required": true, "min": 1},
+    "MEMORY_TOTAL": {"type": "uint", "required": true, "min": 1}
+  },
+  "ports": {
+    "in": {"direction": "input", "plane": "control", "type": "any"}
+  },
+  "methods": ["summon_worker", "on_job_completed"],
+  "features": ["core", "worker"],
+  "worker": {"required": true, "default": "scheduler"},
+  "execution": ["INLINE"]
+}

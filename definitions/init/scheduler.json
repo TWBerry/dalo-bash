@@ -1,0 +1,8 @@
+{
+  "abi": 1,
+  "name": "scheduler",
+  "artifact": "artifacts/scheduler.bash",
+  "entry": "dalo_init_scheduler",
+  "requires": [],
+  "runtime_requires": []
+}

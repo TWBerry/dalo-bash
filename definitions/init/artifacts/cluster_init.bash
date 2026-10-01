@@ -18,5 +18,7 @@ dalo_init_cluster() {
         seen["$port"]=1
     done < <(compgen -A variable 'm_')
     ((${#seen[@]})) || return 66
-    machine_discovery_scan24
+    # Discovery convergence starts from BRIDGE worker lifecycle only after
+    # listen endpoints have had a chance to start.  INIT must never block.
+    return 0
 }

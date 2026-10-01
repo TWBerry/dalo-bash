@@ -11,7 +11,7 @@
   "outputs": {},
   "features": [],
   "execution": "INLINE",
-  "sha256": "197c648ff8900d64fdaa8f509fc7e3eabc1420ec04d4ff4c9fabbd650fd64711",
+  "sha256": "c6640efaab0cf83087d55183ee6030a34104e843f6d7ab5b8708368ac322b21a",
   "runtime_requires": [],
   "lifecycle": {
     "start": "worker_start",
