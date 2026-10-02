@@ -464,6 +464,11 @@ __NS___control_send_response() {
             return 77
         fi
         if "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$cap" "$raw"; then
+            # The passive scheduler accepts membership only after its HELLO
+            # acknowledgement has been transmitted successfully.
+            if [[ "$tag" == K && "${1:-}" == SCHED_CLUSTER_HELLO ]]; then
+                __NS___cluster_accept_passive "$remote_id" "$request_id" || return
+            fi
             return 0
         fi
         if [[ "${1:-}" == SCHED_CLUSTER_HELLO ]]; then
@@ -2973,6 +2978,22 @@ __NS___cluster_defer_reply() {
     __NS___CLUSTER_DEFERRED_PEER["$req"]="$peer"
 }
 
+# Mark a passive peer ACTIVE after a correlated HELLO ACK was transmitted.
+# Parameters: $1 is the remote MACHINE port; $2 is the request identifier.
+__NS___cluster_accept_passive() {
+    [ $# -eq 2 ] || return 64
+    local peer="$1" req="$2"
+    [[ "$peer" =~ ^[0-9]+$ && -n "$req" ]] || return 71
+    __NS___cluster_init || return
+    if [[ "${__NS___CLUSTER_STATE[$peer]:-}" != ACTIVE ]]; then
+        __NS___CLUSTER_GENERATION["$peer"]=$(( ${__NS___CLUSTER_GENERATION[$peer]:-0} + 1 ))
+    fi
+    __NS___CLUSTER_STATE["$peer"]=ACTIVE
+}
+
+# Retry deferred HELLO replies on an initialized transport.
+# Parameters: $1 is peer port, $2 bridge namespace, $3 local port,
+# and $4 the control capability used for the outbound response.
 __NS___cluster_flush_replies() {
     [ $# -eq 4 ] || return 64
     local peer="$1" bridge_ns="$2" local_port="$3" cap="$4" req
@@ -2980,6 +3001,7 @@ __NS___cluster_flush_replies() {
     for req in "${!__NS___CLUSTER_DEFERRED_REPLY[@]}"; do
         [[ "${__NS___CLUSTER_DEFERRED_PEER[$req]:-}" == "$peer" ]] || continue
         if "${bridge_ns}_forward_tcp_control" "$local_port" "$peer" "$cap" "${__NS___CLUSTER_DEFERRED_REPLY[$req]}"; then
+            __NS___cluster_accept_passive "$peer" "$req" || return
             unset '__NS___CLUSTER_DEFERRED_REPLY['"$req"']' '__NS___CLUSTER_DEFERRED_PEER['"$req"']'
         else
             return 1
@@ -3029,6 +3051,7 @@ __NS___cluster_poll() {
     for peer in "${!DALO_MACHINE_PORTS[@]}"; do
         [[ "$peer" == "$local_port" || -n "${DALO_LOCAL_PORTS[$peer]:-}" ]] && continue
         if ! machine_transport_route_resolve bns "$peer"; then
+            __NS___cluster_mark_unresolved "$peer" || return
             if [[ -n "${DALO_MACHINE_IP[$peer]:-}" ]]; then
                 __NS___CLUSTER_STATE["$peer"]=DISCOVERED
             else
@@ -3059,6 +3082,11 @@ __NS___cluster_poll() {
         # Inbound HELLO can precede outbound discovery. Flush queued replies
         # before initiating or checking our own membership handshake.
         __NS___cluster_flush_replies "$peer" "$bns" "$local_port" CLUSTER || true
+        # A listener only answers inbound HELLO. The connector initiates the
+        # exchange, independently of startup order and numeric port values.
+        if [[ "${!mode_var:-}" == listen ]]; then
+            continue
+        fi
         req="${__NS___CLUSTER_REQUEST[$peer]:-}"
         if [[ -n "$req" ]]; then
             status="${__NS___ORCH_STATUS[$req]:-}"
