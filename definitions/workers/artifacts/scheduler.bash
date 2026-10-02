@@ -25,6 +25,9 @@ worker_poll() {
     local ns="${ASYNC_WORKER_NS:?missing ASYNC_WORKER_NS}"
     local init_var="${ns}_SCHEDULER_WORKER_INITIALIZED"
     [[ "${!init_var:-0}" == 1 ]] || return 69
+    # The parent-owned scheduler must service inbound CONTROL FIFO before
+    # checking cluster membership and pending HELLO acknowledgements.
+    "${ns}_drain_fifo" || return
     "${ns}_scheduler_diagnose" || return
     "${ns}_cluster_poll"
 }

@@ -47,29 +47,18 @@ python_shutdown(){
  fi
  if [ -n "${DALO_PY_INFD:-}" ];then eval "exec ${DALO_PY_INFD}>&-" 2>/dev/null || true; unset DALO_PY_INFD; fi
  if [ -n "${DALO_PY_OUTFD:-}" ];then eval "exec ${DALO_PY_OUTFD}>&-" 2>/dev/null || true; unset DALO_PY_OUTFD; fi
- # SHUTDOWN ACK means worker teardown completed, but the supervisor still has to
- # leave its request loop and remove the runtime endpoint.  FINI must not return
- # until that externally observable teardown is complete, including when this
- # shell reused a supervisor and therefore has no DALO_PY_SUPERVISOR_PID.
- for((i=0;i<500;i++));do
-  [ ! -e "$DALO_PY_ROOT/ready" ] && [ ! -e "$DALO_PY_ROOT/request.fifo" ] && break
-  sleep .01
- done
- if [ -e "$DALO_PY_ROOT/ready" ] || [ -e "$DALO_PY_ROOT/request.fifo" ];then
-  printf 'python_shutdown: supervisor teardown timed out: %s\n' "$DALO_PY_ROOT" >&2
-  rc=1
- fi
- # Endpoint removal precedes process exit by a few instructions.  Poll the PID
- # captured before SHUTDOWN so FINI is a process-death barrier even for a reused
- # supervisor that is not a child of this Bash process.
- if [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]];then
-  for((i=0;i<500;i++));do kill -0 "$supervisor_pid" 2>/dev/null || break; sleep .01; done
-  if kill -0 "$supervisor_pid" 2>/dev/null;then
-   printf 'python_shutdown: supervisor process did not exit: pid=%s\n' "$supervisor_pid" >&2
+ # Only the final client waits for shared supervisor teardown. Other clients
+ # must not interfere with active sessions or wait for a process they do not own.
+ if [[ "$reply" == OK\|SHUTDOWN\|*\|LAST ]];then
+  for((i=0;i<500;i++));do
+   [ ! -e "$DALO_PY_ROOT/ready" ] && [ ! -e "$DALO_PY_ROOT/request.fifo" ] && break
+   sleep .01
+  done
+  if [ -e "$DALO_PY_ROOT/ready" ] || [ -e "$DALO_PY_ROOT/request.fifo" ];then
+   printf 'python_shutdown: final supervisor teardown timed out: %s\n' "$DALO_PY_ROOT" >&2
    rc=1
   fi
  fi
- if [ -n "${DALO_PY_SUPERVISOR_PID:-}" ];then wait "$DALO_PY_SUPERVISOR_PID" 2>/dev/null || true; fi
  unset DALO_PY_SESSION DALO_PY_SUPERVISOR_PID
  return "$rc"
 }

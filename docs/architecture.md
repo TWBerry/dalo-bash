@@ -839,6 +839,21 @@ control is implemented.
 
 ## 24. Current development checkpoint
 
+**2026-10-02 distributed-runtime update:** The v11 two-MACHINE loopback
+harness passed both startup orders (AB and BA) with A and B reporting
+`ACTIVE` and exit status 0. The tested topology has B as the sole
+`SCHED_CLUSTER_HELLO` initiator and A as the passive ACK responder. The
+v11 TCP receive path retains incomplete frames across polls; the
+harness prioritizes BRIDGE polling before scheduler FIFO processing.
+
+This is a **loopback harness checkpoint**, not proof of a completed
+production cluster handshake or physical-LAN interoperability. The
+one-way HELLO/ACK lifecycle and deferred-ACK behavior still need to be
+integrated into the production scheduler and validated under deliberate
+TCP fragmentation, disconnects, and reconnection. See
+[`bridge-cluster.md`](bridge-cluster.md) for protocol flow and test gates.
+
+
 The following major pieces are already established or runtime-validated:
 
 -   dependency-aware DALO library loader;
@@ -862,9 +877,9 @@ The following major pieces are already established or runtime-validated:
 -   child→parent/per-object FIFO boundary;
 -   PROJECT-level quiescence wait.
 
-The next control-plane work should formalize and stress-test the FIFO
-Control ABI before building richer ORCHESTRATOR/SCHEDULER commands on
-top of it.
+The next distributed control-plane work is to validate fragmented TCP
+frames at the integrated worker level, move the verified one-way handshake
+into the production scheduler, and rerun AB/BA before physical-LAN tests.
 
 ## 25. Architectural summary
 

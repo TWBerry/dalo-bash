@@ -225,60 +225,94 @@ define_fifo_api() {
     local ns="$1"
     local body
     body=$(cat <<'EOF'
+# FIFO Frame ABI v2 uses a conspicuous multi-byte separator. Each field is
+# percent-escaped before framing, including the separator's UTF-8 bytes, so
+# literal occurrences in user data cannot change the number of fields.
+# A frame is: TAG + DELIMITER + ARGC + (DELIMITER + ENCODED_FIELD) * ARGC.
+__NS___FIFO_DELIMITER='€♧¿'
+
+# Encode a single FIFO field without losing empty strings or control bytes.
+# $1: raw field; $2: name of the output variable in the caller's scope.
 __NS___fifo_field_encode() {
     [ $# -eq 2 ] || return 2
     local __in="$1" __out_name="$2" __encoded
     __encoded="${__in//%/%25}"
+    __encoded="${__encoded//€/%E282AC}"
+    __encoded="${__encoded//♧/%E299A7}"
+    __encoded="${__encoded//¿/%C2BF}"
     __encoded="${__encoded//$'\t'/%09}"
     __encoded="${__encoded//$'\n'/%0A}"
     __encoded="${__encoded//$'\r'/%0D}"
     printf -v "$__out_name" '%s' "$__encoded"
 }
 
+# Decode a field produced by fifo_field_encode in reverse escape order.
+# $1: encoded field; $2: name of the output variable in the caller's scope.
 __NS___fifo_field_decode() {
     [ $# -eq 2 ] || return 2
     local __in="$1" __out_name="$2" __decoded
     __decoded="${__in//%0D/$'\r'}"
     __decoded="${__decoded//%0A/$'\n'}"
     __decoded="${__decoded//%09/$'\t'}"
+    __decoded="${__decoded//%C2BF/¿}"
+    __decoded="${__decoded//%E299A7/♧}"
+    __decoded="${__decoded//%E282AC/€}"
     __decoded="${__decoded//%25/%}"
     printf -v "$__out_name" '%s' "$__decoded"
 }
 
+# Encode a complete FIFO frame, preserving empty and trailing arguments.
+# $1: frame tag; $@: positional fields following the tag.
 __NS___fifo_frame_encode() {
     local tag="$1"; shift
-    local frame encoded arg
+    local frame encoded arg delim="$__NS___FIFO_DELIMITER"
     [[ "$tag" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || return 2
-    printf -v frame '%s\t%d' "$tag" "$#"
+    printf -v frame '%s%s%d' "$tag" "$delim" "$#"
     for arg in "$@"; do
         __NS___fifo_field_encode "$arg" encoded || return
-        frame+=$'\t'"$encoded"
+        frame+="$delim$encoded"
     done
     printf '%s' "$frame"
 }
 
+# Decode a frame without IFS splitting, which discards empty whitespace fields.
+# $1: complete frame; $2: output tag name; $3: output array name.
 __NS___fifo_frame_decode() {
+    [ $# -eq 3 ] || return 2
     local frame="$1" out_tag_name="$2" out_argv_name="$3"
-    local _tag _argc _field i decoded_field
-    local -a fields=() decoded=()
+    local delim="$__NS___FIFO_DELIMITER" rest field i _tag _argc decoded_field
+    local -a __parsed_fields=()
     local -n out_tag_ref="$out_tag_name"
     local -n out_argv_ref="$out_argv_name"
-
-    IFS=$'\t' read -r -a fields <<< "$frame"
-    ((${#fields[@]} >= 2)) || return 2
-    _tag="${fields[0]}"
-    _argc="${fields[1]}"
+    [[ "$frame" == *"$delim"* ]] || return 2
+    _tag="${frame%%"$delim"*}"
+    rest="${frame#*"$delim"}"
     [[ "$_tag" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || return 5
+    _argc="${rest%%"$delim"*}"
     [[ "$_argc" =~ ^[0-9]+$ ]] || return 3
-    ((${#fields[@]} == _argc + 2)) || return 4
-
+    # Prevent arithmetic overflow and unbounded allocations from hostile frames.
+    ((${#_argc} <= 6 && 10#$_argc <= 4096)) || return 3
+    if [[ "$rest" == *"$delim"* ]]; then
+        rest="${rest#*"$delim"}"
+        ((_argc > 0)) || return 4
+    else
+        ((_argc == 0)) || return 4
+        rest=''
+    fi
     for ((i=0; i<_argc; i++)); do
-        _field="${fields[i+2]}"
-        __NS___fifo_field_decode "$_field" decoded_field || return
-        decoded[i]="$decoded_field"
+        if ((i < _argc - 1)); then
+            [[ "$rest" == *"$delim"* ]] || return 4
+            field="${rest%%"$delim"*}"
+            rest="${rest#*"$delim"}"
+        else
+            [[ "$rest" != *"$delim"* ]] || return 4
+            field="$rest"
+        fi
+        __NS___fifo_field_decode "$field" decoded_field || return
+        __parsed_fields+=("$decoded_field")
     done
     out_tag_ref="$_tag"
-    out_argv_ref=("${decoded[@]}")
+    out_argv_ref=("${__parsed_fields[@]}")
 }
 
 __NS___fifo_atomic_max() {
@@ -418,10 +452,25 @@ __NS___control_send_response() {
         bridge_ns="${__NS___CONTROL_REMOTE_BRIDGE[$remote_id]:-}"
         local_id="${__NS___CONTROL_REMOTE_SRC[$remote_id]:-}"
         cap="${__NS___CONTROL_REMOTE_CAP[$remote_id]:-}"
-        [[ -n "$bridge_ns" && -n "$local_id" && -n "$cap" ]] || return 77
         raw="$(__NS___fifo_frame_encode "$tag" "$request_id" "$@")" || return
-        "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$cap" "$raw"
-        return
+        if [[ -z "$bridge_ns" || -z "$local_id" || -z "$cap" ]]; then
+            # A HELLO may arrive before the reverse connector is ready.
+            # Retain its response in the scheduler's parent process; retry from
+            # cluster_poll once that peer's outbound route is initialized.
+            if [[ "${1:-}" == SCHED_CLUSTER_HELLO ]]; then
+                __NS___cluster_defer_reply "$remote_id" "$request_id" "$raw"
+                return 0
+            fi
+            return 77
+        fi
+        if "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$cap" "$raw"; then
+            return 0
+        fi
+        if [[ "${1:-}" == SCHED_CLUSTER_HELLO ]]; then
+            __NS___cluster_defer_reply "$remote_id" "$request_id" "$raw"
+            return 0
+        fi
+        return 1
     fi
     __NS___control_send_frame_to "$reply_target" "$tag" "$request_id" "$@"
 }
@@ -539,7 +588,7 @@ __NS___drain_fifo() {
                local ctl_ver="${argv[0]}" ctl_req="${argv[1]}" ctl_source="${argv[2]}" ctl_target="${argv[3]}" ctl_reply="${argv[4]}" ctl_op="${argv[5]}" ctl_flags="${argv[6]}" ctl_rc=0
                local -a ctl_args=("${argv[@]:7}")
                [[ "$ctl_ver" == 1 && "$ctl_req" =~ ^[A-Za-z0-9_.:-]+$ ]] || continue
-               [[ "$ctl_target" == 'ns:__NS__' || "$ctl_target" == '__NS__' ]] || ctl_rc=68
+               [[ "$ctl_target" == 'ns:__NS__' || "$ctl_target" == '__NS__' || ( "$ctl_target" == 'ns:scheduler' && "${DALO_MACHINE_SCHEDULER_NS:-}" == '__NS__' ) ]] || ctl_rc=68
                if ((ctl_rc == 0)); then
                    case "${__NS___CONTROL_STATE:-ACTIVE}" in
                        DRAINING) ctl_rc=69 ;;
@@ -2912,6 +2961,32 @@ __NS___placement_init() {
 # Dynamic Cluster Membership ABI v1.  PORT is the stable MACHINE identity;
 # discovery/IP and BRIDGE connectivity are reachability only.  A peer becomes
 # ACTIVE only after a correlated scheduler HELLO/WELCOME exchange.
+# One deferred HELLO reply per request ID; never lose an ACK merely because
+# discovery of the reverse MACHINE transport is still in progress.
+__NS___cluster_defer_reply() {
+    [ $# -eq 3 ] || return 64
+    local peer="$1" req="$2" raw="$3"
+    [[ "$peer" =~ ^[0-9]+$ && -n "$req" ]] || return 71
+    declare -p __NS___CLUSTER_DEFERRED_REPLY >/dev/null 2>&1 || declare -gA __NS___CLUSTER_DEFERRED_REPLY=()
+    declare -p __NS___CLUSTER_DEFERRED_PEER >/dev/null 2>&1 || declare -gA __NS___CLUSTER_DEFERRED_PEER=()
+    __NS___CLUSTER_DEFERRED_REPLY["$req"]="$raw"
+    __NS___CLUSTER_DEFERRED_PEER["$req"]="$peer"
+}
+
+__NS___cluster_flush_replies() {
+    [ $# -eq 4 ] || return 64
+    local peer="$1" bridge_ns="$2" local_port="$3" cap="$4" req
+    declare -p __NS___CLUSTER_DEFERRED_REPLY >/dev/null 2>&1 || return 0
+    for req in "${!__NS___CLUSTER_DEFERRED_REPLY[@]}"; do
+        [[ "${__NS___CLUSTER_DEFERRED_PEER[$req]:-}" == "$peer" ]] || continue
+        if "${bridge_ns}_forward_tcp_control" "$local_port" "$peer" "$cap" "${__NS___CLUSTER_DEFERRED_REPLY[$req]}"; then
+            unset '__NS___CLUSTER_DEFERRED_REPLY['"$req"']' '__NS___CLUSTER_DEFERRED_PEER['"$req"']'
+        else
+            return 1
+        fi
+    done
+}
+
 __NS___cluster_init() {
     declare -p __NS___CLUSTER_STATE >/dev/null 2>&1 || declare -gA __NS___CLUSTER_STATE=()
     declare -p __NS___CLUSTER_GENERATION >/dev/null 2>&1 || declare -gA __NS___CLUSTER_GENERATION=()
@@ -2944,13 +3019,25 @@ __NS___cluster_mark_unresolved() {
 
 __NS___cluster_poll() {
     __NS___cluster_init || return
-    local var bns modev peerv portv peer local_port initv req status result
-    while IFS= read -r var; do
-        [[ "$var" == m_*_OBJECT_TYPE && "${!var:-}" == BRIDGE ]] || continue
-        bns="${var%_OBJECT_TYPE}"
-        modev="${bns}_FIELD_MODE"; peerv="${bns}_FIELD_PEER_PORT"; portv="${bns}_FIELD_PORT"
-        [[ "${!modev:-}" == connect && "${!peerv:-}" =~ ^[0-9]+$ && "${!portv:-}" =~ ^[0-9]+$ ]] || continue
-        peer="${!peerv}"; local_port="${!portv}"; initv="${bns}_BRIDGE_WORKER_INITIALIZED"
+    local peer local_port bns initv req status result
+    local_port="${DALO_MACHINE_LOCAL_PORT:-}"
+    [[ "$local_port" =~ ^[0-9]+$ ]] || return 64
+
+    # Membership is driven by MACHINE identities, not by enumerating BRIDGE
+    # OBJECTs.  A BRIDGE namespace is only a temporary compatibility transport
+    # route until the physical socket owner moves fully into MACHINE transport.
+    for peer in "${!DALO_MACHINE_PORTS[@]}"; do
+        [[ "$peer" == "$local_port" || -n "${DALO_LOCAL_PORTS[$peer]:-}" ]] && continue
+        if ! machine_transport_route_resolve bns "$peer"; then
+            if [[ -n "${DALO_MACHINE_IP[$peer]:-}" ]]; then
+                __NS___CLUSTER_STATE["$peer"]=DISCOVERED
+            else
+                __NS___CLUSTER_STATE["$peer"]=UNRESOLVED
+            fi
+            continue
+        fi
+
+        initv="${bns}_BRIDGE_WORKER_INITIALIZED"
         if [[ "${!initv:-0}" != 1 ]]; then
             if [[ -n "${DALO_MACHINE_IP[$peer]:-}" ]]; then __NS___CLUSTER_STATE["$peer"]=DISCOVERED
             else __NS___CLUSTER_STATE["$peer"]=UNRESOLVED; fi
@@ -2960,6 +3047,18 @@ __NS___cluster_poll() {
         fi
         __NS___CLUSTER_BRIDGE["$peer"]="$bns"
         __NS___control_route_bind "$peer" "$bns" "$local_port" CLUSTER || return
+        # A listener must wait for an accepted socket before sending HELLO.
+        # The connector initiates the session with its first outbound HELLO.
+        local mode_var="${bns}_FIELD_MODE" transport_var="${bns}_BRIDGE_TRANSPORT_NS"
+        if [[ "${!mode_var:-}" == listen ]]; then
+            local transport_ns="${!transport_var:-}" has_session=0
+            [[ -n "$transport_ns" ]] || continue
+            "${transport_ns}_tcp_has_session" has_session || continue
+            [[ "$has_session" == 1 ]] || continue
+        fi
+        # Inbound HELLO can precede outbound discovery. Flush queued replies
+        # before initiating or checking our own membership handshake.
+        __NS___cluster_flush_replies "$peer" "$bns" "$local_port" CLUSTER || true
         req="${__NS___CLUSTER_REQUEST[$peer]:-}"
         if [[ -n "$req" ]]; then
             status="${__NS___ORCH_STATUS[$req]:-}"
@@ -2987,9 +3086,15 @@ __NS___cluster_poll() {
             __NS___CLUSTER_STATE["$peer"]=SUSPECT
             continue
         }
+        # A successful send must produce a nonempty request ID.  Never index
+        # the associative request ledger with an empty key.
+        if [[ -z "$req" ]]; then
+            __NS___CLUSTER_STATE["$peer"]=SUSPECT
+            continue
+        fi
         __NS___CLUSTER_REQUEST["$peer"]="$req"
         __NS___CLUSTER_REQUEST_PEER["$req"]="$peer"
-    done < <(compgen -A variable 'm_')
+    done
 }
 
 
@@ -3125,6 +3230,19 @@ __NS___placement_remote_migration_send_bundle() {
         "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" WORKER "$chunk" || return
     done
     "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" WORKER_SHA256 "$expected" || return
+    # INIT_BEGIN creates the destination artifact even when custom INIT is empty.
+    # Parameters: tx_id identifies the admitted migration transaction.
+    [[ -r "$bundle_dir/init.bash" && -r "$bundle_dir/init.sha256" ]] || return 3
+    local init_expected=''
+    IFS= read -r init_expected <"$bundle_dir/init.sha256" || return
+    [[ "$init_expected" =~ ^[0-9a-f]{64}$ ]] || return 77
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" INIT_BEGIN '' || return
+    IFS= read -r -d '' payload <"$bundle_dir/init.bash" || true
+    while [[ -n "$payload" ]]; do
+        chunk="${payload:0:8192}"; payload="${payload:8192}"
+        "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" INIT "$chunk" || return
+    done
+    "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" INIT_SHA256 "$init_expected" || return
     "${bridge_ns}_bridge_send_bulk" "$local_id" "$remote_id" "$capability" MIGRATION_BUNDLE "$tx_id" END ''
 }
 
@@ -3157,13 +3275,24 @@ __NS___placement_migration_bulk_receive() {
             [[ -v "__NS___PLACEMENT_BULK_SEEN[$tx_id:WORKER]" ]] || : >"$dir/worker.bash"
             printf '%s' "$payload" >>"$dir/worker.bash" || return ;;
         WORKER_SHA256) printf '%s\n' "$payload" >"$dir/worker.sha256" || return ;;
+        INIT_BEGIN) : >"$dir/init.bash" || return ;;
+        INIT)
+            [[ -v "__NS___PLACEMENT_BULK_SEEN[$tx_id:INIT_BEGIN]" ]] || return 79
+            printf '%s' "$payload" >>"$dir/init.bash" || return ;;
+        INIT_SHA256) printf '%s\n' "$payload" >"$dir/init.sha256" || return ;;
         END)
             local uuid='' source_obj_id='' object_type='' expected='' actual='' blank _bulk_imported_ns='' _bulk_imported_obj_id=''
-            [[ -r "$dir/meta" && -r "$dir/raw.snapshot" && -r "$dir/object.type" && -r "$dir/worker.bash" && -r "$dir/worker.sha256" ]] || return 75
+            [[ -r "$dir/meta" && -r "$dir/raw.snapshot" && -r "$dir/object.type" && -r "$dir/worker.bash" && -r "$dir/worker.sha256" && -r "$dir/init.bash" && -r "$dir/init.sha256" ]] || return 75
+            [[ -v "__NS___PLACEMENT_BULK_SEEN[$tx_id:INIT_BEGIN]" ]] || return 75
             IFS=$'\t' read -r uuid source_obj_id object_type <"$dir/meta" || return
             [[ -n "$uuid" && -n "$source_obj_id" && "$object_type" == BLANK ]] || return 76
             IFS= read -r expected <"$dir/worker.sha256" || return
             actual="$(__dalo_sha256_file "$dir/worker.bash")" || return
+            [[ "$actual" == "$expected" ]] || return 77
+            # Verify INIT before any destination OBJECT reconstruction begins.
+            IFS= read -r expected <"$dir/init.sha256" || return
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 77
+            actual="$(__dalo_sha256_file "$dir/init.bash")" || return
             [[ "$actual" == "$expected" ]] || return 77
             blank="${__NS___PLACEMENT_MIG_BLANK[$tx_id]}"
             { printf 'ASYNC_OBJECT_MIGRATION\t1\n'; printf 'UUID\t%q\n' "$uuid"; printf 'SOURCE_OBJ_ID\t%q\n' "$source_obj_id"; printf 'OBJECT_TYPE\t%q\n' BLANK; printf 'SNAPSHOT\t%q\n' "$dir/raw.snapshot"; printf 'END\n'; } >"$dir/object.snapshot" || return
@@ -3257,8 +3386,10 @@ __NS___placement_remote_command() {
     __NS___ORCH_PENDING["$request_id"]=1; __NS___ORCH_STATUS["$request_id"]=PENDING
     __NS___ORCH_OPERATION["$request_id"]="$op"; __NS___ORCH_RESULT["$request_id"]=''; __NS___ORCH_ERROR["$request_id"]=''
     raw="$(__NS___fifo_frame_encode Q 1 "$request_id" "remote:${local_id}" "$remote_target" "$reply_target" "$op" 0 "$@")" || return
-    if ! "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$capability" "$raw"; then
-        local rc=$?; unset '__NS___ORCH_PENDING['"$request_id"']'
+    local rc=0
+    "${bridge_ns}_forward_tcp_control" "$local_id" "$remote_id" "$capability" "$raw" || rc=$?
+    if (( rc != 0 )); then
+        unset '__NS___ORCH_PENDING['"$request_id"']'
         __NS___ORCH_STATUS["$request_id"]=SEND_ERROR; __NS___ORCH_ERROR["$request_id"]="$rc"; return "$rc"
     fi
     printf -v "$outvar" '%s' "$request_id"
@@ -3874,9 +4005,41 @@ __asyncobj_rebind_uuid() {
     UUID_TO_OBJ_ID["$wanted"]="$obj_id"
 }
 
+# Execute the verified instance INIT in the destination OBJECT namespace.
+# Parameters:
+#   $1: Namespace of the constructed destination OBJECT.
+#   $2: Path to the already SHA-256-verified INIT source file.
+#   $3: Initialization reason (create or migrate).
+# Returns: The custom INIT exit status, or a nonzero argument/file error.
+# The INIT runs in a function scope so its local variables do not leak into
+# the migration importer. Its effects on the OBJECT are intentionally retained.
+__dalo_migration_run_init() {
+    [ "$#" -eq 3 ] || return 64
+    local DALO_OBJECT_NS="$1" init_file="$2" DALO_INIT_REASON="$3"
+    [[ "$DALO_OBJECT_NS" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ "$DALO_INIT_REASON" == create || "$DALO_INIT_REASON" == migrate ]] || return 64
+    [[ -r "$init_file" ]] || return 65
+    [[ -s "$init_file" ]] || return 0
+    source "$init_file"
+}
+
+# Validate a bundle INIT before running any destination constructor.
+# Parameters:
+#   $1: Bundle directory containing init.bash and init.sha256.
+# Returns: Zero only when both artifacts exist and their digests match.
+__dalo_migration_verify_init() {
+    [ "$#" -eq 1 ] || return 64
+    local dir="$1" expected actual
+    [[ -r "$dir/init.bash" && -r "$dir/init.sha256" ]] || return 75
+    IFS= read -r expected <"$dir/init.sha256" || return
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 77
+    actual="$(__dalo_sha256_file "$dir/init.bash")" || return
+    [[ "$actual" == "$expected" ]] || return 77
+}
+
 __migration_import_unsafe() {
-    [ $# -ge 2 ] && [ $# -le 4 ] || return 2
-    local bundle="$1" out_ns="$2" out_obj_id="${3:-}" prepared_blank="${4:-}"
+    [ $# -ge 2 ] && [ $# -le 5 ] || return 2
+    local bundle="$1" out_ns="$2" out_obj_id="${3:-}" prepared_blank="${4:-}" init_file="${5:-}"
     local tag a b uuid="" source_obj_id="" object_type="" snap=""
     local new_ns obj_id_var line name type value
     local task status func attempt retries created started finished
@@ -3907,6 +4070,11 @@ __migration_import_unsafe() {
         create_random_blank_object new_ns || return
     fi
     __asyncobj_rebind_uuid "$new_ns" "$uuid" || return
+    # The scheduler already reserved RAM through BLANK. Run custom INIT only
+    # after vanilla construction and before restoring the source snapshot.
+    if [[ -n "$init_file" ]]; then
+        __dalo_migration_run_init "$new_ns" "$init_file" migrate || return
+    fi
 
     while IFS= read -r line; do
         IFS=$'\t' read -r -a fields <<< "$line"
@@ -4204,6 +4372,29 @@ compile_topology() {
 # The worker filename inside a bundle is namespace-neutral. Destination binds it
 # to its fresh namespace and may emit <new_ns>.worker.bash locally.
 
+# Materialize the source of an instance-owned INIT into a migration bundle.
+# Parameters:
+#   $1: Source OBJECT namespace whose INIT source is registered.
+#   $2: Destination bundle directory; must already exist.
+# Output:
+#   init.bash: Exact registered INIT source, or an empty file if absent.
+#   init.sha256: SHA-256 of init.bash, computed through the shared hash helper.
+# Returns nonzero on a filesystem or hashing failure.
+__dalo_migration_export_init() {
+    [ "$#" -eq 2 ] || return 64
+    local ns="$1" bundle_dir="$2" source_var="${1}_INIT_SOURCE"
+    local digest
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    if [[ -v "$source_var" ]]; then
+        printf '%s' "${!source_var}" >"$bundle_dir/init.bash" || return
+    else
+        : >"$bundle_dir/init.bash" || return
+    fi
+    digest="$(__dalo_sha256_file "$bundle_dir/init.bash")" || return
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 65
+    printf '%s\n' "$digest" >"$bundle_dir/init.sha256" || return
+}
+
 migration_export_with_worker() {
     [ $# -eq 3 ] || return 2
     local as="$1" obj="$2" bundle_dir="$3"
@@ -4226,6 +4417,7 @@ migration_export_with_worker() {
     actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 5
     printf '%s\n' "$expected" >"$bundle_dir/worker.sha256"
+    __dalo_migration_export_init "$ns" "$bundle_dir" || return
     printf '%s\n' "${ns}_UUID" >"$bundle_dir/source.uuid.var"
     printf '%s\n' "${ns}_OBJ_ID" >"$bundle_dir/source.obj_id.var"
 }
@@ -4240,10 +4432,12 @@ __migration_import_with_worker_unsafe() {
     actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 4
 
+    __dalo_migration_verify_init "$bundle_dir" || return
+
     # STEP16 migration_import(snapshot,new_ns) creates a fresh object identity,
     # then rebinds the stable UUID carried by the snapshot.
     local imported_ns imported_obj_id
-    migration_import "$bundle_dir/object.snapshot" imported_ns imported_obj_id || return
+    migration_import "$bundle_dir/object.snapshot" imported_ns imported_obj_id "$bundle_dir/init.bash" || return
     new_ns="$imported_ns"
     if [[ -r "$bundle_dir/object.type" ]]; then
         local restored_type
@@ -4296,12 +4490,12 @@ __migration_cleanup_new_namespaces() {
 }
 
 migration_import() {
-    [ $# -ge 2 ] && [ $# -le 3 ] || return 2
-    local bundle="$1" out_ns="$2" out_obj_id="${3:-}"
+    [ $# -ge 2 ] && [ $# -le 4 ] || return 2
+    local bundle="$1" out_ns="$2" out_obj_id="${3:-}" init_file="${4:-}"
     local -A _migration_before_ns=()
     local rc=0
     __migration_capture_namespaces _migration_before_ns || return
-    __migration_import_unsafe "$bundle" "$out_ns" "$out_obj_id" || rc=$?
+    __migration_import_unsafe "$bundle" "$out_ns" "$out_obj_id" "" "$init_file" || rc=$?
     if (( rc != 0 )); then
         __migration_cleanup_new_namespaces _migration_before_ns || true
         return "$rc"
@@ -4320,11 +4514,13 @@ migration_flood_prepared_blank() {
     actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 4
 
+    __dalo_migration_verify_init "$bundle_dir" || return
+
     # FLOOD boundary: the BLANK reservation remains physically reserved.  Only
     # ownership changes later at migration_resource_commit(); there is no
     # release/re-reserve window in which another OBJECT could steal the RAM.
     local imported_ns imported_obj_id
-    __migration_import_unsafe "$bundle_dir/object.snapshot" imported_ns imported_obj_id "$blank" || return
+    __migration_import_unsafe "$bundle_dir/object.snapshot" imported_ns imported_obj_id "$blank" "$bundle_dir/init.bash" || return
     [[ "$imported_ns" == "$blank" ]] || return 76
 
     if [[ -r "$bundle_dir/object.type" ]]; then
@@ -4459,6 +4655,7 @@ migration_export_prepared_with_worker() {
     actual="$(__dalo_sha256_file "$bundle_dir/worker.bash")" || return
     [[ "$actual" == "$expected" ]] || return 5
     printf '%s\n' "$expected" > "$bundle_dir/worker.sha256"
+    __dalo_migration_export_init "$ns" "$bundle_dir" || return
 }
 
 # Migration topology transaction v2.
@@ -4715,6 +4912,10 @@ _dalo_bridge_server=None
 _dalo_bridge_sock=None
 _dalo_bridge_host=$qhost
 _dalo_bridge_port=int($port)
+# Preserve incomplete frames across worker polls within this TCP session.
+_dalo_bridge_rxbuf=bytearray()
+_dalo_bridge_rxlen=None
+_dalo_bridge_max_frame=64*1024*1024
 def _dalo_rxline(_s,_limit=256):
     _b=b''
     while len(_b)<_limit:
@@ -4771,26 +4972,37 @@ def _dalo_bridge_ensure(_timeout=0):
             except Exception: pass
         raise
 def _dalo_bridge_recv(_timeout=0):
+    # Purpose: incrementally decode one length-prefixed frame without blocking
+    # the MACHINE lifecycle while waiting for an incomplete header or payload.
+    # Parameters: _timeout is the maximum wait in seconds for socket readiness;
+    # zero performs a strictly nonblocking poll. The receive buffer and expected
+    # length belong to this Python worker and survive subsequent poll calls.
+    global _dalo_bridge_rxbuf, _dalo_bridge_rxlen
+    import select
     _s=_dalo_bridge_ensure(_timeout)
     if _s is None: return '__DALO_DISCOVERY_HANDLED__'
-    # Timeout governs waiting for the *start* of a frame only.  Once the
-    # socket is readable, consume the complete length-prefixed frame without a
-    # per-chunk timeout; otherwise a timeout after the 8-byte header would lose
-    # framing and permanently desynchronize the stream for large payloads.
-    if float(_timeout) != 0:
-        import select
+    while True:
+        if _dalo_bridge_rxlen is None and len(_dalo_bridge_rxbuf)>=8:
+            _dalo_bridge_rxlen=struct.unpack('!Q',_dalo_bridge_rxbuf[:8])[0]
+            del _dalo_bridge_rxbuf[:8]
+            if _dalo_bridge_rxlen>_dalo_bridge_max_frame:
+                raise ValueError('bridge frame exceeds maximum size')
+        if _dalo_bridge_rxlen is not None and len(_dalo_bridge_rxbuf)>=_dalo_bridge_rxlen:
+            _payload=bytes(_dalo_bridge_rxbuf[:_dalo_bridge_rxlen])
+            del _dalo_bridge_rxbuf[:_dalo_bridge_rxlen]
+            _dalo_bridge_rxlen=None
+            return _payload.decode('utf-8')
         if not select.select([_s],[],[],float(_timeout))[0]:
-            raise TimeoutError('bridge receive timeout')
-    _s.settimeout(None)
-    def _rxn(_n):
-        _b=b''
-        while len(_b)<_n:
-            _c=_s.recv(_n-len(_b))
-            if not _c: raise EOFError('bridge peer closed')
-            _b+=_c
-        return _b
-    _n=struct.unpack('!Q',_rxn(8))[0]
-    return _rxn(_n).decode('utf-8')
+            return '__DALO_BRIDGE_INCOMPLETE__'
+        try:
+            _chunk=_s.recv(65536, socket.MSG_DONTWAIT)
+        except (BlockingIOError, InterruptedError):
+            return '__DALO_BRIDGE_INCOMPLETE__'
+        if not _chunk:
+            raise EOFError('bridge peer closed with incomplete frame')
+        _dalo_bridge_rxbuf.extend(_chunk)
+        # Do not wait again in this poll after consuming currently ready bytes.
+        _timeout=0
 "
     inline_python -t "$handle" -x "$code" || { release_python_thread "$handle" >/dev/null 2>&1 || true; return 71; }
     printf -v "__NS___PYTHON_THREAD" '%s' "$handle"
@@ -4801,14 +5013,45 @@ def _dalo_bridge_recv(_timeout=0):
     printf -v "__NS___BRIDGE_PEER_ID" '%s' "$peer_id"
 }
 
+__NS___tcp_accept_once() {
+    local handle="${__NS___PYTHON_THREAD:-}" value
+    [[ -n "$handle" ]] || return 1
+    [[ "${__NS___BRIDGE_MODE:-}" == listen ]] || return 2
+    # Called only after the parent lifecycle observed listener readability.
+    # Accept and validate OPEN (or answer a discovery PROBE), but never wait
+    # for the first length-prefixed application frame in this poll cycle.
+    value="$(inline_python -t "$handle" "_dalo_bridge_ensure(0) is not None")" || return
+    case "$value" in
+        True|False) return 0 ;;
+        *) return 72 ;;
+    esac
+}
+
+__NS___tcp_has_session() {
+    local out="$1" handle="${__NS___PYTHON_THREAD:-}" value
+    [[ -n "$out" && -n "$handle" ]] || return 2
+    value="$(inline_python -t "$handle" "_dalo_bridge_sock is not None")" || return
+    case "$value" in
+        True)  printf -v "$out" '%s' 1 ;;
+        False) printf -v "$out" '%s' 0 ;;
+        *) return 72 ;;
+    esac
+}
+
 __NS___tcp_send() {
     [ $# -eq 1 ] || return 2
-    local raw="$1" handle="${__NS___PYTHON_THREAD:-}" qraw code
+    local raw="$1" transport_ns="${__NS___BRIDGE_TRANSPORT_NS:-}" handle="${__NS___PYTHON_THREAD:-}" qraw code
+    if [[ -n "$transport_ns" && "$transport_ns" != "__NS__" ]]; then
+        "${transport_ns}_tcp_send" "$raw"
+        return
+    fi
     [[ -n "$handle" ]] || return 1
     __NS___bridge_python_quote qraw "$raw" || return
     code="import socket, struct, time
 if _dalo_bridge_sock is None:
-    _dalo_bridge_ensure(0)
+    _s=_dalo_bridge_ensure(0)
+    if _s is None:
+        raise ConnectionError('bridge send has no established session')
 _b=$qraw.encode('utf-8')
 _dalo_bridge_sock.sendall(struct.pack('!Q',len(_b))+_b)
 "
@@ -4829,7 +5072,11 @@ __NS___bridge_hex_decode() {
 
 __NS___tcp_receive() {
     [ $# -ge 1 ] && [ $# -le 2 ] || return 2
-    local out="$1" timeout="${2:-0}" handle="${__NS___PYTHON_THREAD:-}" value hex
+    local out="$1" timeout="${2:-0}" transport_ns="${__NS___BRIDGE_TRANSPORT_NS:-}" handle="${__NS___PYTHON_THREAD:-}" value hex
+    if [[ -n "$transport_ns" && "$transport_ns" != "__NS__" ]]; then
+        "${transport_ns}_tcp_receive" "$out" "$timeout"
+        return
+    fi
     [[ -n "$handle" ]] || return 1
     [[ "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 2
     # EVAL results are repr() by Python Runtime ABI v1.  Hex makes that repr pure
@@ -4837,7 +5084,10 @@ __NS___tcp_receive() {
     value="$(inline_python -t "$handle" "_dalo_bridge_recv($timeout).encode('utf-8').hex()")" || return
     [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]] || return 72
     hex="${value:1:${#value}-2}"
-    __NS___bridge_hex_decode "$out" "$hex"
+    __NS___bridge_hex_decode "$out" "$hex" || return
+    # Return a distinct nonfatal status for a partial TCP frame. Callers must
+    # resume on the next readable poll without discarding Python receive state.
+    [[ "${!out}" != '__DALO_BRIDGE_INCOMPLETE__' ]] || return 75
 }
 
 
@@ -4846,6 +5096,12 @@ __NS___forward_tcp() { __NS___tcp_send "$1"; }
 __NS___bridge_bind_peer() {
     [ $# -eq 1 ] || return 2
     printf -v "__NS___BRIDGE_PEER_ID" '%s' "$1"
+}
+
+__NS___bridge_bind_transport() {
+    [ $# -eq 1 ] || return 2
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    printf -v "__NS___BRIDGE_TRANSPORT_NS" '%s' "$1"
 }
 
 __NS___bridge_bind_data_target() {
@@ -5156,7 +5412,7 @@ __NS___ant_submit() {
     [[ "$request_id" =~ ^[A-Za-z0-9_.:-]+$ && -r "$artifact" ]] || return 3
     local code hash job_id
     code="$(base64 <"$artifact" | tr -d '\n')" || return
-    hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
+    hash="$(__dalo_sha256_file "$artifact")" || return
     printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
     job_id="${__NS___ANT_JOB_SEQ}"
     __NS___ANT_REMOTE_JOB_REQ["$job_id"]="$request_id"
@@ -5289,7 +5545,7 @@ __NS___ant_handle_job() {
     dir="$(mktemp -d "${TMPDIR:-/tmp}/__NS__.ant.${job_id}.XXXXXX")" || return
     artifact="$dir/worker.bash"; result_file="$dir/result.frame"
     printf '%s' "$code64" | base64 -d >"$artifact" || { rm -rf "$dir"; return; }
-    actual_hash="$(sha256sum "$artifact" | awk '{print $1}')" || { rm -rf "$dir"; return; }
+    actual_hash="$(__dalo_sha256_file "$artifact")" || { rm -rf "$dir"; return; }
     [[ "$actual_hash" == "$expected_hash" ]] || { rm -rf "$dir"; __NS___ant_send RESULT "$request_id" "$job_id" 127 hash_mismatch; return 1; }
     bash -n "$artifact" || { rm -rf "$dir"; __NS___ant_send RESULT "$request_id" "$job_id" 128 syntax_error; return 1; }
     __NS___ANT_LEASE_BUSY["$lease"]=$((busy + 1))
@@ -5496,7 +5752,7 @@ __NS___ant_remote_submit() {
     local _ant_req _ant_job _ant_code _ant_hash
     __NS___ant_next_request_id _ant_req || return
     _ant_code="$(base64 <"$artifact" | tr -d '\n')" || return
-    _ant_hash="$(sha256sum "$artifact" | awk '{print $1}')" || return
+    _ant_hash="$(__dalo_sha256_file "$artifact")" || return
     printf -v "__NS___ANT_JOB_SEQ" '%s' "$(( ${__NS___ANT_JOB_SEQ:-0} + 1 ))"
     _ant_job="${__NS___ANT_JOB_SEQ}"
     __NS___ANT_REMOTE_JOB_REQ["$_ant_job"]="$_ant_req"
@@ -5573,13 +5829,6 @@ ant_endpoint_constructor() {
 declare -gA DALO_MACHINE_IP=() DALO_LOCAL_PORTS=()
 declare -g DALO_DISCOVERY_BASE24=""
 
-machine_endpoint_register() {
-    [ $# -eq 1 ] || return 2
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 64
-    # Registration is intentionally idempotent: PORT itself is the identity.
-    : "${DALO_MACHINE_IP[$port]:-}"
-}
 machine_endpoint_set_ip() {
     [ $# -eq 2 ] || return 2
     local port="$1" ip="$2"
@@ -5693,8 +5942,12 @@ _dalo_discovery_result=';'.join('%s=%s'%(_p,_ip) for _p,_ip in sorted(_found.ite
     ((${#pending[@]} == 0))
 }
 
-# Stable set of globally known MACHINE/BRIDGE port identities for this PROJECT.
-declare -gA DALO_MACHINE_PORTS=()
+# Stable MACHINE transport identities for this PROJECT.  PORT belongs to the
+# MACHINE, never to an individual BRIDGE object.  During Transport Ownership
+# ABI v1 phase 1, BRIDGE namespaces may still back the physical socket, but
+# they are registered only as compatibility routes for a peer MACHINE PORT.
+declare -gA DALO_MACHINE_PORTS=() DALO_MACHINE_TRANSPORT_ROUTE=()
+declare -g DALO_MACHINE_LOCAL_PORT=""
 machine_endpoint_register() {
     [ $# -eq 1 ] || return 2
     local port="$1"
@@ -5703,8 +5956,42 @@ machine_endpoint_register() {
 }
 machine_endpoint_register_local() {
     [ $# -eq 1 ] || return 2
-    machine_endpoint_register "$1" || return
-    DALO_LOCAL_PORTS["$1"]=1
+    local port="$1"
+    machine_endpoint_register "$port" || return
+    if [[ -n "$DALO_MACHINE_LOCAL_PORT" && "$DALO_MACHINE_LOCAL_PORT" != "$port" ]]; then
+        return 73
+    fi
+    DALO_MACHINE_LOCAL_PORT="$port"
+    DALO_LOCAL_PORTS["$port"]=1
+}
+machine_transport_route_bind() {
+    [ $# -eq 2 ] || return 2
+    local peer="$1" ns="$2"
+    [[ "$peer" =~ ^[0-9]+$ ]] && ((peer >= 1 && peer <= 65535)) || return 64
+    [[ "$ns" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    machine_endpoint_register "$peer" || return
+    DALO_MACHINE_TRANSPORT_ROUTE["$peer"]="$ns"
+}
+machine_transport_route_resolve() {
+    [ $# -eq 2 ] || return 2
+    local out="$1" peer="$2" ns="${DALO_MACHINE_TRANSPORT_ROUTE[$2]:-}"
+    [[ "$out" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    [[ -n "$ns" ]] || return 67
+    printf -v "$out" '%s' "$ns"
+}
+machine_transport_namespace() {
+    [ $# -eq 3 ] || return 2
+    local out="$1" mode="$2" peer="$3" ns
+    [[ "$out" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 64
+    case "$mode" in
+        listen) ns=dalo_machine_listener ;;
+        connect)
+            [[ "$peer" =~ ^[0-9]+$ ]] && ((peer >= 1 && peer <= 65535)) || return 64
+            ns="dalo_machine_peer_${peer}"
+            ;;
+        *) return 64 ;;
+    esac
+    printf -v "$out" '%s' "$ns"
 }
 
 # BRIDGE OBJECT ABI v3.
@@ -5758,7 +6045,13 @@ __NS___remote_deny_call() {
 __NS___remote_control_gate() {
     [ $# -eq 1 ] || return 2
     local raw="$1" tag argc encoded_func func
-    IFS=$'\t' read -r tag argc encoded_func _ <<<"$raw"
+    if [[ "$raw" == *"€♧¿"* ]]; then
+        tag="${raw%%€♧¿*}"
+        argc="${raw#*€♧¿}"; argc="${argc%%€♧¿*}"
+        encoded_func=''
+    else
+        IFS=$'\t' read -r tag argc encoded_func _ <<<"$raw"
+    fi
 
     case "$tag" in
         X)
@@ -5855,7 +6148,13 @@ __NS___tcp_cap_revoke() {
 __NS___tcp_cap_operation() {
     [ $# -eq 2 ] || return 2
     local raw="$1" out="$2" tag argc encoded_func func
-    IFS=$'\t' read -r tag argc encoded_func _ <<<"$raw"
+    if [[ "$raw" == *"€♧¿"* ]]; then
+        tag="${raw%%€♧¿*}"
+        argc="${raw#*€♧¿}"; argc="${argc%%€♧¿*}"
+        encoded_func=''
+    else
+        IFS=$'\t' read -r tag argc encoded_func _ <<<"$raw"
+    fi
     case "$tag" in
         C)
             [[ "$argc" =~ ^[0-9]+$ && "$argc" -ge 1 && -n "$encoded_func" ]] || return 78
@@ -6328,6 +6627,35 @@ __asyncmachine_emit_worker() {
     printf '%s_worker() { local ASYNC_WORKER_NS=%q; %s "$@"; }\n' "$ns" "$ns" "$impl" >>"$out"
 }
 
+# Emit auxiliary functions declared by a worker artifact before its lifecycle entrypoints.
+# Parameters:
+#   $1 - Path to the standalone worker artifact.
+#   $2 - Generated MACHINE output path.
+#   $3 - Worker lifecycle start function name, if declared.
+#   $4 - Worker lifecycle poll function name, if declared.
+#   $5 - Worker lifecycle stop function name, if declared.
+# Functions are discovered in an isolated Bash process so the compiler's own
+# function namespace is not modified. Lifecycle and primary worker functions
+# are linked separately with per-object namespace wrappers.
+__asyncmachine_emit_worker_helpers() {
+    [ "$#" -eq 5 ] || return 2
+    local file="$1" out="$2" start="$3" poll="$4" stop="$5" definitions
+    definitions="$(bash -c '
+        file="$1"; shift
+        declare -A before=()
+        while read -r name; do before["$name"]=1; done < <(compgen -A function)
+        source "$file" || exit 5
+        while read -r name; do
+            [[ -z "${before[$name]:-}" ]] || continue
+            case "$name" in
+                worker|"$1"|"$2"|"$3") continue ;;
+            esac
+            declare -f "$name" || exit 5
+        done < <(compgen -A function | LC_ALL=C sort)
+    ' _ "$file" "$start" "$poll" "$stop")" || return 5
+    [[ -z "$definitions" ]] || printf '\n# Auxiliary worker artifact functions.\n%s\n' "$definitions" >>"$out"
+}
+
 __asyncmachine_emit_worker_lifecycle() {
     [ $# -eq 5 ] || return 2
     local ns="$1" file="$2" symbol="$3" suffix="$4" out="$5" def impl
@@ -6372,7 +6700,7 @@ __asyncmachine_link() {
     [[ -r "$library_source" && -r "$helper_source" ]] || return 3
 
     local -n objs="${project}_DECL_OBJECTS" types="${project}_DECL_TYPE"
-    local -n wf="${project}_DECL_WORKER_FILE" dw="${project}_DECL_WORKERS"
+    local -n wf="${project}_DECL_WORKER_FILE" object_init_files="${project}_DECL_INIT_FILE" dw="${project}_DECL_WORKERS"
     local -n rk="${project}_DECL_RESOURCE_KIND" ra="${project}_DECL_RESOURCE_ARG"
     local -n decl_fields="${project}_DECL_FIELD"
     local wstart_arr="${project}_WORKER_START" wpoll_arr="${project}_WORKER_POLL" wstop_arr="${project}_WORKER_STOP" wkeep_arr="${project}_WORKER_KEEPALIVE" wrequires_arr="${project}_WORKER_RUNTIME_REQUIRES"
@@ -6422,10 +6750,18 @@ __asyncmachine_link() {
 
     # Machine namespaces are compiler-assigned symbols. Runtime obj_id/UUID/FIFO
     # identity is deliberately NOT allocated in the compiler process.
-    local i obj ns
+    local i obj ns scheduler_seen=''
     for ((i=0; i<${#objs[@]}; i++)); do
         obj="${objs[$i]}"
-        printf -v ns 'm_%04d_%s' "$i" "$obj"
+        # SCHEDULER is a singleton per MACHINE and has a fixed physical name.
+        # Reject duplicate schedulers and reserve the name against other objects.
+        if [[ "${types[$obj]}" == SCHEDULER ]]; then
+            [[ -z "${scheduler_seen:-}" ]] || { printf 'duplicate SCHEDULER in MACHINE\n' >&2; return 71; }
+            scheduler_seen=1
+            ns=scheduler
+        else
+            printf -v ns 'm_%04d_%s' "$i" "$obj"
+        fi
         machine_ns["$obj"]="$ns"
     done
 
@@ -6563,6 +6899,33 @@ __asyncmachine_link() {
             [[ "$field_name" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 34
             printf 'printf -v %q %%s %q\n' "${ns}_FIELD_${field_name}" "${decl_fields[$field_key]}" >>"$out"
         done
+        # Embed instance-owned INIT as a distinct, reusable source component.
+        # The same component will be added to the migration bundle in the next
+        # stage; do not fold it into the vanilla constructor or WORKER source.
+        if [[ -n "${object_init_files[$obj]:-}" ]]; then
+            local object_init_source="${object_init_files[$obj]}"
+            [[ -r "$object_init_source" ]] || {
+                printf 'Missing OBJECT INIT source: %s\n' "$object_init_source" >&2
+                return 74
+            }
+            # Generated function parameters:
+            #   $1 - Runtime namespace of the OBJECT instance.
+            #   $2 - Initialization reason: create or migrate.
+            # DALO_INIT_REASON is function-local and available to user code.
+            printf '\n# Instance-owned custom INIT for %s.\n' "$obj" >>"$out"
+            printf '%s_custom_init() {\n' "$ns" >>"$out"
+            printf '  local DALO_INIT_REASON="${2:?missing initialization reason}"\n' >>"$out"
+            printf '  local DALO_OBJECT_NS="${1:?missing OBJECT namespace}"\n' >>"$out"
+            cat "$object_init_source" >>"$out" || return
+            printf '\n}\n' >>"$out"
+            # Preserve the exact INIT source as an instance-owned string.  It
+            # remains independent of generated namespace-specific functions.
+            # The migration exporter materializes it into init.bash later.
+            local init_text
+            init_text="$(cat "$object_init_source")" || return
+            printf 'printf -v %q %%s %q\n' "${ns}_INIT_SOURCE" "$init_text" >>"$out"
+            printf '%s_custom_init %q create || exit $?\n' "$ns" "$ns" >>"$out"
+        fi
         if [[ -n "${wf[$obj]:-}" ]]; then
             local __ws __wp __wx __wk
             __asyncmachine_meta_get __ws "$wstart_arr" "$obj" "" || return
@@ -6570,6 +6933,7 @@ __asyncmachine_link() {
             __asyncmachine_meta_get __wx "$wstop_arr" "$obj" "" || return
             __asyncmachine_meta_get __wk "$wkeep_arr" "$obj" "0" || return
             __asyncmachine_emit_worker "$ns" "${wf[$obj]}" "$out" || return
+            __asyncmachine_emit_worker_helpers "${wf[$obj]}" "$out" "$__ws" "$__wp" "$__wx" || return
             __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__ws" start "$out" || return
             __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__wp" poll "$out" || return
             __asyncmachine_emit_worker_lifecycle "$ns" "${wf[$obj]}" "$__wx" stop "$out" || return

@@ -17,7 +17,7 @@ dalo_object_definition_register(){
  t="$(jq -r .type "$f")"; DALO_OBJECT_DEF_FILE["$t"]="$f"
 }
 dalo_feature_definition_register(){
- local f="$1" n; jq -e '.abi==1 and (.name|type=="string") and ((.requires//[])|type=="array")' "$f" >/dev/null || return 5
+ local f="$1" n; jq -e '(.abi==1 or .abi==2) and (.name|type=="string") and ((.requires//[])|type=="array") and ((.requires//[])|all(type=="string")) and (if .abi==2 then ((.generators//[])|type=="array" and all(type=="string")) else true end)' "$f" >/dev/null || return 5
  n="$(jq -r .name "$f")"; DALO_FEATURE_DEF_FILE["$n"]="$f"
 }
 dalo_init_definition_register(){

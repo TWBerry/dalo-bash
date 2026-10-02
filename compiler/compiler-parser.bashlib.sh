@@ -43,7 +43,11 @@ dalo_parse_project() {
         fi
 
         if ((indent==1)); then
-            if [[ "$current" == OBJECT && "$text" == WORKER ]]; then
+            if [[ ( "$current" == OBJECT || "$current" == WORKER || "$current" == OBJECT_INIT ) && "$text" == INIT ]]; then
+                current="OBJECT_INIT"
+                continue
+            fi
+            if [[ ( "$current" == OBJECT || "$current" == WORKER || "$current" == OBJECT_INIT ) && "$text" == WORKER ]]; then
                 current="WORKER"
                 continue
             fi
@@ -69,6 +73,15 @@ dalo_parse_project() {
                 OBJECT)
                     case "$key" in
                         TYPE) dalo_ir_set_object_type "$ir" "$current_object" "$value" ;;
+                        LIBRARIES) dalo_ir_set_object_libraries "$ir" "$current_object" "$value" || return ;;
+                        [A-Z][A-Z0-9_]*) dalo_ir_set_object_field "$ir" "$current_object" "$key" "$value" ;;
+                        *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
+                    esac ;;
+                OBJECT_INIT)
+                    current="OBJECT"
+                    case "$key" in
+                        TYPE) dalo_ir_set_object_type "$ir" "$current_object" "$value" ;;
+                        LIBRARIES) dalo_ir_set_object_libraries "$ir" "$current_object" "$value" || return ;;
                         [A-Z][A-Z0-9_]*) dalo_ir_set_object_field "$ir" "$current_object" "$key" "$value" ;;
                         *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
                     esac ;;
@@ -78,6 +91,7 @@ dalo_parse_project() {
                     current="OBJECT"
                     case "$key" in
                         TYPE) dalo_ir_set_object_type "$ir" "$current_object" "$value" ;;
+                        LIBRARIES) dalo_ir_set_object_libraries "$ir" "$current_object" "$value" || return ;;
                         [A-Z][A-Z0-9_]*) dalo_ir_set_object_field "$ir" "$current_object" "$key" "$value" ;;
                         *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
                     esac ;;
@@ -98,6 +112,22 @@ dalo_parse_project() {
                 REQUIRED) dalo_ir_set_project_arg_required "$ir" "$current_arg" "$value" || return ;;
                 DEFAULT) dalo_ir_set_project_arg_default "$ir" "$current_arg" "$value" || return ;;
                 *) printf 'daloc:%d: unknown ARG field %s\n' "$lineno" "$key" >&2; return 20 ;;
+            esac
+            continue
+        fi
+
+        # OBJECT INIT is an instance-owned source artifact, not PROJECT INIT.
+        # CODE is resolved relative to the declaring .dalo file at parse time.
+        if ((indent==2)) && [[ "$current" == OBJECT_INIT ]]; then
+            key="${text%% *}"; value="${text#"$key"}"; value="${value# }"
+            case "$key" in
+                CODE)
+                    [[ -n "$value" ]] || { printf 'daloc:%d: OBJECT INIT CODE is empty\n' "$lineno" >&2; return 34; }
+                    [[ "$value" == /* ]] || value="$project_dir/$value"
+                    [[ -r "$value" ]] || { printf 'daloc:%d: OBJECT INIT CODE is not readable: %s\n' "$lineno" "$value" >&2; return 35; }
+                    dalo_ir_set_object_init_code "$ir" "$current_object" "$value" || return
+                    ;;
+                *) printf 'daloc:%d: unknown OBJECT INIT field %s\n' "$lineno" "$key" >&2; return 36 ;;
             esac
             continue
         fi

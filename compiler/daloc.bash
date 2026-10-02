@@ -17,7 +17,7 @@ dalo_definitions_load_tree "$ROOT"
 dalo_parse_project "$input" DALO_IR
 dalo_definition_validate_ir DALO_IR
 dalo_connect_lower_all DALO_IR
-dalo_features_lower_ir DALO_IR
+dalo_features_lower_ir_v2 DALO_IR
 name="${DALO_IR_NAME}"
 out="$(dirname -- "$input")/${name}.dalo.bash"
 dalo_link_machine "$ROOT" DALO_IR "$out"

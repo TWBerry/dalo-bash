@@ -11,7 +11,7 @@ dalo_ir_init() {
     printf -v "${p}_NAME" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
     eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=() ${p}_PARAM_ORDER=() ${p}_INIT_REQUESTS=() ${p}_INIT_ORDER=()"
-    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_WORKER_DEF=() ${p}_WORKER_START=() ${p}_WORKER_POLL=() ${p}_WORKER_STOP=() ${p}_WORKER_KEEPALIVE=() ${p}_WORKER_RUNTIME_REQUIRES=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
+    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_OBJECT_LIBRARIES=() ${p}_OBJECT_INIT_CODE=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_WORKER_DEF=() ${p}_WORKER_START=() ${p}_WORKER_POLL=() ${p}_WORKER_STOP=() ${p}_WORKER_KEEPALIVE=() ${p}_WORKER_RUNTIME_REQUIRES=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
 }
 dalo_ir_add_init() {
     [ $# -eq 2 ] || return 2
@@ -33,6 +33,20 @@ dalo_ir_add_object() {
     [[ ! -v t["$2"] ]] || { printf 'daloc: duplicate OBJECT %s\n' "$2" >&2; return 22; }
     a+=("$2"); t["$2"]=""
 }
+# Store the user-owned INIT source path for one declared OBJECT instance.
+# Parameters:
+#   $1 - IR namespace containing the OBJECT declarations.
+#   $2 - OBJECT instance name in that namespace.
+#   $3 - Absolute or project-resolved path to the INIT Bash source file.
+# Returns nonzero if the instance does not exist or INIT was already assigned.
+dalo_ir_set_object_init_code() {
+    [ "$#" -eq 3 ] || return 2
+    local -n types="${1}_OBJECT_TYPE" init_code="${1}_OBJECT_INIT_CODE"
+    [[ -v types["$2"] ]] || return 23
+    [[ ! -v init_code["$2"] ]] || { printf 'daloc: duplicate OBJECT INIT for %s\n' "$2" >&2; return 33; }
+    init_code["$2"]="$3"
+}
+
 dalo_ir_set_object_type(){ local -n t="${1}_OBJECT_TYPE"; [[ -v t["$2"] ]] || return 23; t["$2"]="$3"; }
 dalo_ir_set_object_field(){ local -n f="${1}_OBJECT_FIELD"; f["$2.$3"]="$4"; }
 dalo_ir_add_connect_text(){ local -n a="${1}_CONNECT_TEXT"; a+=("$2"); }
@@ -70,4 +84,14 @@ dalo_ir_set_project_arg_default() {
     [[ -v types["$2"] ]] || return 29
     [[ "${required[$2]:-0}" == 0 ]] || { printf 'daloc: ARG cannot have DEFAULT when REQUIRED\n' >&2; return 31; }
     defaults["$2"]="$3"; required["$2"]=0; has_default["$2"]=1
+}
+
+# Object-owned library dependencies, never inferred from WORKER include calls.
+dalo_ir_set_object_libraries() {
+    local -n libs="${1}_OBJECT_LIBRARIES"
+    local lib
+    for lib in $3; do
+        [[ "$lib" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || { printf 'daloc: invalid library name %s\n' "$lib" >&2; return 39; }
+    done
+    libs["$2"]="$3"
 }
