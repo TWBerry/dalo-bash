@@ -579,6 +579,13 @@ __NS___drain_fifo() {
             continue
         fi
         case "$tag" in
+            P)
+               # User data is dispatched only by the owning MACHINE parent.
+               ((${#argv[@]} == 3)) || continue
+               [[ "${argv[0]}" == "${__NS___OBJECT_NAME:-}" ]] || continue
+               if declare -F dalo_machine_parent_dispatch >/dev/null; then
+                   dalo_machine_parent_dispatch "${argv[0]}" "${argv[1]}" "${argv[2]}" || return
+               fi ;;
             O) ((${#argv[@]} == 2)) || continue
                __NS___OUTPUT_DATA_VECTOR["${argv[0]}"]="${argv[1]}" ;;
             L)
@@ -3034,7 +3041,13 @@ __NS___cluster_mark_unresolved() {
     [ $# -eq 1 ] || return 64
     local peer="$1" req="${__NS___CLUSTER_REQUEST[$1]:-}"
     __NS___cluster_init || return
-    [[ -z "$req" ]] || unset '__NS___CLUSTER_REQUEST_PEER['"$req"']'
+    # Invalidate the outstanding handshake before removing its peer mapping.
+    # Parameters: peer is the remote MACHINE identity being invalidated.
+    if [[ -n "$req" ]]; then
+        unset '__NS___ORCH_PENDING['"$req"']' '__NS___CLUSTER_REQUEST_PEER['"$req"']'
+        __NS___ORCH_STATUS["$req"]=DISCONNECTED
+        __NS___ORCH_ERROR["$req"]=75
+    fi
     unset '__NS___CLUSTER_REQUEST['"$peer"']' '__NS___CLUSTER_BRIDGE['"$peer"']'
     __NS___CLUSTER_STATE["$peer"]=UNRESOLVED
 }
@@ -3070,6 +3083,18 @@ __NS___cluster_poll() {
         fi
         __NS___CLUSTER_BRIDGE["$peer"]="$bns"
         __NS___control_route_bind "$peer" "$bns" "$local_port" CLUSTER || return
+        # An initialized BRIDGE is not proof that its established TCP session
+        # is still alive. Probe existing ACTIVE membership on both roles.
+        # The transport probe is nonblocking and preserves pending frame bytes.
+        local health_transport_var="${bns}_BRIDGE_TRANSPORT_NS" health_ns="" health=0
+        health_ns="${!health_transport_var:-$bns}"
+        if [[ "${__NS___CLUSTER_STATE[$peer]:-}" == ACTIVE ]]; then
+            if ! "${health_ns}_tcp_has_session" health || [[ "$health" != 1 ]]; then
+                __NS___cluster_mark_unresolved "$peer" || return
+                __NS___CLUSTER_STATE["$peer"]=DISCOVERED
+                continue
+            fi
+        fi
         # A listener must wait for an accepted socket before sending HELLO.
         # The connector initiates the session with its first outbound HELLO.
         local mode_var="${bns}_FIELD_MODE" transport_var="${bns}_BRIDGE_TRANSPORT_NS"
@@ -4999,6 +5024,26 @@ def _dalo_bridge_ensure(_timeout=0):
             try: _s.close()
             except Exception: pass
         raise
+def _dalo_bridge_session_alive():
+    # Purpose: detect a remote TCP close without consuming application data.
+    # Parameters: none; uses this worker's current bridge socket and RX state.
+    # Return: True for a live socket, False after EOF or fatal socket error.
+    global _dalo_bridge_sock, _dalo_bridge_rxbuf, _dalo_bridge_rxlen
+    _s=_dalo_bridge_sock
+    if _s is None: return False
+    try:
+        _data=_s.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        if _data: return True
+    except (BlockingIOError, InterruptedError):
+        return True
+    except OSError:
+        pass
+    try: _s.close()
+    except OSError: pass
+    _dalo_bridge_sock=None
+    _dalo_bridge_rxbuf=bytearray()
+    _dalo_bridge_rxlen=None
+    return False
 def _dalo_bridge_recv(_timeout=0):
     # Purpose: incrementally decode one length-prefixed frame without blocking
     # the MACHINE lifecycle while waiting for an incomplete header or payload.
@@ -5042,23 +5087,29 @@ def _dalo_bridge_recv(_timeout=0):
 }
 
 __NS___tcp_accept_once() {
-    local handle="${__NS___PYTHON_THREAD:-}" value
+    # Purpose: accept a pending TCP session without blocking on an absent peer.
+    # Parameters: none; the reserved Python worker owns the listener socket.
+    local handle="${__NS___PYTHON_THREAD:-}"
     [[ -n "$handle" ]] || return 1
     [[ "${__NS___BRIDGE_MODE:-}" == listen ]] || return 2
-    # Called only after the parent lifecycle observed listener readability.
-    # Accept and validate OPEN (or answer a discovery PROBE), but never wait
-    # for the first length-prefixed application frame in this poll cycle.
-    value="$(inline_python -t "$handle" "_dalo_bridge_ensure(0) is not None")" || return
-    case "$value" in
-        True|False) return 0 ;;
-        *) return 72 ;;
-    esac
+    # -x executes Python statements and forwards print() to stdout; it does
+    # not return printed output to command substitution. Use its exit status.
+    inline_python -t "$handle" -x "
+import select
+if _dalo_bridge_sock is None and _dalo_bridge_server is not None:
+    if select.select([_dalo_bridge_server], [], [], 0)[0]:
+        _dalo_bridge_ensure(0.2)
+"
 }
 
 __NS___tcp_has_session() {
     local out="$1" handle="${__NS___PYTHON_THREAD:-}" value
     [[ -n "$out" && -n "$handle" ]] || return 2
-    value="$(inline_python -t "$handle" "_dalo_bridge_sock is not None")" || return
+    # Purpose: check a live TCP session, not merely an allocated socket.
+    # Parameters: out receives 1 for an established healthy socket or 0
+    # for an absent/closed socket. MSG_PEEK never consumes framed data.
+    # An empty nonblocking peek is EOF; EAGAIN means the socket is alive.
+    value="$(inline_python -t "$handle" "(lambda: _dalo_bridge_session_alive())()")" || return
     case "$value" in
         True)  printf -v "$out" '%s' 1 ;;
         False) printf -v "$out" '%s' 0 ;;
@@ -6397,6 +6448,8 @@ project_register_object() {
     esac
 
     local gx="${project}_GRID_X" gy="${project}_GRID_Y"
+    local parent_var="${project}_PARENT_WORKER_CODE"
+    local -n parent_hooks="${project}_PARENT_HOOK_CODE"
     local -n objs="${project}_DECL_OBJECTS" types="${project}_DECL_TYPE"
     local -n xs="${project}_DECL_X" ys="${project}_DECL_Y"
     [[ ! -v types["$name"] ]] || return 4
@@ -6915,6 +6968,7 @@ __asyncmachine_link() {
             printf 'create_blank_object %q || exit $?\n' "$ns"
             printf 'printf -v %q %%s "$ASYNC_MACHINE_SCRIPT_OBJ_ID"\n' "${ns}_OWNER_SCRIPT_OBJ_ID"
             printf 'printf -v %q %%s "$ASYNC_MACHINE_SCRIPT_UUID"\n' "${ns}_OWNER_SCRIPT_UUID"
+            printf 'printf -v %q %%s %q\n' "${ns}_OBJECT_NAME" "$obj"
             printf 'printf -v %q %%s %q\n' "${ns}_OBJECT_TYPE" "$type"
             printf 'printf -v %q %%s %q\n' "${ns}_MAX_JOBS" "$workers"
         } >>"$out"
@@ -6969,6 +7023,41 @@ __asyncmachine_link() {
             printf 'printf -v %q %%s %q\n' "${ns}_WORKER_KEEPALIVE" "$__wk" >>"$out"
         fi
     done
+
+    # MACHINE-level parent dispatcher and optional OBJECT hooks are embedded
+    # as isolated functions, not sourced into the compiler or generated global scope.
+    if [[ -n "${!parent_var:-}" ]]; then
+        printf '\n# Parent worker: $1 source OBJECT, $2 target OBJECT, $3 payload.\n' >>"$out"
+        printf 'dalo_machine_parent_worker() {\n' >>"$out"
+        cat "${!parent_var}" >>"$out" || return
+        printf '\n}\n' >>"$out"
+    fi
+    for obj in "${!parent_hooks[@]}"; do
+        ns="${machine_ns[$obj]}"
+        printf '\n# OBJECT parent hook: $1 source, $2 target, $3 payload.\n' >>"$out"
+        printf '%s_parent_hook() {\n' "$ns" >>"$out"
+        cat "${parent_hooks[$obj]}" >>"$out" || return
+        printf '\n}\n' >>"$out"
+    done
+    if [[ -n "${!parent_var:-}" || ${#parent_hooks[@]} -gt 0 ]]; then
+        printf '\n# Validate source/target identity before invoking user code.\n' >>"$out"
+        printf 'dalo_machine_parent_dispatch() {\n' >>"$out"
+        printf '  local source="$1" target="$2" payload="$3"\n' >>"$out"
+        printf '  case "$source" in\n' >>"$out"
+        for obj in "${objs[@]}"; do printf '    %q) : ;;\n' "$obj" >>"$out"; done
+        printf '    *) return 76 ;;\n  esac\n' >>"$out"
+        printf '  case "$target" in\n' >>"$out"
+        for obj in "${objs[@]}"; do
+            ns="${machine_ns[$obj]}"
+            if [[ -n "${parent_hooks[$obj]:-}" ]]; then
+                printf '    %q) %s_parent_hook "$source" "$target" "$payload" ;;\n' "$obj" "$ns" >>"$out"
+            else
+                printf '    %q) ' "$obj" >>"$out"
+                if [[ -n "${!parent_var:-}" ]]; then printf 'dalo_machine_parent_worker "$source" "$target" "$payload" ;;\n' >>"$out"; else printf 'return 77 ;;\n' >>"$out"; fi
+            fi
+        done
+        printf '    *) return 76 ;;\n  esac\n}\n' >>"$out"
+    fi
 
     # Generic DATA routing. The compiler resolves canonical EDGE records into
     # concrete namespace/port triples. Runtime never reads Object JSON.

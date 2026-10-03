@@ -51,6 +51,14 @@ dalo_parse_project() {
                 current="WORKER"
                 continue
             fi
+            if [[ "$current" == PROJECT && "$text" == PARENT_WORKER ]]; then
+                current="PARENT_WORKER"
+                continue
+            fi
+            if [[ ( "$current" == OBJECT || "$current" == WORKER || "$current" == OBJECT_INIT ) && "$text" == PARENT_HOOK ]]; then
+                current="PARENT_HOOK"
+                continue
+            fi
             if [[ ( "$current" == PROJECT || "$current" == ARG ) && "$text" == ARG\ * ]]; then
                 current_arg="${text#ARG }"
                 [[ "$current_arg" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { printf 'daloc:%d: invalid ARG name\n' "$lineno" >&2; return 20; }
@@ -67,6 +75,16 @@ dalo_parse_project() {
                         VERSION) dalo_ir_set_project_version "$ir" "$value" ;;
                         INIT) dalo_ir_add_init "$ir" "$value" ;;
                         *) printf 'daloc:%d: unknown PROJECT field %s\n' "$lineno" "$key" >&2; return 15 ;;
+                    esac ;;
+                PARENT_WORKER)
+                    printf 'daloc:%d: PARENT_WORKER fields require two TABs\n' "$lineno" >&2; return 42 ;;
+                PARENT_HOOK)
+                    current="OBJECT"
+                    case "$key" in
+                        TYPE) dalo_ir_set_object_type "$ir" "$current_object" "$value" ;;
+                        LIBRARIES) dalo_ir_set_object_libraries "$ir" "$current_object" "$value" || return ;;
+                        [A-Z][A-Z0-9_]*) dalo_ir_set_object_field "$ir" "$current_object" "$key" "$value" ;;
+                        *) return 43 ;;
                     esac ;;
                 ARG)
                     printf 'daloc:%d: ARG fields must use two TABs\n' "$lineno" >&2; return 15 ;;
@@ -96,6 +114,24 @@ dalo_parse_project() {
                         *) printf 'daloc:%d: invalid OBJECT field %s\n' "$lineno" "$key" >&2; return 16 ;;
                     esac ;;
                 *) printf 'daloc:%d: indented field without PROJECT/OBJECT\n' "$lineno" >&2; return 17 ;;
+            esac
+            continue
+        fi
+
+        if ((indent==2)) && [[ "$current" == PARENT_WORKER || "$current" == PARENT_HOOK ]]; then
+            key="${text%% *}"; value="${text#"$key"}"; value="${value# }"
+            case "$key" in
+                CODE)
+                    [[ -n "$value" ]] || return 44
+                    [[ "$value" == /* ]] || value="$project_dir/$value"
+                    [[ -r "$value" ]] || { printf 'daloc:%d: parent source not readable: %s\n' "$lineno" "$value" >&2; return 45; }
+                    if [[ "$current" == PARENT_WORKER ]]; then
+                        dalo_ir_set_parent_worker_code "$ir" "$value" || return
+                    else
+                        dalo_ir_set_parent_hook_code "$ir" "$current_object" "$value" || return
+                    fi ;;
+                TYPE) [[ "$value" == inline ]] || { printf 'daloc:%d: parent TYPE must be inline\n' "$lineno" >&2; return 46; } ;;
+                *) printf 'daloc:%d: unknown parent field %s\n' "$lineno" "$key" >&2; return 47 ;;
             esac
             continue
         fi

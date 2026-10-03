@@ -9,9 +9,10 @@ DALO_COMPILER_IR_INCLUDE=1
 dalo_ir_init() {
     local p="$1"
     printf -v "${p}_NAME" '%s' ""
+    printf -v "${p}_PARENT_WORKER_CODE" '%s' ""
     printf -v "${p}_VERSION" '%s' ""
     eval "declare -g -a ${p}_OBJECTS=() ${p}_CONNECT_TEXT=() ${p}_EDGES=() ${p}_FEATURES=() ${p}_PARAM_ORDER=() ${p}_INIT_REQUESTS=() ${p}_INIT_ORDER=()"
-    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_OBJECT_LIBRARIES=() ${p}_OBJECT_INIT_CODE=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_WORKER_DEF=() ${p}_WORKER_START=() ${p}_WORKER_POLL=() ${p}_WORKER_STOP=() ${p}_WORKER_KEEPALIVE=() ${p}_WORKER_RUNTIME_REQUIRES=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
+    eval "declare -g -A ${p}_OBJECT_TYPE=() ${p}_OBJECT_FIELD=() ${p}_OBJECT_LIBRARIES=() ${p}_OBJECT_INIT_CODE=() ${p}_PARENT_HOOK_CODE=() ${p}_WORKER_CODE=() ${p}_WORKER_TYPE=() ${p}_WORKER_EXECUTION=() ${p}_WORKER_DEF=() ${p}_WORKER_START=() ${p}_WORKER_POLL=() ${p}_WORKER_STOP=() ${p}_WORKER_KEEPALIVE=() ${p}_WORKER_RUNTIME_REQUIRES=() ${p}_PARAM_TYPE=() ${p}_PARAM_DEFAULT=() ${p}_PARAM_REQUIRED=() ${p}_PARAM_HAS_DEFAULT=()"
 }
 dalo_ir_add_init() {
     [ $# -eq 2 ] || return 2
@@ -94,4 +95,20 @@ dalo_ir_set_object_libraries() {
         [[ "$lib" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || { printf 'daloc: invalid library name %s\n' "$lib" >&2; return 39; }
     done
     libs["$2"]="$3"
+}
+
+# Store the unique MACHINE-level parent worker artifact.
+# Parameters: $1 is the IR namespace; $2 is the resolved source path.
+dalo_ir_set_parent_worker_code() {
+    local p="$1" path="$2" var="${1}_PARENT_WORKER_CODE"
+    [[ -z "${!var:-}" ]] || { printf 'daloc: duplicate PARENT_WORKER\n' >&2; return 40; }
+    printf -v "$var" '%s' "$path"
+}
+
+# Store an optional OBJECT-specific parent hook artifact.
+# Parameters: $1 is the IR namespace; $2 is the OBJECT name; $3 is the source path.
+dalo_ir_set_parent_hook_code() {
+    local -n hooks="${1}_PARENT_HOOK_CODE" types="${1}_OBJECT_TYPE"
+    [[ -v types["$2"] && ! -v hooks["$2"] ]] || return 41
+    hooks["$2"]="$3"
 }

@@ -683,3 +683,52 @@ Local BRIDGE ports are excluded from the pre-start scan because BRIDGE
 listeners are started only after the INIT chain completes.
 
 ## 21. Current semantic rules
+
+## MACHINE parent dispatch (experimental ABI v1)
+
+One optional `PARENT_WORKER` block may appear under `PROJECT` (one TAB).
+An optional `PARENT_HOOK` block may appear under each `OBJECT` (one TAB).
+Their `CODE` paths are relative to the `.dalo` file, and both support only
+`TYPE inline` for standalone MACHINE generation. Their Bash files contain
+function *bodies*, not declarations; the linker embeds each in a generated
+function. The blocks use two TABs for `TYPE` and `CODE`.
+
+```text
+PROJECT
+<TAB>NAME example
+<TAB>VERSION 1.0
+<TAB>PARENT_WORKER
+<TAB><TAB>TYPE inline
+<TAB><TAB>CODE parent.bash
+
+OBJECT origin
+<TAB>TYPE ORIGIN
+
+OBJECT sink
+<TAB>TYPE ENDPOINT
+<TAB>PARENT_HOOK
+<TAB><TAB>TYPE inline
+<TAB><TAB>CODE sink-hook.bash
+```
+
+A child sends `P`-tagged FIFO messages with exactly three fields: source
+OBJECT name, target OBJECT name, and payload. For example, from an ORIGIN
+worker whose generated namespace is `m_0000_origin`:
+
+```bash
+m_0000_origin_fifo_msg P origin sink "$payload"
+```
+
+The owning OBJECT's FIFO decoder verifies that the source name matches the
+OBJECT instance before invoking the MACHINE dispatcher. The dispatcher
+validates that the target OBJECT exists. A target-specific `PARENT_HOOK` takes
+precedence; otherwise the MACHINE `PARENT_WORKER` receives the message.
+Both handlers receive `$1` source, `$2` target, `$3` payload and run in the
+canonical parent Bash process. A handler must not read the shared FIFO or
+block the parent indefinitely. Nonzero handler status propagates to the FIFO
+drain caller. This is local MACHINE messaging, not a cross-MACHINE transport
+or an authorization boundary between hostile code in the same Bash process.
+
+The current implementation is a first vertical slice: it does not yet add
+per-message ACK/correlation, a separate parent worker process, scheduling
+fairness, or a direct parent-to-child FIFO reply path.

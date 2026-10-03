@@ -14,6 +14,12 @@ dalo_link_machine(){
     local -n objs="${p}_OBJECTS" types="${p}_OBJECT_TYPE" fields="${p}_OBJECT_FIELD" object_libs="${p}_OBJECT_LIBRARIES" object_init="${p}_OBJECT_INIT_CODE"
     local -n edges="${p}_EDGES" worker_code="${p}_WORKER_CODE" worker_type="${p}_WORKER_TYPE" worker_execution="${p}_WORKER_EXECUTION" worker_start="${p}_WORKER_START" worker_poll="${p}_WORKER_POLL" worker_stop="${p}_WORKER_STOP" worker_keepalive="${p}_WORKER_KEEPALIVE" worker_requires="${p}_WORKER_RUNTIME_REQUIRES"
     local -n params="${p}_PARAM_ORDER" param_type="${p}_PARAM_TYPE" param_default="${p}_PARAM_DEFAULT" param_required="${p}_PARAM_REQUIRED"
+    local parent_var="${p}_PARENT_WORKER_CODE"
+    local -n parent_hooks="${p}_PARENT_HOOK_CODE"
+    [[ -z "${!parent_var:-}" || -r "${!parent_var}" ]] || return 80
+    [[ -z "${!parent_var:-}" ]] || bash -n "${!parent_var}" || return 81
+    local hook
+    for hook in "${parent_hooks[@]}"; do bash -n "$hook" || return 82; done
     dalo_definition_resolve_inits "$p" || return
     local -n init_order="${p}_INIT_ORDER" init_artifact="${p}_INIT_ARTIFACT" init_entry="${p}_INIT_ENTRY" init_runtime="${p}_INIT_RUNTIME_REQUIRES"
 
@@ -64,6 +70,10 @@ dalo_link_machine(){
             b_requires["$obj"]="${object_libs[$obj]:-}"
         fi
     done
+    printf -v "${backend}_PARENT_WORKER_CODE" '%s' "${!parent_var:-}"
+    eval "declare -g -A ${backend}_PARENT_HOOK_CODE=()"
+    local -n b_hooks="${backend}_PARENT_HOOK_CODE"
+    for obj in "${!parent_hooks[@]}"; do b_hooks["$obj"]="${parent_hooks[$obj]}"; done
     printf -v "${backend}_MAX_WORKERS_PER_OBJECT" '%s' 1
 
     # MACHINE entry ABI v1: a single ORIGIN is the implicit startup entry.
