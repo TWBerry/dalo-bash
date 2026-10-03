@@ -1,0 +1,29 @@
+# DALO throughput benchmark topology. The controller and FIFO relay are
+# intentionally not declared until their generic descriptor ABI is finalized.
+PROJECT
+	NAME throughput_benchmark
+	VERSION 0.1
+
+OBJECT origin
+	TYPE ORIGIN
+	WORKER
+		CODE ../../definitions/workers/artifacts/passthrough.bash
+		TYPE inline
+		EXECUTION INLINE
+
+OBJECT pipe
+	TYPE PIPE
+	WORKER
+		CODE ../../definitions/workers/artifacts/passthrough.bash
+		TYPE inline
+		EXECUTION INLINE
+
+OBJECT endpoint
+	TYPE ENDPOINT
+	WORKER
+		CODE ../../definitions/workers/artifacts/passthrough.bash
+		TYPE inline
+		EXECUTION INLINE
+
+CONNECT origin.out pipe.in
+CONNECT pipe.out endpoint.in

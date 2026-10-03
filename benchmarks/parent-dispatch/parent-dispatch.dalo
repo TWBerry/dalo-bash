@@ -1,0 +1,21 @@
+PROJECT
+	NAME parent_dispatch_probe
+	VERSION 1.0
+	PARENT_WORKER
+		TYPE inline
+		CODE parent.bash
+
+OBJECT origin
+	TYPE ORIGIN
+	WORKER
+		TYPE inline
+		CODE noop.bash
+
+OBJECT endpoint
+	TYPE ENDPOINT
+	WORKER
+		TYPE inline
+		CODE noop.bash
+	PARENT_HOOK
+		TYPE inline
+		CODE hook.bash
