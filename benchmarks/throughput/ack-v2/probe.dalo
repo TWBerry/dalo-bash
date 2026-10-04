@@ -1,0 +1,17 @@
+# Async acknowledgment integration probe using the existing parent FIFO dispatcher.
+PROJECT
+	NAME async_ack_probe
+	VERSION 1.0
+	PARENT_WORKER
+		TYPE inline
+		CODE relay.bash
+OBJECT pipe
+	TYPE PIPE
+	WORKER
+		TYPE inline
+		CODE noop.bash
+OBJECT endpoint
+	TYPE ENDPOINT
+	WORKER
+		TYPE inline
+		CODE endpoint.bash

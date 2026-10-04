@@ -1,0 +1,19 @@
+# Integration probe: child PIPE FIFO -> parent relay -> ENDPOINT DATA + ACK.
+PROJECT
+	NAME fifo_ack_probe
+	VERSION 1.0
+	PARENT_WORKER
+		TYPE inline
+		CODE relay.bash
+
+OBJECT pipe
+	TYPE PIPE
+	WORKER
+		TYPE inline
+		CODE ../../parent-dispatch/noop.bash
+
+OBJECT endpoint
+	TYPE ENDPOINT
+	WORKER
+		TYPE inline
+		CODE endpoint.bash

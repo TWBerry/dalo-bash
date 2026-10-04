@@ -1,4 +1,189 @@
 #!/bin/bash
+# ==============================================================================
+# GENERATED ASYNC MACHINE -- DO NOT EDIT BY HAND
+# Machine ABI: 2
+# Project SHA256: 43c452680ae64929d7292eb71e8a537e90dfbfbad03fbeefbb0042746207fa80
+# Runtime identity and FIFOs are created only when this machine starts.
+# ==============================================================================
+
+DALO_LIBRARY_ABI=1
+DALO_LIBRARY_NAME="helpers"
+DALO_LIBRARY_VERSION="1.0.0"
+DALO_LIBRARY_REQUIRES="python"
+DALO_LIBRARY_INIT="dalo_helpers_init"
+DALO_LIBRARY_FINI="dalo_helpers_fini"
+# DALO shared helper library
+
+if [ "${DALO_HELPERS_INCLUDE:-0}" -eq 0 ]; then
+    DALO_HELPERS_INCLUDE=1
+else
+    return 0
+fi
+
+__asyncobj_ensure_variable_storage() {
+    local ns="$1"
+    declare -p "${ns}_VARIABLE_TYPE" >/dev/null 2>&1 || eval "declare -gA ${ns}_VARIABLE_TYPE=()"
+    declare -p "${ns}_VARIABLE_VALUE" >/dev/null 2>&1 || eval "declare -gA ${ns}_VARIABLE_VALUE=()"
+    declare -p "${ns}_CODE_ORDER" >/dev/null 2>&1 || eval "declare -ga ${ns}_CODE_ORDER=()"
+    local code_var="${ns}_variables_code"
+    if ! declare -p "$code_var" >/dev/null 2>&1; then
+        printf -v "$code_var" '%s' ""
+    fi
+}
+
+__asyncobj_record_code() {
+    local ns="$1" component="$2" code="$3"
+    __asyncobj_ensure_variable_storage "$ns"
+
+    local type_name="${ns}_VARIABLE_TYPE"
+    local value_name="${ns}_VARIABLE_VALUE"
+    local order_name="${ns}_CODE_ORDER"
+    local -n _types="$type_name" _values="$value_name" _order="$order_name"
+    local key="code.${component}"
+
+    if [[ ! -v _types["$key"] ]]; then
+        _order+=("$key")
+    fi
+    _types["$key"]="bash"
+    _values["$key"]="$code"
+
+    local aggregate="" k
+    for k in "${_order[@]}"; do
+        aggregate+="${_values[$k]}"$'\n'
+    done
+    printf -v "${ns}_variables_code" '%s' "$aggregate"
+}
+
+__asyncobj_eval_body() {
+    local ns="$1" component="$2" body="$3"
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/asyncobj-body.XXXXXX")" || return 1
+    printf '%s\n' "$body" > "$tmp"
+    if ! bash -n "$tmp"; then
+        rm -f -- "$tmp"
+        printf 'Chyba [%s]: generated component %s neprošel bash -n\n' "$ns" "$component" >&2
+        return 2
+    fi
+    rm -f -- "$tmp"
+
+    eval "$body" || return
+    __asyncobj_record_code "$ns" "$component" "$body"
+}
+
+__asyncobj_random_hex() {
+    local bytes="${1:-8}" out=""
+    if [ -r /dev/urandom ]; then
+        out="$(od -An -N "$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return
+    else
+        printf -v out '%08x%08x' "$RANDOM$RANDOM" "$RANDOM$RANDOM"
+    fi
+    printf '%s\n' "$out"
+}
+
+__asyncobj_decode_q() {
+    [ $# -eq 2 ] || return 2
+    local encoded="$1" outvar="$2" decoded
+    eval "decoded=$encoded" || return
+    printf -v "$outvar" '%s' "$decoded"
+}
+
+# Compute a lowercase SHA-256 digest for a readable file.
+# Parameters:
+#   $1: Path to the file whose contents must be hashed.
+# Output: Exactly 64 hexadecimal characters followed by a newline on success.
+# Returns: 0 on success, 2 for invalid arguments, 127 if no hashing tool is
+#   installed, or the underlying hashing tool's nonzero exit status.
+# Notes: Avoid pipelines so a failed hash command cannot be masked by awk.
+# Hash a readable file using an explicitly reserved persistent Python worker or native tools.
+# Parameters:
+#   $1: Path to the file whose bytes are hashed; paths may contain spaces or Unicode.
+# Output: One lowercase, 64-character SHA-256 digest followed by a newline.
+# Returns: 0 on success; 2 on invalid arguments; native-tool status on fallback failure.
+# Notes: Python is opt-in. Call dalo_hash_python_enable in the owning shell first.
+#        The native fallback remains available to early bootstrap and migration.
+__dalo_sha256_file() {
+    [ "$#" -eq 1 ] || return 2
+    local path="$1" output digest code
+    [ -f "$path" ] && [ -r "$path" ] || return 1
+    if [ -n "${DALO_HASH_PY_HANDLE:-}" ] && declare -F inline_python >/dev/null 2>&1; then
+        # Encode filename bytes using Bash builtins; avoid shell/Python quoting hazards.
+        # LC_ALL=C ensures each substring is exactly one byte, including UTF-8 paths.
+        local hex='' byte i LC_ALL=C
+        for ((i=0; i<${#path}; i++)); do
+            printf -v byte '%02x' "'${path:i:1}"
+            hex+="$byte"
+        done
+        code="__import__('hashlib').file_digest(open(bytes.fromhex('$hex').decode('utf-8','surrogateescape'),'rb'),'sha256').hexdigest()"
+        output="$(inline_python -t "$DALO_HASH_PY_HANDLE" "$code")" || return
+        # EVAL returns Python repr for strings; remove its surrounding quotes.
+        if [[ "${output:0:1}" == "'" && "${output: -1}" == "'" ]]; then output="${output:1:${#output}-2}"; fi
+        [[ "$output" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+        printf '%s
+' "${output,,}"
+        return 0
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        output="$(sha256sum -- "$1")" || return
+    elif command -v shasum >/dev/null 2>&1; then
+        output="$(shasum -a 256 -- "$1")" || return
+    else
+        return 127
+    fi
+    digest="${output%% *}"
+    [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    printf '%s
+' "${digest,,}"
+}
+
+# Reserve a dedicated Python execution slot for file hashing in the owning shell.
+# Parameters: none. Requires the caller to load the python library using `include python`.
+# Returns: zero if a valid slot was reserved; nonzero if Python is unavailable or busy.
+# Notes: Do not invoke this inside command substitution: the reservation must survive.
+# Initialize the helpers library after its declared Python dependency is ready.
+# Parameters: none.
+# Returns: zero in all supported configurations; native SHA-256 remains available
+#          if no Python worker can be reserved.
+# Side effects: reserves one persistent Python execution slot when available.
+dalo_helpers_init() {
+    [ "$#" -eq 0 ] || return 2
+    if ! dalo_hash_python_enable; then
+        unset DALO_HASH_PY_HANDLE
+        printf '%s\n' 'DALO helpers: Python hash slot unavailable; using native SHA-256' >&2
+    fi
+    return 0
+}
+
+# Release the helpers-owned Python slot before the Python library shuts down.
+# Parameters: none.
+# Returns: zero; shutdown continues even if the Python supervisor is unavailable.
+# Side effects: releases the hash lease if it is still valid.
+dalo_helpers_fini() {
+    [ "$#" -eq 0 ] || return 2
+    dalo_hash_python_disable || return 0
+    return 0
+}
+
+dalo_hash_python_enable() {
+    [ "$#" -eq 0 ] || return 2
+    declare -F init_python_thread >/dev/null 2>&1 || return 127
+    [ -z "${DALO_HASH_PY_HANDLE:-}" ] || return 0
+    local handle
+    handle="$(init_python_thread)" || return
+    [[ "$handle" == OK\|* ]] || return 1
+    DALO_HASH_PY_HANDLE="$handle"
+}
+
+# Release the dedicated hash slot without shutting down the shared Python supervisor.
+# Parameters: none.
+# Returns: zero when no slot is held or when release succeeds; otherwise nonzero.
+dalo_hash_python_disable() {
+    [ "$#" -eq 0 ] || return 2
+    [ -n "${DALO_HASH_PY_HANDLE:-}" ] || return 0
+    local handle="$DALO_HASH_PY_HANDLE"
+    unset DALO_HASH_PY_HANDLE
+    release_python_thread "$handle" >/dev/null
+}
+
 DALO_LIBRARY_ABI=1
 DALO_LIBRARY_NAME="dalo"
 DALO_LIBRARY_VERSION="1.0.0"
@@ -42,9 +227,6 @@ else
     return 0
 fi
 
-__dalo_library_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return
-source "${__dalo_library_dir}/helpers.bashlib.sh" || return
-unset __dalo_library_dir
 # ============================================================================
 # 0. OBJECT VARIABLE / CODE STORAGE BOOTSTRAP
 # ============================================================================
@@ -57,7 +239,7 @@ define_variable_api() {
     __asyncobj_ensure_variable_storage "$ns"
 
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_set_variable() {
     [ \$# -eq 3 ] || return 2
     local name="\$1" type="\$2" value="\$3"
@@ -176,8 +358,7 @@ ${ns}_apply_code() {
     ${ns}_OBJECT_HEALTH="OK"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "variable_api" "$body"
 }
 
@@ -212,39 +393,25 @@ fifo_close() {
 define_default_worker_cleanup() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_default_worker_cleanup() {
     local worker_dir="\$1" slot_id="\${2:-}" exit_code="\${3:-0}"
     : "\$worker_dir" "\$slot_id" "\$exit_code"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_fifo_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<'EOF' || :
+    body=$(cat <<'EOF'
 # FIFO Frame ABI v2 uses a conspicuous multi-byte separator. Each field is
 # percent-escaped before framing, including the separator's UTF-8 bytes, so
 # literal occurrences in user data cannot change the number of fields.
 # A frame is: TAG + DELIMITER + ARGC + (DELIMITER + ENCODED_FIELD) * ARGC.
 __NS___FIFO_DELIMITER='€♧¿'
-# Parent-owned partial output vectors. Keys are slot|port, so interleaved
-# worker streams cannot corrupt each other's in-progress transfers.
-declare -gA __NS___FIFO_CHUNK_DATA=()
-declare -gA __NS___FIFO_CHUNK_OFFSET=()
-declare -gA __NS___FIFO_CHUNK_TOTAL=()
-# Bounded per-process output staging. The queue owns complete logical output
-# vectors, not wire fragments. It is opt-in so legacy synchronous calls retain
-# their exact behavior. The current worker loop flushes before completion; a
-# separate sender will be introduced only after this staging ABI is validated.
-declare -ga __NS___OUTPUT_QUEUE_KEYS=()
-declare -ga __NS___OUTPUT_QUEUE_VALUES=()
-declare -gi __NS___OUTPUT_QUEUE_BYTES=0
-
 
 # Encode a single FIFO field without losing empty strings or control bytes.
 # $1: raw field; $2: name of the output variable in the caller's scope.
@@ -349,7 +516,7 @@ __NS___fifo_frame_decode() {
 }
 
 __NS___fifo_atomic_max() {
-    local path="${1:-${__NS___FIFO_PATH:-}}" __out_name="${2:-}" __atomic_value
+    local path="${1:-${__NS___FIFO_PATH:-}}" out="${2:-}" __atomic_value
     if [[ -n "$path" && "$path" != "${__NS___FIFO_PATH:-}" ]]; then
         __atomic_value="$(getconf PIPE_BUF "$path" 2>/dev/null || true)"
         [[ "$__atomic_value" =~ ^[0-9]+$ ]] || __atomic_value=512
@@ -361,7 +528,7 @@ __NS___fifo_atomic_max() {
             __NS___FIFO_ATOMIC_MAX="$__atomic_value"
         fi
     fi
-    if [ -n "$__out_name" ]; then printf -v "$__out_name" '%s' "$__atomic_value"; else printf '%s' "$__atomic_value"; fi
+    if [ -n "$out" ]; then printf -v "$out" '%s' "$__atomic_value"; else printf '%s' "$__atomic_value"; fi
 }
 
 __NS___fifo_send_raw_fd() {
@@ -517,142 +684,11 @@ __NS___control_send_response() {
 
 # Port-aware DATA output. The worker owns output-vector semantics; runtime only
 # records the member under <slot>|<port> and transports it to the parent.
-# Transport an output-vector member using atomic FIFO frames. Small values
-# retain the original O-frame ABI; larger values use ordered C frames.
-# Parameters: $1 slot ID; $2 output port; $3... output value components.
-__NS___fifo_output_port_send() {
+__NS___fifo_output_port() {
     [ $# -ge 3 ] || return 2
     local slot_id="$1" output_port="$2"; shift 2
     [[ "$output_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
-    local key="$slot_id|$output_port" payload="$*" frame atomic_max
-    local LC_ALL=C offset=0 chunk chunk_size=96 total
-    local batch='' batch_bytes=0 frame_bytes fd
-    __NS___fifo_frame_encode --out frame O "$key" "$payload" || return
-    __NS___fifo_atomic_max "${__NS___FIFO_PATH:-}" atomic_max || return
-    if (( ${#frame} + 1 <= atomic_max )); then
-        __NS___fifo_send_raw "$frame"
-        return $?
-    fi
-    total=${#payload}
-    fd="${__NS___FIFO_FD:-}"
-    [[ -n "$fd" ]] || return 1
-    # Every C frame remains independently decodable. Batch complete newline-
-    # terminated frames into a single atomic write, without changing the wire
-    # format or requiring a receiver-side protocol update. Parameters: none;
-    # this function's slot_id/output_port/payload identify the vector.
-    # A conservative 96-byte chunk accommodates threefold percent escaping
-    # and metadata on platforms whose PIPE_BUF is only 512 bytes.
-    while ((offset < total)); do
-        chunk="${payload:offset:chunk_size}"
-        __NS___fifo_frame_encode --out frame C "$key" "$offset" "$total" "$chunk" || return
-        frame_bytes=$(( ${#frame} + 1 ))
-        (( frame_bytes <= atomic_max )) || return 90
-        if [[ "${DALO_FIFO_BATCH_CHUNKS:-1}" == 0 ]]; then
-            __NS___fifo_send_raw "$frame" || return
-        else
-            # Flush before exceeding PIPE_BUF: each printf is one atomic FIFO
-            # write even when other worker processes send concurrently.
-            if (( batch_bytes + frame_bytes > atomic_max )); then
-                printf '%s' "$batch" >&"$fd" || return
-                batch=''
-                batch_bytes=0
-            fi
-            batch+="$frame"$'\n'
-            batch_bytes=$((batch_bytes + frame_bytes))
-        fi
-        offset=$((offset + ${#chunk}))
-    done
-    if ((batch_bytes > 0)); then
-        printf '%s' "$batch" >&"$fd" || return
-    fi
-}
-
-# Send staged output vectors in FIFO order, coalescing adjacent small O
-# frames into atomic PIPE_BUF-bounded writes. Entries are removed only after
-# their complete batch has been written successfully. Large vectors retain
-# the previously validated chunked transport.
-# Parameters: none; the queue and FIFO belong to this generated namespace.
-__NS___fifo_output_queue_flush() {
-    local key value slot port size frame atomic_max fd index=0 count=0
-    local batch='' batch_bytes=0 frame_bytes committed=0
-    local LC_ALL=C
-    fd="${__NS___FIFO_FD:-}"
-    [[ -n "$fd" ]] || return 1
-    __NS___fifo_atomic_max "${__NS___FIFO_PATH:-}" atomic_max || return
-    while (( index < ${#__NS___OUTPUT_QUEUE_KEYS[@]} )); do
-        key="${__NS___OUTPUT_QUEUE_KEYS[index]}"
-        value="${__NS___OUTPUT_QUEUE_VALUES[index]}"
-        slot="${key%%|*}"
-        port="${key#*|}"
-        # An opt-in sender hook registers this vector before any O/C frame.
-        # Parameters: $1 logical key; $2 payload bytes. The hook must send
-        # the R frame on this sender's existing output FIFO and reserve credit.
-        # A failed registration is fatal; no unregistered data may be sent.
-        if [[ -n ${DALO_CREDIT_SENDER_REGISTER_HOOK:-} ]]; then
-            declare -F "$DALO_CREDIT_SENDER_REGISTER_HOOK" >/dev/null || return 94
-            "$DALO_CREDIT_SENDER_REGISTER_HOOK" "$key" "${#value}" || return
-        fi
-        __NS___fifo_frame_encode --out frame O "$key" "$value" || return
-        frame_bytes=$(( ${#frame} + 1 ))
-        if [[ "${DALO_FIFO_BATCH_VECTORS:-1}" != 0 ]] &&
-           ((frame_bytes <= atomic_max)); then
-            if ((batch_bytes + frame_bytes > atomic_max)); then
-                printf '%s' "$batch" >&"$fd" || return
-                committed=$((committed + count))
-                batch='' batch_bytes=0 count=0
-            fi
-            batch+="$frame"$'\n'
-            batch_bytes=$((batch_bytes + frame_bytes))
-            count=$((count + 1))
-        else
-            if ((batch_bytes)); then
-                printf '%s' "$batch" >&"$fd" || return
-                committed=$((committed + count))
-                batch='' batch_bytes=0 count=0
-            fi
-            __NS___fifo_output_port_send "$slot" "$port" "$value" || return
-            committed=$((committed + 1))
-        fi
-        index=$((index + 1))
-    done
-    if ((batch_bytes)); then
-        printf '%s' "$batch" >&"$fd" || return
-        committed=$((committed + count))
-    fi
-    # The normal path commits only after every write succeeds. A failed write
-    # retains queued entries, which may cause duplicate earlier frames if the
-    # caller retries; treat transport failure as fatal rather than retrying.
-    __NS___OUTPUT_QUEUE_KEYS=()
-    __NS___OUTPUT_QUEUE_VALUES=()
-    __NS___OUTPUT_QUEUE_BYTES=0
-}
-
-# Stage one complete output vector under the 256-KiB byte budget. Oversized
-# values bypass staging after draining older entries. On a full queue, flush
-# before admitting the next value; never silently discard a completed vector.
-# Parameters: $1 slot ID; $2 output port; $3... value components.
-__NS___fifo_output_port() {
-    (($# >= 3)) || return 2
-    local slot="$1" port="$2"; shift 2
-    local value="$*" limit="${DALO_OUTPUT_QUEUE_BYTES:-262144}"
-    [[ "$slot" =~ ^[0-9]+$ && "$port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
-    if [[ "${DALO_OUTPUT_QUEUE_ENABLED:-0}" != 1 ]]; then
-        __NS___fifo_output_port_send "$slot" "$port" "$value"
-        return $?
-    fi
-    [[ "$limit" =~ ^[1-9][0-9]*$ && ${#limit} -le 9 ]] || return 2
-    ((limit <= 16777216)) || return 2
-    if ((${#value} > limit)); then
-        __NS___fifo_output_queue_flush || return
-        __NS___fifo_output_port_send "$slot" "$port" "$value"
-        return $?
-    fi
-    if ((__NS___OUTPUT_QUEUE_BYTES + ${#value} > limit)); then
-        __NS___fifo_output_queue_flush || return
-    fi
-    __NS___OUTPUT_QUEUE_KEYS+=("$slot|$port")
-    __NS___OUTPUT_QUEUE_VALUES+=("$value")
-    __NS___OUTPUT_QUEUE_BYTES=$((__NS___OUTPUT_QUEUE_BYTES+${#value}))
+    __NS___fifo_send O "$slot_id|$output_port" "$*"
 }
 
 __NS___fifo_set() {
@@ -735,7 +771,7 @@ __NS___control_state() { printf '%s\n' "${__NS___CONTROL_STATE:-ACTIVE}"; }
 
 __NS___drain_fifo() {
     local fd="${__NS___FIFO_FD:-}"; [ -n "$fd" ] || return 0
-    local line tag chunk_key chunk_offset chunk_total chunk_value
+    local line tag
     local -a argv=()
     while :; do
         read -t 0 -u "$fd" || break
@@ -745,21 +781,6 @@ __NS___drain_fifo() {
             continue
         fi
         case "$tag" in
-            F)
-               # A persistent child reaped a failed asynchronous sender.
-               # Parameters: sender generation and validated EXIT status token.
-               ((${#argv[@]} == 2)) || return 92
-               declare -F dalo_parent_sender_fail >/dev/null || return 94
-               dalo_parent_sender_fail "${argv[0]}" "${argv[1]}" || return $?
-               ;;
-            R)
-               # Register an ACK destination on the same FIFO as its data.
-               # Parameters: key, sender FIFO, generation, message ID, bytes.
-               # FIFO ordering ensures registration precedes O/C delivery.
-               ((${#argv[@]} == 5)) || return 92
-               declare -F dalo_parent_ack_register >/dev/null || return 94
-               dalo_parent_ack_register "${argv[@]}" || return $?
-               ;;
             P)
                # User data is dispatched only by the owning MACHINE parent.
                ((${#argv[@]} == 3)) || continue
@@ -768,51 +789,7 @@ __NS___drain_fifo() {
                    dalo_machine_parent_dispatch "${argv[0]}" "${argv[1]}" "${argv[2]}" || return
                fi ;;
             O) ((${#argv[@]} == 2)) || continue
-               __NS___OUTPUT_DATA_VECTOR["${argv[0]}"]="${argv[1]}"
-               # Notify an opt-in parent ACK handler only after the complete
-               # output vector has been stored in this owning parent shell.
-               # Parameters: $1 logical output key; $2 payload byte length.
-               # The callback must not acknowledge downstream CONNECT effects.
-               if [[ -n ${DALO_CREDIT_PARENT_ACK_HOOK:-} ]]; then
-                   declare -F "$DALO_CREDIT_PARENT_ACK_HOOK" >/dev/null || return 94
-                   "$DALO_CREDIT_PARENT_ACK_HOOK" "${argv[0]}" "${#argv[1]}" || return 94
-               fi ;;
-            C)
-               # Reassemble chunked output members in the owning parent.
-               # Parameters: key, byte offset, total byte length, data chunk.
-               # Reject out-of-order, overlapping, or oversized transfers.
-               ((${#argv[@]} == 4)) || return 92
-               chunk_key="${argv[0]}" chunk_offset="${argv[1]}"
-               chunk_total="${argv[2]}" chunk_value="${argv[3]}"
-               [[ "$chunk_key" =~ ^[0-9]+\|[A-Za-z_][A-Za-z0-9_.-]*$ &&
-                  "$chunk_offset" =~ ^(0|[1-9][0-9]*)$ &&
-                  "$chunk_total" =~ ^[1-9][0-9]*$ ]] || return 92
-               (( ${#chunk_offset} <= 8 && ${#chunk_total} <= 8 &&
-                  chunk_total <= 1048576 )) || return 92
-               if ((chunk_offset == 0)); then
-                   [[ ! -v __NS___FIFO_CHUNK_OFFSET["$chunk_key"] ]] || return 92
-                   __NS___FIFO_CHUNK_DATA["$chunk_key"]=''
-                   __NS___FIFO_CHUNK_OFFSET["$chunk_key"]=0
-                   __NS___FIFO_CHUNK_TOTAL["$chunk_key"]="$chunk_total"
-               fi
-               [[ -v __NS___FIFO_CHUNK_OFFSET["$chunk_key"] ]] || return 92
-               ((chunk_offset == __NS___FIFO_CHUNK_OFFSET["$chunk_key"] &&
-                 chunk_total == __NS___FIFO_CHUNK_TOTAL["$chunk_key"] &&
-                 ${#chunk_value} > 0 &&
-                 chunk_offset + ${#chunk_value} <= chunk_total)) || return 92
-               __NS___FIFO_CHUNK_DATA["$chunk_key"]+="$chunk_value"
-               __NS___FIFO_CHUNK_OFFSET["$chunk_key"]=$((chunk_offset + ${#chunk_value}))
-               if (( __NS___FIFO_CHUNK_OFFSET["$chunk_key"] == chunk_total )); then
-                   __NS___OUTPUT_DATA_VECTOR["$chunk_key"]="${__NS___FIFO_CHUNK_DATA["$chunk_key"]}"
-                   # A chunked vector is ACK-eligible only after its final
-                   # fragment has been validated and the vector stored.
-                   # Parameters: $1 logical output key; $2 total payload bytes.
-                   if [[ -n ${DALO_CREDIT_PARENT_ACK_HOOK:-} ]]; then
-                       declare -F "$DALO_CREDIT_PARENT_ACK_HOOK" >/dev/null || return 94
-                       "$DALO_CREDIT_PARENT_ACK_HOOK" "$chunk_key" "$chunk_total" || return 94
-                   fi
-                   unset '__NS___FIFO_CHUNK_DATA[$chunk_key]' '__NS___FIFO_CHUNK_OFFSET[$chunk_key]' '__NS___FIFO_CHUNK_TOTAL[$chunk_key]'
-               fi ;;
+               __NS___OUTPUT_DATA_VECTOR["${argv[0]}"]="${argv[1]}" ;;
             L)
                ((${#argv[@]} == 1)) || continue
                case "${argv[0]}" in
@@ -1108,8 +1085,7 @@ __NS___drain_fifo() {
     done
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     body="${body//__NS__/$ns}"
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
@@ -1117,7 +1093,7 @@ EOF
 define_worker_cleanup_wrapper() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_worker_cleanup_wrapper() {
     local exit_code=\$?
     local worker_dir="\$1" slot_id="\$2" cleanup_func="\${3:-}"
@@ -1146,15 +1122,14 @@ ${ns}_worker_cleanup_wrapper() {
     exit "\$exit_code"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_job_pool_init() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_job_pool_init() {
     ${ns}_MAX_JOBS="\${1:-\$(nproc 2>/dev/null || echo 4)}"
     ${ns}_JOB_COUNTER=0
@@ -1213,15 +1188,14 @@ ${ns}_job_pool_init() {
     ${ns}_FIFO_FD="\$_fd"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_argv_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_task_argv_set() {
     local task_id="\$1"
     shift
@@ -1256,15 +1230,14 @@ ${ns}_task_argv_forget() {
     unset "\$array_name" 2>/dev/null || true
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_mutation_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 # Parent/owner-side task mutations. These are the canonical state writers.
 ${ns}_task_do_submit() {
     [ \$# -ge 2 ] || return 2
@@ -1335,15 +1308,14 @@ ${ns}_task_do_forget() {
     fi
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_task() {
     local op="\${1:-}"
     [ \$# -gt 0 ] && shift
@@ -1463,15 +1435,14 @@ ${ns}_task() {
     esac
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_state_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_task_status_is_terminal() {
     case "\$1" in
         SUCCESS|FAILED|POSSIBLE_DATA_LOSS|ABNORMAL_TERMINATION|PROTOCOL_INCONSISTENCY) return 0 ;;
@@ -1501,15 +1472,14 @@ ${ns}_task_transition() {
     ${ns}_TASK_STATUS["\$task_id"]="\$to"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_retry_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_task_retries_left() {
     local task_id="\$1"
     [[ -v ${ns}_TASK_STATUS[\$task_id] ]] || return 1
@@ -1557,15 +1527,14 @@ ${ns}_task_do_rerun() {
     fi
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_task_execution_api() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_task_do_start() {
     local task_id="\$1"
     [[ -v ${ns}_TASK_STATUS[\$task_id] ]] || return 1
@@ -1615,15 +1584,14 @@ ${ns}_task_do_attempt_terminal() {
     printf -v "${ns}_TASK_FINISHED[\$task_id]" '%(%s)T' -1
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_try_release_slot() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_try_release_slot() {
     local slot_id="\$1" pid="\$2"
     local current_pid="\${${ns}_WORKER_PIDS[\$slot_id]:-}"
@@ -1685,15 +1653,14 @@ ${ns}_try_release_slot() {
     unset "${ns}_SLOT_ATTEMPT[\$slot_id]"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_finalize_missing_completion() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_finalize_missing_completion() {
     local slot_id="\$1" pid="\$2"
     local current_pid="\${${ns}_WORKER_PIDS[\$slot_id]:-}"
@@ -1741,15 +1708,14 @@ ${ns}_finalize_missing_completion() {
     unset "${ns}_SLOT_ATTEMPT[\$slot_id]"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_mark_reaped() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_mark_reaped() {
     local pid="\$1" reap_rc="\$2" slot_id current_pid
     for (( slot_id=1; slot_id<=\${${ns}_MAX_JOBS}; slot_id++ )); do
@@ -1765,15 +1731,14 @@ ${ns}_mark_reaped() {
     return 1
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_reap_one() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_reap_one() {
     local reaped_pid reap_rc slot_id pid
     local -a wait_pids=()
@@ -1817,15 +1782,14 @@ ${ns}_reap_one() {
     fi
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_mark_job_completed() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_mark_job_completed() {
     [ \$# -eq 3 ] || [ \$# -eq 5 ] || return 64
     local slot_id="\$1" worker_pid="\$2" exit_code="\$3"
@@ -1856,14 +1820,13 @@ ${ns}_mark_job_completed() {
     ${ns}_try_release_slot "\$slot_id" "\$worker_pid"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_scheduler_binding_api() {
     local ns="$1" body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_scheduler_bind() {
     [ \$# -eq 3 ] || return 64
     local scheduler_ns="\$1" cpu="\$2" memory="\$3"
@@ -1901,15 +1864,14 @@ ${ns}_scheduler_release_slot() {
     unset '${ns}_SLOT_RESERVATION['"\$slot_id"']'
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_summon_worker() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 # Canonical OBJECT -> WORKER boundary.
 # ABI: summon_worker INPUT_PORT DATA...
 ${ns}_summon_worker() {
@@ -1919,15 +1881,14 @@ ${ns}_summon_worker() {
     ${ns}_job_pool_add_work_port "\$input_port" "\$@"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_job_pool_add_work() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 
 ${ns}_job_pool_add_work_port() {
     [ \$# -ge 1 ] || return 2
@@ -1937,15 +1898,14 @@ ${ns}_job_pool_add_work_port() {
     ${ns}_job_pool_submit_port "\$input_port" "\$worker_func" "\$cleanup_func" "\$@"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_job_pool_submit() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_job_pool_submit_core() {
     [ \$# -ge 5 ] || return 2
     local task_id="\$1" attempt="\$2" cmd_func="\$3" cleanup_func="\${4:-}" input_port="\$5"
@@ -2044,15 +2004,14 @@ ${ns}_job_pool_submit_task_port() {
     ${ns}_job_pool_submit_core "\$task_id" "\$attempt" "\$cmd_func" "\$cleanup_func" "\$input_port" "\$@"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_job_pool_wait() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_job_pool_wait() {
     while [ "\${${ns}_PENDING_JOBS}" -gt 0 ]; do
         ${ns}_reap_one
@@ -2060,15 +2019,14 @@ ${ns}_job_pool_wait() {
     ${ns}_drain_fifo
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_audit_job_pool() {
     local ns="$1"
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_audit_job_pool() {
     local validate_func="\$1"
     echo "--- Parallel Job State Audit [Instance: ${ns}] ---"
@@ -2116,8 +2074,7 @@ ${ns}_audit_job_pool() {
     echo "--------------------------------------------------"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
@@ -2135,7 +2092,7 @@ define_endpoint_api() {
     local flush_threshold="$4"
 
     local body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_ENDPOINT_OUT_FD="$out_fd"
 ${ns}_ENDPOINT_FLUSH_THRESHOLD="$flush_threshold"
 ${ns}_ENDPOINT_BUFFER_FILE="$buffer_file"
@@ -2214,8 +2171,7 @@ ${ns}_endpoint_finalize() {
     ${ns}_endpoint_flush
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 
     "${ns}_endpoint_init"
@@ -2227,7 +2183,7 @@ EOF
 
 define_diagnostic_api() {
     local ns="$1" body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_diag_set() {
     [ \$# -eq 2 ] || return 2
     ${ns}_DIAG["\$1"]="\$2"
@@ -2349,8 +2305,7 @@ ${ns}_diagnose() {
     ${ns}_OBJECT_HEALTH="OK"
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
@@ -2360,7 +2315,7 @@ EOF
 
 define_runtime_resource_api() {
     local ns="$1" body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_resource_set() {
     [ \$# -eq 2 ] || return 2
     [[ "\$1" =~ ^[a-zA-Z0-9_.-]+$ ]] || return 2
@@ -2395,14 +2350,13 @@ ${ns}_resource_snapshot() {
     done < <(${ns}_resource_list)
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
 define_backend_descriptor_api() {
     local ns="$1" body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_backend_register() {
     [ \$# -ge 2 ] || return 2
     local name="\$1" scope="\$2"; shift 2
@@ -2441,8 +2395,7 @@ ${ns}_backend_is_network_capable() {
     [[ "\$scope" == remote || "\$scope" == universal ]]
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
@@ -2460,7 +2413,7 @@ EOF
 
 define_discovery_api() {
     local ns="$1" body
-    IFS= read -r -d '' body <<EOF || :
+    body=$(cat <<EOF
 ${ns}_discovery_payload() {
     ${ns}_resource_refresh_workers || return
     printf 'HELLO\t1\t%s\t%s\t%s\n' \
@@ -2508,8 +2461,7 @@ ${ns}_peer_forget() {
     done
 }
 EOF
-    # Match command substitution: remove every trailing newline.
-    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+)
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
 
@@ -7364,6 +7316,7 @@ __asyncmachine_link() {
                 printf '  %s_fast_slot=$((%s_fast_slot + 1))\n' "$ns" "$ns"
                 printf '  local slot_id="$%s_fast_slot" key\n' "$ns"
                 printf '  %s_INPUT_DATA_VECTOR["$slot_id|$input_port"]="$*"\n' "$ns"
+                printf '  for key in "${!%s_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$slot_id|"* ]] && unset '\''%s_OUTPUT_DATA_VECTOR['\''"$key"'\'']'\''; done\n' "$ns" "$ns"
                 printf '  %s_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"\n' "$ns"
                 printf '  %s_on_job_completed "$slot_id" 0\n' "$ns"
                 printf '}\n'
@@ -7380,20 +7333,7 @@ __asyncmachine_link() {
                 printf '%s_PERSIST_SEQ=0\n' "$ns"
                 printf '%s_PERSIST_NEXT=0\n' "$ns"
                 printf '%s_PERSIST_PENDING=0\n' "$ns"
-                # Bound outstanding work in every generated persistent pool.
-                # The default is conservative for small FIFO capacities such as
-                # Termux; callers may tune it per MACHINE before sourcing.
-                printf '%s_PERSIST_WINDOW="${DALO_PERSIST_WINDOW:-8}"\n' "$ns"
-                printf '[[ "$%s_PERSIST_WINDOW" =~ ^[1-9][0-9]*$ ]] || { printf "Invalid DALO_PERSIST_WINDOW\\n" >&2; exit 2; }\n' "$ns"
-                printf '%s_PERSIST_FAILED=0\n' "$ns"
-                # Preserve worker failures across FIFO callback boundaries.
-                # A worker failure is not a process crash and must not be lost.
-                printf '%s_PERSIST_WORKER_RC=0\n' "$ns"
-                # Track the owner of every outstanding sequence in the parent.
-                printf 'declare -A %s_PERSIST_OWNER=()\n' "$ns"
-                printf 'declare -A %s_PERSIST_LOST=()\n' "$ns"
                 printf '%s_persistent_start() {\n' "$ns"
-                printf '  if [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then [[ "${DALO_ASYNC_SENDER:-0}" == 1 && "${DALO_OUTPUT_QUEUE_ENABLED:-0}" == 1 ]] || { echo "Credit mode requires async sender and output queue" >&2; return 94; }; fi\n'
                 printf '  local i fd pid\n'
                 printf '  for ((i=0;i<%s_MAX_JOBS;i++)); do\n' "$ns"
                 printf '    exec {fd}> >(%s_persistent_child_loop) || return\n' "$ns"
@@ -7403,120 +7343,32 @@ __asyncmachine_link() {
                 printf '  done\n'
                 printf '}\n'
                 printf '%s_persistent_child_loop() {\n' "$ns"
-                # The sender runs in a separate Bash process so the persistent
-                # worker can calculate the next task while prior output drains.
-                # Parameters: sender_pid identifies the one in-flight sender;
-                # sender_rc captures failures before another sender is launched.
-                printf '  local seq input_port payload rc sender_pid= sender_instance= sender_rc=0\n'
+                printf '  local seq input_port payload rc\n'
                 printf '  while IFS=$'"'"'\t'"'"' read -r seq input_port payload; do\n'
                 printf '    [[ "$seq" == STOP ]] && break\n'
                 printf '    [[ "$seq" =~ ^[0-9]+$ && -n "$input_port" ]] || continue\n'
                 printf '    input_port="$(printf "%%b" "$input_port")"\n'
                 printf '    payload="$(printf "%%b" "$payload")"\n'
-                # Each persistent child has its own Bash address space. The
-                # parent's input vector is not inherited after pool startup,
-                # so populate the child-local vector before invoking WORKER.
-                printf '    %s_INPUT_DATA_VECTOR["$seq|$input_port"]="$payload"\n' "$ns"
                 printf '    rc=0\n'
                 printf '    %s_worker "${TMPDIR:-/tmp}" "$seq" "$payload" || rc=$?\n' "$ns"
-                # The worker's fifo_output_port writes O frames before this
-                # completion control frame on the same object FIFO. The parent
-                # must drain that FIFO before forwarding the output vector.
-                # One in-flight sender is deliberately enforced in v1. The
-                # child-local queue is copied at fork and immediately cleared
-                # in the computing process; only the sender owns that snapshot.
-                # Parameters: sender_pid and sender_rc are child-loop locals;
-                # seq and rc identify the completed job and its worker result.
-                printf '    if [[ "${DALO_ASYNC_SENDER:-0}" == 1 && "${DALO_OUTPUT_QUEUE_ENABLED:-0}" == 1 ]]; then\n'
-                printf '      if [[ -n "$sender_pid" ]]; then\n'
-                printf '        sender_rc=0\n'
-                printf '        wait "$sender_pid" || sender_rc=$?\n'
-                # Report the confirmed exit through the existing ordered FIFO.
-                # Parameters: sender_instance is the reaped generation and
-                # sender_rc is the exact wait status, including SIGKILL (137).
-                printf '        if ((sender_rc != 0)) && [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then\n'
-                printf '          %s_fifo_send F "$sender_instance" "EXIT_${sender_rc}" || return $?\n' "$ns"
-                printf '        fi\n'
-                printf '        sender_pid= sender_instance=\n'
-                printf '        ((sender_rc == 0)) || return "$sender_rc"\n'
-                printf '      fi\n'
-                # The forked sender owns its credit ledger and private ACK FIFO.
-                # A sender generation is unique to one BASHPID; do not copy its
-                # mutable ledger back to the computing worker.
-                # Parameters: seq and rc are the enclosing child-loop locals.
-                printf '      (\n'
-                printf '        if [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then\n'
-                printf '          ack_dir="$(mktemp -d "${TMPDIR:-/tmp}/dalo-credit.XXXXXXXX")" || exit 94\n'
-                printf '          ack_instance="sender.${BASHPID}.${seq}"\n'
-                printf '          DALO_SENDER_FRAME_SEND=%s_fifo_send\n' "$ns"
-                printf '          dalo_sender_credit_init "$ack_dir/ack" "$ack_instance" "${DALO_OUTPUT_QUEUE_BYTES:-262144}" || exit $?\n'
-                printf '          DALO_CREDIT_SENDER_REGISTER_HOOK=dalo_sender_credit_register\n'
-                printf '        fi\n'
-                printf '        %s_fifo_output_queue_flush || rc=$?\n' "$ns"
-                printf '        if [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then\n'
-                printf '          if ((rc == 0)); then dalo_sender_credit_finish || rc=$?; fi\n'
-                printf '          dalo_sender_credit_close || { ((rc != 0)) || rc=$?; }\n'
-                printf '          rm -rf -- "$ack_dir"\n'
-                printf '        fi\n'
-                printf '        %s_fifo_call_parent %s_persistent_completed "$seq" "$rc"\n' "$ns" "$ns"
-                printf '      ) &\n'
-
-                printf '      sender_pid=$!\n'
-                printf '      sender_instance="sender.${sender_pid}.${seq}"\n'
-                printf '      %s_OUTPUT_QUEUE_KEYS=(); %s_OUTPUT_QUEUE_VALUES=(); %s_OUTPUT_QUEUE_BYTES=0\n' "$ns" "$ns" "$ns"
-                printf '    else\n'
-                printf '      %s_fifo_output_queue_flush || rc=$?\n' "$ns"
-                printf '      %s_fifo_call_parent %s_persistent_completed "$seq" "$rc"\n' "$ns" "$ns"
-                printf '    fi\n'
+                printf '    %s_fifo_call_parent %s_persistent_completed "$seq" "$rc"\n' "$ns" "$ns"
                 printf '  done\n'
-                printf '  if [[ -n "$sender_pid" ]]; then\n'
-                printf '    sender_rc=0; wait "$sender_pid" || sender_rc=$?\n'
-                printf '    if ((sender_rc != 0)) && [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then\n'
-                printf '      %s_fifo_send F "$sender_instance" "EXIT_${sender_rc}" || return $?\n' "$ns"
-                printf '    fi\n'
-                printf '    ((sender_rc == 0)) || return "$sender_rc"\n'
-                printf '  fi\n'
                 printf '}\n'
                 printf '%s_summon_worker() {\n' "$ns"
                 printf '  [[ $# -ge 1 ]] || return 2\n'
                 printf '  local input_port="$1"; shift\n'
                 printf '  [[ "$input_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2\n'
-                # Drain the shared child->parent FIFO before private pipe writes.
-                # Without this, children may block on their output FIFO while
-                # the parent blocks submitting more work to a full child pipe.
-                # Parameters: none; the generated summon_worker owns its input.
-                printf '  %s_drain_fifo || return $?\n' "$ns"
-                printf '  %s_persistent_check_health || return $?\n' "$ns"
-                printf '  while ((%s_PERSIST_PENDING >= %s_PERSIST_WINDOW)); do\n' "$ns" "$ns"
-                printf '    %s_drain_fifo || return $?\n' "$ns"
-                printf '    %s_persistent_check_health || return $?\n' "$ns"
-                printf '    ((%s_PERSIST_PENDING < %s_PERSIST_WINDOW)) || sleep 0.001\n' "$ns" "$ns"
-                printf '  done\n'
                 printf '  %s_PERSIST_SEQ=$((%s_PERSIST_SEQ+1))\n' "$ns" "$ns"
                 printf '  local seq="$%s_PERSIST_SEQ" payload="$*" key idx fd\n' "$ns"
                 printf '  %s_INPUT_DATA_VECTOR["$seq|$input_port"]="$payload"\n' "$ns"
+                printf '  for key in "${!%s_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$seq|"* ]] && unset '\''%s_OUTPUT_DATA_VECTOR['\''"$key"'\'']'\''; done\n' "$ns" "$ns"
                 printf '  input_port="${input_port//\\/\\\\}"; input_port="${input_port//$'"'"'\t'"'"'/\\t}"; input_port="${input_port//$'"'"'\n'"'"'/\\n}"\n'
                 printf '  payload="${payload//\\/\\\\}"; payload="${payload//$'"'"'\t'"'"'/\\t}"; payload="${payload//$'"'"'\n'"'"'/\\n}"\n'
                 printf '  idx="$%s_PERSIST_NEXT"\n' "$ns"
                 printf '  %s_PERSIST_NEXT=$(((idx + 1) %% %s_MAX_JOBS))\n' "$ns" "$ns"
                 printf '  fd="${%s_PERSIST_DATA_FDS[idx]}"\n' "$ns"
-                printf '  %s_PERSIST_OWNER["$seq"]="$idx"\n' "$ns"
                 printf '  %s_PERSIST_PENDING=$((%s_PERSIST_PENDING+1))\n' "$ns" "$ns"
-                # Keep the parent draining worker results while a potentially
-                # blocking large input is written to the private worker pipe.
-                # Parameters are the generated summon_worker's local seq,
-                # input_port, payload and fd variables.
-                printf '  local writer_pid writer_rc=0\n'
-                printf '  ( printf "%%s\\t%%s\\t%%s\\n" "$seq" "$input_port" "$payload" >&"$fd" ) &\n'
-                printf '  writer_pid=$!\n'
-                printf '  while kill -0 "$writer_pid" 2>/dev/null; do\n'
-                printf '    if ! %s_drain_fifo; then kill "$writer_pid" 2>/dev/null || true; wait "$writer_pid" 2>/dev/null || true; return 92; fi\n' "$ns"
-                printf '    %s_persistent_check_health || { kill "$writer_pid" 2>/dev/null || true; wait "$writer_pid" 2>/dev/null || true; return 93; }\n' "$ns"
-                printf '    sleep 0.001\n'
-                printf '  done\n'
-                printf '  wait "$writer_pid" || writer_rc=$?\n'
-                printf '  %s_drain_fifo || return $?\n' "$ns"
-                printf '  ((writer_rc == 0)) || return "$writer_rc"\n'
+                printf '  printf "%%s\\t%%s\\t%%s\\n" "$seq" "$input_port" "$payload" >&"$fd"\n'
                 printf '}\n'
                 printf '%s_persistent_stop() {\n' "$ns"
                 printf '  local i fd pid\n'
@@ -7527,58 +7379,12 @@ __asyncmachine_link() {
                 printf '}\n'
                 printf '%s_persistent_completed() {\n' "$ns"
                 printf '  local seq="$1" rc="$2"\n'
-                printf '  unset "%s_PERSIST_OWNER[$seq]"\n' "$ns"
-                printf '  if ((rc != 0 && %s_PERSIST_WORKER_RC == 0)); then %s_PERSIST_WORKER_RC="$rc"; fi\n' "$ns" "$ns"
                 printf '  %s_on_job_completed "$seq" "$rc"\n' "$ns"
                 printf '  ((%s_PERSIST_PENDING > 0)) && %s_PERSIST_PENDING=$((%s_PERSIST_PENDING-1))\n' "$ns" "$ns" "$ns"
                 printf '}\n'
-                # Detect unexpected child death without replaying jobs whose
-                # side effects may already have happened. The owning MACHINE
-                # must propagate this failure instead of waiting indefinitely.
-                printf '%s_persistent_check_health() {\n' "$ns"
-                printf '  local pid idx seq lost=0\n'
-                printf '  ((%s_PERSIST_FAILED == 0)) || return 70\n' "$ns"
-                printf '  for idx in "${!%s_PERSIST_PIDS[@]}"; do\n' "$ns"
-                printf '    pid="${%s_PERSIST_PIDS[idx]}"\n' "$ns"
-                printf '    if ! kill -0 "$pid" 2>/dev/null; then\n'
-                printf '      for seq in "${!%s_PERSIST_OWNER[@]}"; do\n' "$ns"
-                printf '        if [[ "${%s_PERSIST_OWNER[$seq]}" == "$idx" ]]; then %s_PERSIST_LOST["$seq"]="$pid"; lost=$((lost+1)); fi\n' "$ns" "$ns"
-                printf '      done\n'
-                printf '      printf "PERSISTENT worker died: pid=%%s pending=%%s lost=%%s\\n" "$pid" "$%s_PERSIST_PENDING" "$lost" >&2\n' "$ns"
-                printf '      %s_PERSIST_FAILED=1\n' "$ns"
-                printf '      return 70\n'
-                printf '    fi\n'
-                printf '  done\n'
-                printf '}\n'
-                # Explicit emergency cleanup after fail-fast: terminate surviving
-                # children, close private data FDs, and reap owned child PIDs.
-                # Parameters: none; only invoke after the owning MACHINE fails.
-                printf '%s_persistent_abort() {\n' "$ns"
-                printf '  local pid fd\n'
-                printf '  %s_PERSIST_FAILED=1\n' "$ns"
-                printf '  for pid in "${%s_PERSIST_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done\n' "$ns"
-                printf '  for fd in "${%s_PERSIST_DATA_FDS[@]}"; do eval "exec ${fd}>&-"; done\n' "$ns"
-                printf '  for pid in "${%s_PERSIST_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done\n' "$ns"
-                printf '  %s_PERSIST_PIDS=(); %s_PERSIST_DATA_FDS=()\n' "$ns" "$ns"
-                printf '}\n'
                 printf '%s_job_pool_wait() {\n' "$ns"
-                printf '  while ((%s_PERSIST_PENDING > 0)); do %s_drain_fifo || return; %s_persistent_check_health || return; ((%s_PERSIST_PENDING > 0)) && sleep 0.001; done\n' "$ns" "$ns" "$ns" "$ns"
-                printf '  ((%s_PERSIST_WORKER_RC == 0)) || return "$%s_PERSIST_WORKER_RC"\n' "$ns" "$ns"
+                printf '  while ((%s_PERSIST_PENDING > 0)); do %s_drain_fifo || true; ((%s_PERSIST_PENDING > 0)) && sleep 0.001; done\n' "$ns" "$ns" "$ns"
                 printf '}\n'
-                # Initialize the parent-owned ACK registry before starting any
-                # persistent children. Only the experimental opt-in mode loads
-                # external credit modules; the default generated MACHINE is unchanged.
-                # Parameters: DALO_CREDIT_RUNTIME_DIR names the module directory.
-                printf 'if [[ "${DALO_MACHINE_CREDIT_ENABLED:-0}" == 1 ]]; then\n'
-                printf '  [[ -d "${DALO_CREDIT_RUNTIME_DIR:-}" ]] || { echo "DALO credit module directory missing" >&2; exit 94; }\n'
-                printf '  source "${DALO_CREDIT_RUNTIME_DIR}/queue-credit.bashlib.sh" || exit\n'
-                printf '  source "${DALO_CREDIT_RUNTIME_DIR}/queue-credit-ack.bashlib.sh" || exit\n'
-                printf '  source "${DALO_CREDIT_RUNTIME_DIR}/parent-ack-routing.bashlib.sh" || exit\n'
-                printf '  source "${DALO_CREDIT_RUNTIME_DIR}/sender-credit-integration.bashlib.sh" || exit\n'
-                printf '  dalo_parent_ack_init || exit\n'
-                printf '  dalo_parent_sender_watch_init || exit\n'
-                printf '  DALO_CREDIT_PARENT_ACK_HOOK=dalo_parent_ack_complete_optional\n'
-                printf 'fi\n'
                 printf '%s_persistent_start || exit $?\n' "$ns"
             } >>"$out"
         fi
@@ -7620,7 +7426,7 @@ __asyncmachine_link() {
     {
         printf '\nASYNC_MACHINE_READY=1\n'
         printf 'async_machine_wait_all() {\n'
-        printf '  local __dalo_pending __dalo_worker_rc=0\n'
+        printf '  local __dalo_pending\n'
         printf '  while :; do\n'
         printf '    __dalo_pending=0\n'
     } >>"$out"
@@ -7631,10 +7437,6 @@ __asyncmachine_link() {
     for obj in "${objs[@]}"; do
         ns="${machine_ns[$obj]}"
         printf '    %s_drain_fifo || return\n' "$ns" >>"$out"
-        if [[ "${execm[$obj]:-INLINE}" == PERSISTENT ]]; then
-            # Record worker errors but continue draining all routed outputs.
-            printf '    if ((%s_PERSIST_WORKER_RC != 0 && __dalo_worker_rc == 0)); then __dalo_worker_rc="$%s_PERSIST_WORKER_RC"; fi\n' "$ns" "$ns" >>"$out"
-        fi
         local __wp; __asyncmachine_meta_get __wp "$wpoll_arr" "$obj" "" || return
         if [[ -n "$__wp" ]]; then printf '    %s_worker_poll || return\n' "$ns" >>"$out"; fi
     done
@@ -7647,7 +7449,6 @@ __asyncmachine_link() {
                 printf '    if ((%s_PENDING_JOBS > 0)); then %s_reap_one || return; __dalo_pending=1; fi\n' "$ns" "$ns" >>"$out"
                 ;;
             PERSISTENT)
-                printf '    %s_persistent_check_health || return\n' "$ns" >>"$out"
                 printf '    ((%s_PERSIST_PENDING > 0)) && __dalo_pending=1\n' "$ns" >>"$out"
                 ;;
         esac
@@ -7655,7 +7456,7 @@ __asyncmachine_link() {
         [[ "$__wk" == 1 ]] && printf '    __dalo_pending=1\n' >>"$out"
     done
     {
-        printf '    ((__dalo_pending == 0)) && return "$__dalo_worker_rc"\n'
+        printf '    ((__dalo_pending == 0)) && return 0\n'
         printf '    sleep 0.001\n'
         printf '  done\n'
         printf '}\n'
@@ -8198,3 +7999,236 @@ host_shutdown_evacuation() {
 
     printf -v "$_hse_out_status" '%s' EVACUATED
 }
+async_machine_library_fini_all() { return 0; }
+
+# ============================================================================
+# GENERATED MACHINE IMAGE
+# ============================================================================
+ASYNC_MACHINE_ABI=2
+ASYNC_MACHINE_PROJECT_SHA256=43c452680ae64929d7292eb71e8a537e90dfbfbad03fbeefbb0042746207fa80
+ASYNC_MACHINE_NAME=DALO_MACHINE_BUILD
+
+# First-class runtime owner of this generated MACHINE.
+create_blank_object ASYNC_MACHINE || exit $?
+printf -v ASYNC_MACHINE_OBJECT_TYPE %s ASYNC_SCRIPT
+ASYNC_MACHINE_SCRIPT_OBJ_ID="$ASYNC_MACHINE_OBJECT_ID"
+ASYNC_MACHINE_SCRIPT_UUID="$ASYNC_MACHINE_OBJECT_UUID"
+
+ASYNC_MACHINE_PROJECT_ARGC=0
+declare -a ASYNC_MACHINE_PROJECT_ARGV=()
+declare -A ASYNC_MACHINE_PROJECT_ARG_SEEN=()
+async_machine_parse_args() {
+  ASYNC_MACHINE_PROJECT_ARGC=0; ASYNC_MACHINE_PROJECT_ARGV=(); ASYNC_MACHINE_PROJECT_ARG_SEEN=()
+  local arg name value type required default found
+  while (($#)); do
+    arg="$1"; shift
+    [[ "$arg" != -- ]] || { ASYNC_MACHINE_PROJECT_ARGV=("$@"); ASYNC_MACHINE_PROJECT_ARGC=$#; break; }
+    [[ "$arg" == --* ]] || { printf "Unexpected MACHINE argument: %s\n" "$arg" >&2; return 64; }
+    if [[ "$arg" == *=* ]]; then name="${arg%=*}"; name="${name#--}"; value="${arg#*=}"; else name="${arg#--}"; (($#)) || { printf "Missing value for --%s\n" "$name" >&2; return 64; }; value="$1"; shift; fi
+    found=0
+    ((found)) || { printf "Unknown PROJECT argument: --%s\n" "$name" >&2; return 64; }
+    [[ ! -v ASYNC_MACHINE_PROJECT_ARG_SEEN[$name] ]] || { printf "Duplicate PROJECT argument: --%s\n" "$name" >&2; return 64; }; ASYNC_MACHINE_PROJECT_ARG_SEEN[$name]=1
+    case "$type" in int) [[ "$value" =~ ^-?[0-9]+$ ]] || return 65;; uint) [[ "$value" =~ ^[0-9]+$ ]] || return 65;; bool) [[ "$value" == 0 || "$value" == 1 ]] || return 65;; string) :;; esac
+    printf -v "ASYNC_MACHINE_PARAM_${name}" "%s" "$value"; export "ASYNC_MACHINE_PARAM_${name}"
+  done
+}
+
+# Materialize declared runtime object origin.
+create_blank_object m_0000_origin || exit $?
+printf -v m_0000_origin_OWNER_SCRIPT_OBJ_ID %s "$ASYNC_MACHINE_SCRIPT_OBJ_ID"
+printf -v m_0000_origin_OWNER_SCRIPT_UUID %s "$ASYNC_MACHINE_SCRIPT_UUID"
+printf -v m_0000_origin_OBJECT_NAME %s origin
+printf -v m_0000_origin_OBJECT_TYPE %s ORIGIN
+printf -v m_0000_origin_MAX_JOBS %s 1
+
+# Linked worker implementation for m_0000_origin.
+m_0000_origin_worker_impl () 
+{ 
+    local worker_dir="$1" slot="$2" frame="$3";
+    : "$worker_dir" "$slot";
+    "${DALO_BENCH_PIPE_NS}_summon_worker" in "$frame"
+}
+m_0000_origin_worker() { local ASYNC_WORKER_NS=m_0000_origin; m_0000_origin_worker_impl "$@"; }
+printf -v m_0000_origin_TARGET_WORKER_FUNC %s m_0000_origin_worker
+printf -v m_0000_origin_WORKER_KEEPALIVE %s 0
+
+# Materialize declared runtime object pipe.
+create_blank_object m_0001_pipe || exit $?
+printf -v m_0001_pipe_OWNER_SCRIPT_OBJ_ID %s "$ASYNC_MACHINE_SCRIPT_OBJ_ID"
+printf -v m_0001_pipe_OWNER_SCRIPT_UUID %s "$ASYNC_MACHINE_SCRIPT_UUID"
+printf -v m_0001_pipe_OBJECT_NAME %s pipe
+printf -v m_0001_pipe_OBJECT_TYPE %s PIPE
+printf -v m_0001_pipe_MAX_JOBS %s 1
+
+# Linked worker implementation for m_0001_pipe.
+m_0001_pipe_worker_impl () 
+{ 
+    local worker_dir="$1" slot="$2" frame="$3";
+    : "$worker_dir" "$slot";
+    if [[ "${DALO_BENCH_PIPE_CHILD:-0}" == 1 ]]; then
+        if [[ -n "${DALO_BENCH_PIPE_CHILD_MARKER:-}" ]]; then
+            printf "%s\n" "$BASHPID" >> "$DALO_BENCH_PIPE_CHILD_MARKER";
+        fi;
+        "${DALO_BENCH_ENDPOINT_NS}_summon_worker" in "$frame";
+    else
+        if [[ "${DALO_BENCH_PIPE_POOL_ACTIVE:-0}" == 1 ]]; then
+            dalo_bench_pipe_submit "$frame";
+        else
+            "${DALO_BENCH_ENDPOINT_NS}_summon_worker" in "$frame";
+        fi;
+    fi
+}
+m_0001_pipe_worker() { local ASYNC_WORKER_NS=m_0001_pipe; m_0001_pipe_worker_impl "$@"; }
+printf -v m_0001_pipe_TARGET_WORKER_FUNC %s m_0001_pipe_worker
+printf -v m_0001_pipe_WORKER_KEEPALIVE %s 0
+
+# Materialize declared runtime object endpoint.
+create_blank_object m_0002_endpoint || exit $?
+printf -v m_0002_endpoint_OWNER_SCRIPT_OBJ_ID %s "$ASYNC_MACHINE_SCRIPT_OBJ_ID"
+printf -v m_0002_endpoint_OWNER_SCRIPT_UUID %s "$ASYNC_MACHINE_SCRIPT_UUID"
+printf -v m_0002_endpoint_OBJECT_NAME %s endpoint
+printf -v m_0002_endpoint_OBJECT_TYPE %s ENDPOINT
+printf -v m_0002_endpoint_MAX_JOBS %s 1
+
+# Linked worker implementation for m_0002_endpoint.
+m_0002_endpoint_worker_impl () 
+{ 
+    local worker_dir="$1" slot="$2" frame="$3" seq payload;
+    : "$worker_dir" "$slot";
+    [[ "$frame" == *'|'* ]] || return 81;
+    seq="${frame%%|*}" payload="${frame#*|}";
+    [[ "$seq" =~ ^[1-9][0-9]*$ ]] || return 82;
+    [[ -z "${DALO_BENCH_SEEN[$seq]+set}" ]] || { 
+        ((DALO_BENCH_DUPLICATES+=1));
+        return 83
+    };
+    (( ${#payload} == DALO_BENCH_SIZE )) || return 84;
+    [[ "$payload" == "$DALO_BENCH_PAYLOAD" ]] || return 85;
+    DALO_BENCH_SEEN["$seq"]=1;
+    if [[ "${DALO_BENCH_POOL_ACTIVE:-0}" == 1 ]]; then
+        dalo_bench_endpoint_submit "$seq" || return;
+    else
+        ((DALO_BENCH_RECEIVED+=1));
+        ((DALO_BENCH_BYTES+=${#payload}));
+    fi
+}
+m_0002_endpoint_worker() { local ASYNC_WORKER_NS=m_0002_endpoint; m_0002_endpoint_worker_impl "$@"; }
+printf -v m_0002_endpoint_TARGET_WORKER_FUNC %s m_0002_endpoint_worker
+printf -v m_0002_endpoint_WORKER_KEEPALIVE %s 0
+
+# Parent worker: $1 source OBJECT, $2 target OBJECT, $3 payload.
+dalo_machine_parent_worker() {
+#!/usr/bin/env bash
+# Dispatch a child-originated frame through compiled PIPE and ENDPOINT workers.
+# Parameters: $1 source object; $2 destination object; $3 sequence|payload frame.
+[[ "$1" == origin && "$2" == pipe ]] || return 76
+"${DALO_BENCH_PIPE_NS}_summon_worker" in "$3"
+
+}
+
+# Validate source/target identity before invoking user code.
+dalo_machine_parent_dispatch() {
+  local source="$1" target="$2" payload="$3"
+  case "$source" in
+    origin) : ;;
+    pipe) : ;;
+    endpoint) : ;;
+    *) return 76 ;;
+  esac
+  case "$target" in
+    origin) dalo_machine_parent_worker "$source" "$target" "$payload" ;;
+    pipe) dalo_machine_parent_worker "$source" "$target" "$payload" ;;
+    endpoint) dalo_machine_parent_worker "$source" "$target" "$payload" ;;
+    *) return 76 ;;
+  esac
+}
+
+# Generic output-vector routes for origin.
+define_vector_forward_hook m_0000_origin ORIGIN out m_0001_pipe in
+
+# Generic output-vector routes for pipe.
+define_vector_forward_hook m_0001_pipe PIPE out m_0002_endpoint in
+
+# Generic output-vector routes for endpoint.
+define_vector_forward_hook m_0002_endpoint ENDPOINT
+
+# Generic vector-aware INLINE execution for m_0000_origin.
+m_0000_origin_fast_slot=0
+m_0000_origin_fifo_output_port() {
+  [[ $# -ge 3 ]] || return 2
+  local slot_id="$1" output_port="$2"; shift 2
+  m_0000_origin_OUTPUT_DATA_VECTOR["$slot_id|$output_port"]="$*"
+}
+m_0000_origin_summon_worker() {
+  [[ $# -ge 1 ]] || return 2
+  local input_port="$1"; shift
+  m_0000_origin_fast_slot=$((m_0000_origin_fast_slot + 1))
+  local slot_id="$m_0000_origin_fast_slot" key
+  m_0000_origin_INPUT_DATA_VECTOR["$slot_id|$input_port"]="$*"
+  for key in "${!m_0000_origin_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$slot_id|"* ]] && unset 'm_0000_origin_OUTPUT_DATA_VECTOR['"$key"']'; done
+  m_0000_origin_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"
+  m_0000_origin_on_job_completed "$slot_id" 0
+}
+m_0000_origin_job_pool_wait() { :; }
+
+# Generic vector-aware INLINE execution for m_0001_pipe.
+m_0001_pipe_fast_slot=0
+m_0001_pipe_fifo_output_port() {
+  [[ $# -ge 3 ]] || return 2
+  local slot_id="$1" output_port="$2"; shift 2
+  m_0001_pipe_OUTPUT_DATA_VECTOR["$slot_id|$output_port"]="$*"
+}
+m_0001_pipe_summon_worker() {
+  [[ $# -ge 1 ]] || return 2
+  local input_port="$1"; shift
+  m_0001_pipe_fast_slot=$((m_0001_pipe_fast_slot + 1))
+  local slot_id="$m_0001_pipe_fast_slot" key
+  m_0001_pipe_INPUT_DATA_VECTOR["$slot_id|$input_port"]="$*"
+  for key in "${!m_0001_pipe_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$slot_id|"* ]] && unset 'm_0001_pipe_OUTPUT_DATA_VECTOR['"$key"']'; done
+  m_0001_pipe_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"
+  m_0001_pipe_on_job_completed "$slot_id" 0
+}
+m_0001_pipe_job_pool_wait() { :; }
+
+# Generic vector-aware INLINE execution for m_0002_endpoint.
+m_0002_endpoint_fast_slot=0
+m_0002_endpoint_fifo_output_port() {
+  [[ $# -ge 3 ]] || return 2
+  local slot_id="$1" output_port="$2"; shift 2
+  m_0002_endpoint_OUTPUT_DATA_VECTOR["$slot_id|$output_port"]="$*"
+}
+m_0002_endpoint_summon_worker() {
+  [[ $# -ge 1 ]] || return 2
+  local input_port="$1"; shift
+  m_0002_endpoint_fast_slot=$((m_0002_endpoint_fast_slot + 1))
+  local slot_id="$m_0002_endpoint_fast_slot" key
+  m_0002_endpoint_INPUT_DATA_VECTOR["$slot_id|$input_port"]="$*"
+  for key in "${!m_0002_endpoint_OUTPUT_DATA_VECTOR[@]}"; do [[ "$key" == "$slot_id|"* ]] && unset 'm_0002_endpoint_OUTPUT_DATA_VECTOR['"$key"']'; done
+  m_0002_endpoint_worker "${TMPDIR:-/tmp}" "$slot_id" "$@"
+  m_0002_endpoint_on_job_completed "$slot_id" 0
+}
+m_0002_endpoint_job_pool_wait() { :; }
+
+ASYNC_MACHINE_READY=1
+async_machine_wait_all() {
+  local __dalo_pending
+  while :; do
+    __dalo_pending=0
+    m_0000_origin_drain_fifo || return
+    m_0001_pipe_drain_fifo || return
+    m_0002_endpoint_drain_fifo || return
+    ((__dalo_pending == 0)) && return 0
+    sleep 0.001
+  done
+}
+async_machine_main() {
+  async_machine_parse_args "$@" || return
+  m_0000_origin_summon_worker __entry__ || return
+  async_machine_wait_all
+}
+async_machine_worker_stop_all() { local __rc=0
+  return "$__rc"; }
+ASYNC_MACHINE_DESTROYED=0
+async_machine_destroy() { [[ "$ASYNC_MACHINE_DESTROYED" -eq 0 ]] || return 0; ASYNC_MACHINE_DESTROYED=1; local __rc=0 __x=0; async_machine_worker_stop_all || __rc=$?; async_machine_library_fini_all || { __x=$?; ((__rc==0)) && __rc=$__x; }; return "$__rc"; }
+trap async_machine_destroy EXIT INT TERM
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then async_machine_main "$@"; fi

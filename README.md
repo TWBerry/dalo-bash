@@ -1,51 +1,7 @@
-# DALO — Distributed Asynchronous Library with Objects for Bash
+# DALO Sender Reap Integration v1 (experimental)
 
-DALO is a standalone Bash-oriented system for compiling a human-readable
-`.dalo` PROJECT into an executable MACHINE. Objects, workers, features,
-connections, and library dependencies are described declaratively; the
-compiler resolves their definitions and emits the runtime wiring.
+This patch adds a `F` failure frame on the existing ordered worker-to-parent FIFO after the persistent worker reaps a failed asynchronous sender with `wait`. The frame carries `sender.<PID>.<sequence>` and `EXIT_<wait-status>`; the parent dispatches it to `dalo_parent_sender_fail` and preserves pending ACK registrations for explicit reconciliation. Both the previous-sender wait and the final STOP wait emit the frame.
 
-The architecture separates a logical PROJECT from the MACHINE that executes
-it, and separates DATA transport from CONTROL. Local object state belongs
-to its owning process. Distributed communication uses declarative BRIDGE
-objects rather than a compiler-specific object type.
+**Limits:** Failure detection happens when the worker reaches its next `wait` (next job or STOP); it is not yet proactive while the worker is idle. A failure frame is not a replay mechanism. A vector already acknowledged by the parent but whose sender dies before reading its ACK needs separate end-to-end delivery auditing. The test shipped here verifies integration source contracts and parent quarantine; the complete generated MACHINE must be tested on Termux with all project libraries installed.
 
-## Documentation
-
-| Document | Scope |
-| --- | --- |
-| [Architecture](docs/architecture.md) | Core invariants, object model, execution, control, identity, and migration design |
-| [Compiler](docs/compiler.md) | Parsing, IR, definitions, dependency closure, and standalone MACHINE generation |
-| [PROJECT format](docs/dalo-format.md) | Human-readable `.dalo` declarations and semantics |
-| [Libraries](docs/library.md) | Dependency-aware `include` loader and library metadata |
-| [TCP bridge and cluster checkpoint](docs/bridge-cluster.md) | Framing, nonblocking receive, HELLO/ACK, and AB/BA validation |
-| [Object library integration](docs/object-libraries-integration.md) | First compatibility-stage OBJECT `LIBRARIES` patch and limitations |
-| [Helpers](docs/helpers.md) | Runtime helper APIs |
-| [Iterators](docs/iterators.md) | Synchronous and asynchronous generators |
-| [Fixed-point arithmetic](docs/fixed.md) | Q16.16 fixed-point ABI |
-
-## Current distributed-runtime checkpoint
-
-As of 2026-10-02, the two-MACHINE loopback harness passed both startup
-orders, AB and BA, using the v11 nonblocking TCP bridge changes. Both
-MACHINEs reported `ACTIVE`, and both processes exited with status 0.
-The harness uses one-way `SCHED_CLUSTER_HELLO`: connector B initiates and
-listener A responds with an ACK. These are **loopback harness results**;
-they do not establish production scheduler integration, physical-LAN
-interoperability, reconnection behavior, or authenticated remote control.
-
-See [the bridge checkpoint](docs/bridge-cluster.md) for the verified scope,
-protocol sequence, known limitations, and next validation steps.
-
-## Development and tests
-
-Compile PROJECTs using the compiler entry point documented in
-[compiler.md](docs/compiler.md). Existing library integration tests include:
-
-```bash
-bash tests/test-object-libraries.bash
-bash tests/test-fixed.bash
-```
-
-The two-MACHINE AB/BA harness is a separate local test environment; its
-results should not be confused with an end-to-end physical-LAN test.
+Install in `~/dalo-bash-queue` after backing up `runtime/dalo.bashlib.sh`; do not install into the reference tree. Run `bash tests/test-sender-reap-integration.sh` and the existing quarantine and production DIRECT tests. To exercise the failure path in a generated MACHINE, the next fault-injection test must expose and SIGKILL the real sender PID before the persistent worker's next `wait`.

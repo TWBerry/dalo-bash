@@ -1,0 +1,23 @@
+PROJECT
+	NAME dalo_full_benchmark
+	VERSION 1.1
+	PARENT_WORKER
+		TYPE inline
+		CODE scheduler.bash
+OBJECT origin
+	TYPE ORIGIN
+	WORKER
+		TYPE inline
+		CODE origin.bash
+OBJECT pipe
+	TYPE PIPE
+	WORKER
+		TYPE inline
+		CODE pipe.bash
+OBJECT endpoint
+	TYPE ENDPOINT
+	WORKER
+		TYPE inline
+		CODE endpoint.bash
+CONNECT origin.out pipe.in
+CONNECT pipe.out endpoint.in
