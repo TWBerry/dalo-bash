@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+<title id="title">DALO Parent ACK Hook v1 — Termux</title>
+<desc id="desc">Time by payload size; two persistent workers, four messages per size, one run. All fourteen configurations passed.</desc>
+<rect width="1120" height="560" fill="#fff"/>
+<text x="92" y="33" font-family="sans-serif" font-size="23" font-weight="bold" fill="#17243a">Parent ACK Hook v1 — Termux</text>
+<text x="92" y="55" font-family="sans-serif" font-size="14" fill="#566477">2 workers · 4 messages per size · 1 run · all PASS</text>
+<line x1="92" y1="456.0" x2="1086" y2="456.0" stroke="#e1e7ee"/>
+<text x="80" y="461.0" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">0</text>
+<line x1="92" y1="401.1" x2="1086" y2="401.1" stroke="#e1e7ee"/>
+<text x="80" y="406.1" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">0.5</text>
+<line x1="92" y1="346.3" x2="1086" y2="346.3" stroke="#e1e7ee"/>
+<text x="80" y="351.3" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">1</text>
+<line x1="92" y1="291.4" x2="1086" y2="291.4" stroke="#e1e7ee"/>
+<text x="80" y="296.4" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">1.5</text>
+<line x1="92" y1="236.6" x2="1086" y2="236.6" stroke="#e1e7ee"/>
+<text x="80" y="241.6" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">2</text>
+<line x1="92" y1="181.7" x2="1086" y2="181.7" stroke="#e1e7ee"/>
+<text x="80" y="186.7" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">2.5</text>
+<line x1="92" y1="126.9" x2="1086" y2="126.9" stroke="#e1e7ee"/>
+<text x="80" y="131.9" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">3</text>
+<line x1="92" y1="72.0" x2="1086" y2="72.0" stroke="#e1e7ee"/>
+<text x="80" y="77.0" text-anchor="end" font-size="13" font-family="sans-serif" fill="#566477">3.5</text>
+<text transform="translate(92.0,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">8 B</text>
+<text transform="translate(168.5,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">16 B</text>
+<text transform="translate(244.9,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">32 B</text>
+<text transform="translate(321.4,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">64 B</text>
+<text transform="translate(397.8,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">128 B</text>
+<text transform="translate(474.3,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">256 B</text>
+<text transform="translate(550.8,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">512 B</text>
+<text transform="translate(627.2,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">1 KiB</text>
+<text transform="translate(703.7,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">2 KiB</text>
+<text transform="translate(780.2,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">4 KiB</text>
+<text transform="translate(856.6,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">8 KiB</text>
+<text transform="translate(933.1,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">16 KiB</text>
+<text transform="translate(1009.5,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">32 KiB</text>
+<text transform="translate(1086.0,473) rotate(45)" text-anchor="start" font-family="sans-serif" font-size="12" fill="#566477">64 KiB</text>
+<polyline points="92.0,442.7 168.5,440.3 244.9,439.7 321.4,443.2 397.8,440.6 474.3,440.0 550.8,438.5 627.2,437.0 703.7,433.1 780.2,423.3 856.6,396.8 933.1,351.0 1009.5,264.1 1086.0,105.7" fill="none" stroke="#2563a6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="92.0" cy="442.7" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="168.5" cy="440.3" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="244.9" cy="439.7" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="321.4" cy="443.2" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="397.8" cy="440.6" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="474.3" cy="440.0" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="550.8" cy="438.5" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="627.2" cy="437.0" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="703.7" cy="433.1" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="780.2" cy="423.3" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="856.6" cy="396.8" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="933.1" cy="351.0" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="1009.5" cy="264.1" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<circle cx="1086.0" cy="105.7" r="4.5" fill="#2563a6" stroke="white" stroke-width="1.5"/>
+<text x="25" y="264.0" transform="rotate(-90 25 264.0)" font-family="sans-serif" font-size="14" text-anchor="middle" fill="#334155">Elapsed time (seconds)</text>
+<text x="560.0" y="546" font-family="sans-serif" font-size="14" text-anchor="middle" fill="#334155">Output vector payload</text>
+</svg>
