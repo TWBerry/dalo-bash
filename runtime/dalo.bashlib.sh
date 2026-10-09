@@ -387,6 +387,27 @@ __NS___fifo_send_raw() {
     __NS___fifo_send_raw_fd "$fd" "$1" "${__NS___FIFO_PATH:-}"
 }
 
+# Select a physical data FIFO once per complete output vector.
+# Parameters: $1 slot|port key; $2 output variable for the selected channel.
+__NS___fifo_select_data_channel() {
+    local key="$1" out="$2" count="${__NS___FIFO_CHANNEL_COUNT:-1}" selected
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 64
+    # A sender-local sequence spreads consecutive vectors even when their
+    # logical slot and port are identical. Channel zero remains available.
+    __NS___FIFO_DATA_SEQUENCE=$(( ${__NS___FIFO_DATA_SEQUENCE:-0} + 1 ))
+    selected=$(( (__NS___FIFO_DATA_SEQUENCE - 1) % count ))
+    printf -v "$out" '%s' "$selected"
+}
+
+# Send one encoded frame on the selected data channel.
+# Parameters: $1 frame tag; remaining parameters are frame fields.
+__NS___fifo_send_selected() {
+    (($# >= 1)) || return 2
+    local frame channel="${__NS___FIFO_ACTIVE_CHANNEL:-0}"
+    __NS___fifo_frame_encode --out frame "$@" || return
+    __NS___fifo_send_raw_fd "${__NS___FIFO_FDS[channel]}" "$frame" "${__NS___FIFO_PATHS[channel]}"
+}
+
 __NS___fifo_send() {
     local tag="$1"; shift
     local frame
@@ -526,15 +547,15 @@ __NS___fifo_output_port_send() {
     [[ "$output_port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
     local key="$slot_id|$output_port" payload="$*" frame atomic_max
     local LC_ALL=C offset=0 chunk chunk_size=96 total
-    local batch='' batch_bytes=0 frame_bytes fd
+    local batch='' batch_bytes=0 frame_bytes fd channel="${__NS___FIFO_ACTIVE_CHANNEL:-0}"
     __NS___fifo_frame_encode --out frame O "$key" "$payload" || return
-    __NS___fifo_atomic_max "${__NS___FIFO_PATH:-}" atomic_max || return
+    __NS___fifo_atomic_max "${__NS___FIFO_PATHS[channel]:-${__NS___FIFO_PATH:-}}" atomic_max || return
     if (( ${#frame} + 1 <= atomic_max )); then
-        __NS___fifo_send_raw "$frame"
+        __NS___fifo_send_raw_fd "${__NS___FIFO_FDS[channel]}" "$frame" "${__NS___FIFO_PATHS[channel]}"
         return $?
     fi
     total=${#payload}
-    fd="${__NS___FIFO_FD:-}"
+    fd="${__NS___FIFO_FDS[channel]:-${__NS___FIFO_FD:-}}"
     [[ -n "$fd" ]] || return 1
     # Every C frame remains independently decodable. Batch complete newline-
     # terminated frames into a single atomic write, without changing the wire
@@ -548,7 +569,7 @@ __NS___fifo_output_port_send() {
         frame_bytes=$(( ${#frame} + 1 ))
         (( frame_bytes <= atomic_max )) || return 90
         if [[ "${DALO_FIFO_BATCH_CHUNKS:-1}" == 0 ]]; then
-            __NS___fifo_send_raw "$frame" || return
+            __NS___fifo_send_raw_fd "${__NS___FIFO_FDS[channel]}" "$frame" "${__NS___FIFO_PATHS[channel]}" || return
         else
             # Flush before exceeding PIPE_BUF: each printf is one atomic FIFO
             # write even when other worker processes send concurrently.
@@ -573,55 +594,26 @@ __NS___fifo_output_port_send() {
 # the previously validated chunked transport.
 # Parameters: none; the queue and FIFO belong to this generated namespace.
 __NS___fifo_output_queue_flush() {
-    local key value slot port size frame atomic_max fd index=0 count=0
-    local batch='' batch_bytes=0 frame_bytes committed=0
-    local LC_ALL=C
-    fd="${__NS___FIFO_FD:-}"
-    [[ -n "$fd" ]] || return 1
-    __NS___fifo_atomic_max "${__NS___FIFO_PATH:-}" atomic_max || return
-    while (( index < ${#__NS___OUTPUT_QUEUE_KEYS[@]} )); do
+    local key value slot port index channel
+    local saved_hook_sender="${DALO_SENDER_FRAME_SEND:-}"
+    for ((index=0; index<${#__NS___OUTPUT_QUEUE_KEYS[@]}; index++)); do
         key="${__NS___OUTPUT_QUEUE_KEYS[index]}"
         value="${__NS___OUTPUT_QUEUE_VALUES[index]}"
         slot="${key%%|*}"
         port="${key#*|}"
-        # An opt-in sender hook registers this vector before any O/C frame.
-        # Parameters: $1 logical key; $2 payload bytes. The hook must send
-        # the R frame on this sender's existing output FIFO and reserve credit.
-        # A failed registration is fatal; no unregistered data may be sent.
+        __NS___fifo_select_data_channel "$key" channel || return
+        __NS___FIFO_ACTIVE_CHANNEL="$channel"
+        # The credit hook uses this same descriptor before any O/C data.
+        # Parameters: key and payload bytes are passed unchanged to the hook.
         if [[ -n ${DALO_CREDIT_SENDER_REGISTER_HOOK:-} ]]; then
             declare -F "$DALO_CREDIT_SENDER_REGISTER_HOOK" >/dev/null || return 94
+            DALO_SENDER_FRAME_SEND=__NS___fifo_send_selected
             "$DALO_CREDIT_SENDER_REGISTER_HOOK" "$key" "${#value}" || return
         fi
-        __NS___fifo_frame_encode --out frame O "$key" "$value" || return
-        frame_bytes=$(( ${#frame} + 1 ))
-        if [[ "${DALO_FIFO_BATCH_VECTORS:-1}" != 0 ]] &&
-           ((frame_bytes <= atomic_max)); then
-            if ((batch_bytes + frame_bytes > atomic_max)); then
-                printf '%s' "$batch" >&"$fd" || return
-                committed=$((committed + count))
-                batch='' batch_bytes=0 count=0
-            fi
-            batch+="$frame"$'\n'
-            batch_bytes=$((batch_bytes + frame_bytes))
-            count=$((count + 1))
-        else
-            if ((batch_bytes)); then
-                printf '%s' "$batch" >&"$fd" || return
-                committed=$((committed + count))
-                batch='' batch_bytes=0 count=0
-            fi
-            __NS___fifo_output_port_send "$slot" "$port" "$value" || return
-            committed=$((committed + 1))
-        fi
-        index=$((index + 1))
+        __NS___fifo_output_port_send "$slot" "$port" "$value" || return
     done
-    if ((batch_bytes)); then
-        printf '%s' "$batch" >&"$fd" || return
-        committed=$((committed + count))
-    fi
-    # The normal path commits only after every write succeeds. A failed write
-    # retains queued entries, which may cause duplicate earlier frames if the
-    # caller retries; treat transport failure as fatal rather than retrying.
+    DALO_SENDER_FRAME_SEND="$saved_hook_sender"
+    unset __NS___FIFO_ACTIVE_CHANNEL
     __NS___OUTPUT_QUEUE_KEYS=()
     __NS___OUTPUT_QUEUE_VALUES=()
     __NS___OUTPUT_QUEUE_BYTES=0
@@ -637,15 +629,23 @@ __NS___fifo_output_port() {
     local value="$*" limit="${DALO_OUTPUT_QUEUE_BYTES:-262144}"
     [[ "$slot" =~ ^[0-9]+$ && "$port" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || return 2
     if [[ "${DALO_OUTPUT_QUEUE_ENABLED:-0}" != 1 ]]; then
-        __NS___fifo_output_port_send "$slot" "$port" "$value"
-        return $?
+        local channel rc
+        __NS___fifo_select_data_channel "$slot|$port" channel || return
+        __NS___FIFO_ACTIVE_CHANNEL="$channel"
+        __NS___fifo_output_port_send "$slot" "$port" "$value" && rc=0 || rc=$?
+        unset __NS___FIFO_ACTIVE_CHANNEL
+        return "$rc"
     fi
     [[ "$limit" =~ ^[1-9][0-9]*$ && ${#limit} -le 9 ]] || return 2
     ((limit <= 16777216)) || return 2
     if ((${#value} > limit)); then
+        local channel rc
         __NS___fifo_output_queue_flush || return
-        __NS___fifo_output_port_send "$slot" "$port" "$value"
-        return $?
+        __NS___fifo_select_data_channel "$slot|$port" channel || return
+        __NS___FIFO_ACTIVE_CHANNEL="$channel"
+        __NS___fifo_output_port_send "$slot" "$port" "$value" && rc=0 || rc=$?
+        unset __NS___FIFO_ACTIVE_CHANNEL
+        return "$rc"
     fi
     if ((__NS___OUTPUT_QUEUE_BYTES + ${#value} > limit)); then
         __NS___fifo_output_queue_flush || return
@@ -733,8 +733,10 @@ __NS___control_close() {
 }
 __NS___control_state() { printf '%s\n' "${__NS___CONTROL_STATE:-ACTIVE}"; }
 
-__NS___drain_fifo() {
-    local fd="${__NS___FIFO_FD:-}"; [ -n "$fd" ] || return 0
+# Drain a single physical FIFO while retaining the existing frame dispatcher.
+# Parameters: $1 open FIFO file descriptor.
+__NS___drain_fifo_one() {
+    local fd="${1:-}"; [ -n "$fd" ] || return 0
     local line tag chunk_key chunk_offset chunk_total chunk_value
     local -a argv=()
     while :; do
@@ -1107,12 +1109,30 @@ __NS___drain_fifo() {
         esac
     done
 }
+# Drain every physical channel of this object, starting with the control channel.
+# Parameters: none; the namespace owns the channel descriptors.
+__NS___drain_fifo() {
+    local fd channel
+    local -a fds=("${__NS___FIFO_FDS[@]}")
+    if ((${#fds[@]} == 0)); then
+        fd="${__NS___FIFO_FD:-}"
+        [[ -n "$fd" ]] || return 0
+        __NS___drain_fifo_one "$fd"
+        return $?
+    fi
+    for channel in "${!fds[@]}"; do
+        fd="${fds[channel]}"
+        __NS___drain_fifo_one "$fd" || return $?
+    done
+}
+
 EOF
     # Match command substitution: remove every trailing newline.
     while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
     body="${body//__NS__/$ns}"
     __asyncobj_eval_body "$ns" "${FUNCNAME[0]}" "$body"
 }
+
 
 define_worker_cleanup_wrapper() {
     local ns="$1"
@@ -1206,11 +1226,36 @@ ${ns}_job_pool_init() {
 
     local main_tmp="\${MAIN_TMP_DIR:-\${TMPDIR:-/tmp}}"
     mkdir -p -- "\$main_tmp"
-    ${ns}_FIFO_PATH="\$main_tmp/${ns}_pool.fifo"
-    [ -p "\${${ns}_FIFO_PATH}" ] || mkfifo -m 600 "\${${ns}_FIFO_PATH}"
-    local _fd
-    exec {_fd}<>"\${${ns}_FIFO_PATH}"
-    ${ns}_FIFO_FD="\$_fd"
+    # Initialize all physical channels while preserving channel-zero compatibility.
+    # Parameters: DALO_FIFO_CHANNELS controls the positive channel count.
+    local _channels="\${DALO_FIFO_CHANNELS:-1}" _channel _path _fd
+    [[ "\$_channels" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'Invalid DALO_FIFO_CHANNELS: %s\n' "\$_channels" >&2
+        return 64
+    }
+    (( _channels <= 64 )) || {
+        printf 'DALO_FIFO_CHANNELS exceeds phase-one limit (64)\n' >&2
+        return 64
+    }
+    declare -g -a ${ns}_FIFO_PATHS=() ${ns}_FIFO_FDS=()
+    ${ns}_FIFO_CHANNEL_COUNT="\$_channels"
+    for ((_channel=0; _channel<_channels; _channel++)); do
+        if (( _channel == 0 )); then
+            _path="\$main_tmp/${ns}_pool.fifo"
+        else
+            _path="\$main_tmp/${ns}_pool.\${_channel}.fifo"
+        fi
+        if [[ -e "\$_path" && ! -p "\$_path" ]]; then
+            printf 'FIFO path exists but is not a FIFO: %s\n' "\$_path" >&2
+            return 73
+        fi
+        [[ -p "\$_path" ]] || mkfifo -m 600 "\$_path" || return
+        exec {_fd}<>"\$_path" || return
+        ${ns}_FIFO_PATHS[_channel]="\$_path"
+        ${ns}_FIFO_FDS[_channel]="\$_fd"
+    done
+    ${ns}_FIFO_PATH="\${${ns}_FIFO_PATHS[0]}"
+    ${ns}_FIFO_FD="\${${ns}_FIFO_FDS[0]}"
 }
 EOF
     # Match command substitution: remove every trailing newline.
@@ -4210,8 +4255,14 @@ create_blank_object() {
     fd_var="${ns}_FIFO_FD"
     fifo="${!fifo_var}"
     fd="${!fd_var}"
+    # Keep the canonical FIFO lookup on channel zero; register every channel FD.
+    # Parameters: ns is the namespace and obj_id is the registered object ID.
     register_fifo "$fifo" "$obj_id" || return
-    register_fd "$fd" fifo "$obj_id" || return
+    local channels_var="${ns}_FIFO_FDS" channel_fd
+    local -n channel_fds="$channels_var"
+    for channel_fd in "${channel_fds[@]}"; do
+        register_fd "$channel_fd" fifo "$obj_id" || return
+    done
 }
 
 # create_random_blank_object [out_ns_var]
@@ -4894,11 +4945,28 @@ migration_discard_imported_object() {
     # Drop a committed destination machine lease if one was already attached.
     migration_resource_release_object "$ns" || return
 
-    if [[ -n "$fifo_fd" ]]; then
+    # Close and unregister every channel, including the legacy channel-zero FD.
+    # Parameters: ns identifies the imported object being discarded.
+    local channel_fds_var="${ns}_FIFO_FDS" channel_paths_var="${ns}_FIFO_PATHS"
+    local channel_fd channel_path
+    if declare -p "$channel_fds_var" >/dev/null 2>&1; then
+        local -n discard_fds="$channel_fds_var"
+        for channel_fd in "${discard_fds[@]}"; do
+            fifo_close "$channel_fd"
+            unregister_fd "$channel_fd" || true
+        done
+    elif [[ -n "$fifo_fd" ]]; then
         fifo_close "$fifo_fd"
         unregister_fd "$fifo_fd" || true
     fi
-    [[ -z "$fifo_path" ]] || rm -f -- "$fifo_path"
+    if declare -p "$channel_paths_var" >/dev/null 2>&1; then
+        local -n discard_paths="$channel_paths_var"
+        for channel_path in "${discard_paths[@]}"; do
+            [[ -z "$channel_path" ]] || rm -f -- "$channel_path"
+        done
+    else
+        [[ -z "$fifo_path" ]] || rm -f -- "$fifo_path"
+    fi
     [[ -z "$obj_id" ]] || unregister_fifo "$obj_id" || true
 
     if [[ -n "$uuid" && -v "UUID_TO_OBJ_ID[$uuid]" && "${UUID_TO_OBJ_ID[$uuid]}" == "$obj_id" ]]; then

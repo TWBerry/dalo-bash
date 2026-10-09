@@ -1,7 +1,15 @@
-# DALO Sender Reap Integration v1 (experimental)
+# DALO Supervisor SIGKILL regression v2
 
-This patch adds a `F` failure frame on the existing ordered worker-to-parent FIFO after the persistent worker reaps a failed asynchronous sender with `wait`. The frame carries `sender.<PID>.<sequence>` and `EXIT_<wait-status>`; the parent dispatches it to `dalo_parent_sender_fail` and preserves pending ACK registrations for explicit reconciliation. Both the previous-sender wait and the final STOP wait emit the frame.
+Adds Linux/Android PR_SET_PDEATHSIG(SIGKILL) to Python worker processes so an abruptly killed supervisor cannot leave active worker processes behind. Adds a bounded integration test using actual SIGKILL for both the last Bash client and its supervisor. The test uses its own mktemp directory and never removes the shared TMPDIR. This archive is incremental over Supervisor Recovery v1 and preserves its Bash API and affinity support.
 
-**Limits:** Failure detection happens when the worker reaches its next `wait` (next job or STOP); it is not yet proactive while the worker is idle. A failure frame is not a replay mechanism. A vector already acknowledged by the parent but whose sender dies before reading its ACK needs separate end-to-end delivery auditing. The test shipped here verifies integration source contracts and parent quarantine; the complete generated MACHINE must be tested on Termux with all project libraries installed.
+Install from ~/dalo-bash:
 
-Install in `~/dalo-bash-queue` after backing up `runtime/dalo.bashlib.sh`; do not install into the reference tree. Run `bash tests/test-sender-reap-integration.sh` and the existing quarantine and production DIRECT tests. To exercise the failure path in a generated MACHINE, the next fault-injection test must expose and SIGKILL the real sender PID before the persistent worker's next `wait`.
+    tar xzf /storage/emulated/0/Download/dalo-supervisor-sigkill-v2.tar.gz
+    bash -n runtime/python.bashlib.sh tests/test-python-supervisor-sigkill.sh
+    python3 -m py_compile runtime/python_supervisor.py
+    timeout 60 bash tests/test-python-supervisor-recovery.sh
+    timeout 60 bash tests/test-python-supervisor-sigkill.sh
+
+Expected: five PASS lines total (three Recovery v1 plus two actual SIGKILL scenarios). The shell may print a `Killed` diagnostic for the intentionally killed supervisor; that is expected.
+
+Linux/Android-specific worker parent-death enforcement is best effort on platforms where libc lacks prctl; the SIGKILL regression catches a failure to terminate workers. A pre-existing limitation remains: a client attaching to an unresponsive *live* supervisor can block on the legacy FIFO transport; a separate bounded transport handshake is needed to solve that fully.
